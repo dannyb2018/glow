@@ -10,7 +10,7 @@ foreach(object ${subdirs})
     # While there is GLOW_WITH_CPU variable to control whether
     # CPU backend is enabled or not.
     if(NOT DEFINED ${backendEnabled} OR ${backendEnabled})
-      message("Adding ${object} backend.")
+      message(STATUS "Adding ${object} backend.")
       add_subdirectory(${object})
     endif()
   endif()
@@ -30,8 +30,7 @@ target_link_libraries(Backends
                         Backend
                         Base
                         Graph
-                        Graph
-                        Optimizer)
+                        GraphOptimizerPipeline)
 
 FOREACH(backend ${linked_backends})
   make_whole_archive(Backends ${backend})

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
   BB.newInstr("TensorView")
       .addOperand("Src", OperandKind::In)
       .addMember(MemberType::TypeRef, "Ty")
-      .addMember(MemberType::VectorSizeT, "Offsets")
+      .addMember(MemberType::VectorDimT, "Offsets")
       .setType("Ty");
 
   BB.newInstr("DeallocActivation")
@@ -86,9 +86,39 @@ int main(int argc, char **argv) {
       .addMember(MemberType::VectorUnsigned, "Pads")
       .addMember(MemberType::Unsigned, "Group")
       .addMember(MemberType::Unsigned, "Dilation")
+      .addMember(MEMBER_TYPE_INFO(ConvolutionLayout), "Layout")
+      .addMember(MEMBER_TYPE_INFO(FusedActivation), "FusedActivation")
       .autoIRGen()
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Src", "Filter"})
       .addGradientInstr({"Src", "Filter"}, {"Dest", "Src", "Filter", "Bias"});
+
+  BB.newInstr("ChannelwiseQuantizedConvolution")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Src", OperandKind::In)
+      .addOperand("Filter", OperandKind::In)
+      .addOperand("Bias", OperandKind::In)
+      .addOperand("Scales", OperandKind::In)
+      .addOperand("Offsets", OperandKind::In)
+      .addMember(MemberType::VectorUnsigned, "Kernels")
+      .addMember(MemberType::VectorUnsigned, "Strides")
+      .addMember(MemberType::VectorUnsigned, "Pads")
+      .addMember(MemberType::Unsigned, "Group")
+      .autoIRGen()
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Dest", "Src", "Filter", "ElemKind::Int8QTy"});
+
+  BB.newInstr("ConvTranspose")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Src", OperandKind::In)
+      .addOperand("Filter", OperandKind::In)
+      .addOperand("Bias", OperandKind::In)
+      .addMember(MemberType::VectorUnsigned, "Kernels")
+      .addMember(MemberType::VectorUnsigned, "Strides")
+      .addMember(MemberType::VectorUnsigned, "Pads")
+      .addMember(MemberType::Unsigned, "Group")
+      .addMember(MemberType::Unsigned, "Dilation")
+      .autoIRGen()
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "Src", "Filter"});
 
   BB.newInstr("Convolution3D")
       .addOperand("Dest", OperandKind::Out)
@@ -103,17 +133,19 @@ int main(int argc, char **argv) {
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Src", "Filter"})
       .addGradientInstr({"Src", "Filter"}, {"Dest", "Src", "Filter", "Bias"});
 
-  // MaxPool version caching XY coordinates to speedup gradient-based
+  // MaxPool version caching Argmax flattened coordinates. It is both used by
+  // itself, and also to restore XY coordinates to speedup gradient-based
   // computations.
-  BB.newInstr("MaxPoolWithXY")
+  BB.newInstr("MaxPoolWithArgmax")
       .addOperand("Dest", OperandKind::Out)
       .addOperand("Src", OperandKind::In)
-      .addOperand("SrcXY", OperandKind::Out)
+      .addOperand("Argmax", OperandKind::Out)
       .addMember(MemberType::VectorUnsigned, "Kernels")
       .addMember(MemberType::VectorUnsigned, "Strides")
       .addMember(MemberType::VectorUnsigned, "Pads")
+      .addMember(MemberType::Unsigned, "Layout")
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
-      .addGradientInstr({"Dest", "SrcXY"}, {"Dest", "Src"});
+      .addGradientInstr({"Dest", "Src", "Argmax"}, {"Dest", "Src"});
 
   BB.newInstr("MaxPool")
       .addOperand("Dest", OperandKind::Out)
@@ -121,6 +153,7 @@ int main(int argc, char **argv) {
       .addMember(MemberType::VectorUnsigned, "Kernels")
       .addMember(MemberType::VectorUnsigned, "Strides")
       .addMember(MemberType::VectorUnsigned, "Pads")
+      .addMember(MemberType::Unsigned, "Layout")
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"});
 
   BB.newInstr("AvgPool")
@@ -129,9 +162,32 @@ int main(int argc, char **argv) {
       .addMember(MemberType::VectorUnsigned, "Kernels")
       .addMember(MemberType::VectorUnsigned, "Strides")
       .addMember(MemberType::VectorUnsigned, "Pads")
+      .addMember(MemberType::Unsigned, "Layout")
+      .autoIRGen()
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
+      .addGradientInstr({"Dest", "Src"}, {"Dest", "Src"});
+
+  BB.newInstr("ArgMax")
+      .addOperand("Argmax", OperandKind::Out)
+      .addOperand("Input", OperandKind::In)
+      .addMember(MemberType::Unsigned, "Axis")
+      .addMember(MemberType::Boolean, "KeepDims")
+      .autoVerify(VerifyKind::NoVerify);
+
+  BB.newInstr("AdaptiveAvgPool")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Src", OperandKind::In)
       .autoIRGen()
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
       .addGradientInstr({"Dest"}, {"Dest", "Src"});
+
+  BB.newInstr("FullyConnected")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Src", OperandKind::In)
+      .addOperand("Weights", OperandKind::In)
+      .addOperand("Bias", OperandKind::In)
+      .autoIRGen()
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"});
 
   BB.newInstr("RowwiseQuantizedFullyConnected")
       .addOperand("Dest", OperandKind::Out)
@@ -204,6 +260,16 @@ int main(int argc, char **argv) {
       .autoIRGen()
       .autoVerify(VerifyKind::SameElementType, {"Dest", "LHS", "RHS"});
 
+  /// Performs batch matrix multiplication between the LHS and RHS. The operands
+  /// are a stack of two dimensional matrices. Example: (N, A, Z) x (N, Z, B) =>
+  /// (N, A, B).
+  BB.newInstr("BatchMatMul")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("LHS", OperandKind::In)
+      .addOperand("RHS", OperandKind::In)
+      .autoIRGen()
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "LHS", "RHS"});
+
   /// Accumulates all of the layers in the batch along the Axis dimension and
   /// produce a tensor that has the same dimensions as the input tensor without
   /// the Axis dimension.
@@ -213,6 +279,27 @@ int main(int argc, char **argv) {
       .addMember(MemberType::Unsigned, "Axis")
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Batch"})
       .autoIRGen();
+
+  /// Calculates minimum of all of the layers in the batch along the axes
+  /// dimensions and produce a tensor that has the same dimensions as the input.
+  /// tensor without the Axes dimension.
+  BB.newInstr("BatchedReduceMin")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Batch", OperandKind::In)
+      .addMember(MemberType::VectorUnsigned, "Axes")
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "Batch"})
+      .autoIRGen();
+
+  // Does a running accumulation of all values in input (inclusive).
+  // e.g [1, 2, 3, 4] -> [1, 3, 6, 10]
+  BB.newInstr("CumSum")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Input", OperandKind::In)
+      .addMember(MemberType::Unsigned, "Exclusive")
+      .addMember(MemberType::Unsigned, "Reverse")
+      .inplaceOperand({"Dest", "Input"})
+      .autoIRGen()
+      .autoVerify(VerifyKind::SameType, {"Dest", "Input"});
 
   /// Sums together groups of consecutive slices of Data as per the group sizes
   /// specified by Lengths.
@@ -225,21 +312,51 @@ int main(int argc, char **argv) {
       .autoVerify(VerifyKind::SameElementType,
                   {"Lengths", "ElemKind::Int32ITy"});
 
+  BB.newInstr("SparseLengthsSum")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Data", OperandKind::In)
+      .addOperand("Indices", OperandKind::In)
+      .addOperand("Lengths", OperandKind::In)
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
+      .autoIRGen()
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "Data"})
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Lengths", "ElemKind::Int32ITy"})
+      .addGradientInstr({"Data", "Indices", "Lengths"}, {"Dest", "Data"});
+
   BB.newInstr("SparseLengthsWeightedSum")
       .addOperand("Dest", OperandKind::Out)
       .addOperand("Data", OperandKind::In)
       .addOperand("Weights", OperandKind::In)
       .addOperand("Indices", OperandKind::In)
       .addOperand("Lengths", OperandKind::In)
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
       .autoIRGen()
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Data", "Weights"})
-      .autoVerify(VerifyKind::SameElementType,
-                  {"Indices", "ElemKind::Int64ITy"})
       .autoVerify(VerifyKind::SameElementType,
                   {"Lengths", "ElemKind::Int32ITy"})
       .autoVerify(VerifyKind::SameShape, {"Weights", "Indices"})
       .addGradientInstr({"Data", "Weights", "Indices", "Lengths"},
                         {"Dest", "Data", "Weights"});
+
+  BB.newInstr("EmbeddingBag")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Data", OperandKind::In)
+      .addOperand("Weights", OperandKind::In)
+      .addOperand("Indices", OperandKind::In)
+      .addOperand("Offsets", OperandKind::In)
+      .addMember(MemberType::Boolean, "HasEndOffset")
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
+      .autoIRGen()
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "Data", "Weights"})
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Indices", "ElemKind::Int64ITy"})
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Offsets", "ElemKind::Int64ITy"})
+      .autoVerify(VerifyKind::SameShape, {"Weights", "Indices"});
 
   BB.newInstr("RowwiseQuantizedSparseLengthsWeightedSum")
       .addOperand("Dest", OperandKind::Out)
@@ -249,14 +366,11 @@ int main(int argc, char **argv) {
       .addOperand("Weights", OperandKind::In)
       .addOperand("Indices", OperandKind::In)
       .addOperand("Lengths", OperandKind::In)
+      .addMember(MemberType::Boolean, "UseFP16Accumulation")
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
       .autoIRGen()
-      .autoVerify(VerifyKind::SameElementType, {"Dest", "ElemKind::FloatTy"})
-      .autoVerify(VerifyKind::SameElementType, {"Data", "ElemKind::Int8QTy"})
-      .autoVerify(VerifyKind::SameElementType, {"Scales", "ElemKind::FloatTy"})
-      .autoVerify(VerifyKind::SameElementType, {"Offsets", "ElemKind::FloatTy"})
-      .autoVerify(VerifyKind::SameElementType, {"Weights", "ElemKind::FloatTy"})
-      .autoVerify(VerifyKind::SameElementType,
-                  {"Indices", "ElemKind::Int64ITy"})
+      .autoVerify(VerifyKind::SameElementType, {"Data", "ElemKind::UInt8QTy"})
       .autoVerify(VerifyKind::SameElementType,
                   {"Lengths", "ElemKind::Int32ITy"})
       .autoVerify(VerifyKind::SameShape, {"Weights", "Indices"});
@@ -267,15 +381,29 @@ int main(int argc, char **argv) {
       .addOperand("Weights", OperandKind::In)
       .addOperand("Indices", OperandKind::In)
       .addOperand("Lengths", OperandKind::In)
+      .addMember(MemberType::Boolean, "UseFP16Accumulation")
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
       .autoIRGen()
-      .autoVerify(VerifyKind::SameElementType, {"Dest", "ElemKind::FloatTy"})
       .autoVerify(VerifyKind::SameElementType,
-                  {"Data", "ElemKind::UInt8FusedQTy"})
-      .autoVerify(VerifyKind::SameElementType, {"Weights", "ElemKind::FloatTy"})
+                  {"Lengths", "ElemKind::Int32ITy"})
+      .autoVerify(VerifyKind::SameShape, {"Weights", "Indices"});
+
+  BB.newInstr("EmbeddingBagByteRowwiseOffsets")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Data", OperandKind::In)
+      .addOperand("Weights", OperandKind::In)
+      .addOperand("Indices", OperandKind::In)
+      .addOperand("Offsets", OperandKind::In)
+      .addMember(MemberType::Boolean, "UseFP16Accumulation")
+      .addMember(MemberType::Boolean, "HasEndOffset")
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
+      .autoIRGen()
       .autoVerify(VerifyKind::SameElementType,
                   {"Indices", "ElemKind::Int64ITy"})
       .autoVerify(VerifyKind::SameElementType,
-                  {"Lengths", "ElemKind::Int32ITy"})
+                  {"Offsets", "ElemKind::Int64ITy"})
       .autoVerify(VerifyKind::SameShape, {"Weights", "Indices"});
 
   BB.newInstr("LengthsToRanges")
@@ -308,7 +436,7 @@ int main(int argc, char **argv) {
       .addOperand("Values", OperandKind::In)
       .addOperand("DefaultValue", OperandKind::In)
       .addOperand("Lengths", OperandKind::In)
-      .addMember(MemberType::VectorInt64, "Mask")
+      .addMember(MemberType::VectorDimT, "Mask")
       .autoVerify(VerifyKind::SameElementType,
                   {"Dest", "Values", "DefaultValue"})
       .autoVerify(VerifyKind::SameElementType,
@@ -400,6 +528,16 @@ int main(int argc, char **argv) {
       .autoVerify(VerifyKind::SameElementType, {"Dest", "ElemKind::BoolTy"})
       .autoIRGen("CmpEQ");
 
+  BB.newInstr("ElementCmpLT")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("LHS", OperandKind::In)
+      .addOperand("RHS", OperandKind::In)
+      .dataParallel()
+      .autoVerify(VerifyKind::SameShape, {"Dest", "LHS", "RHS"})
+      .autoVerify(VerifyKind::SameShape, {"LHS", "RHS"})
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "ElemKind::BoolTy"})
+      .autoIRGen("CmpLT");
+
   BB.newInstr("ElementIsNaN")
       .addOperand("Dest", OperandKind::Out)
       .addOperand("Src", OperandKind::In)
@@ -428,6 +566,17 @@ int main(int argc, char **argv) {
       .autoVerify(VerifyKind::SameType, {"Dest", "Src"})
       .autoIRGen("Log");
 
+  BB.newInstr("ElementExp")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Src", OperandKind::In)
+      .inplaceOperand({
+          "Dest",
+          "Src",
+      })
+      .dataParallel()
+      .autoVerify(VerifyKind::SameType, {"Dest", "Src"})
+      .autoIRGen("Exp");
+
   BB.newInstr("ElementSelect")
       .addOperand("Dest", OperandKind::Out)
       .addOperand("Cond", OperandKind::In)
@@ -453,9 +602,31 @@ int main(int argc, char **argv) {
       .autoVerify(VerifyKind::SameType, {"Dest", "Src"})
       .autoIRGen();
 
+  BB.newInstr("BatchedPairwiseDotProduct")
+      .addOperand("Dest", OperandKind::Out)
+      .addMember(MemberType::Unsigned, "NumInputs")
+      .addMember(MemberType::Unsigned, "VectorSize")
+      .autoVerify(VerifyKind::NoVerify);
+
+  BB.newInstr("BatchedPairwiseDotProductGrad")
+      .addOperand("DestGrad", OperandKind::In)
+      .addMember(MemberType::Unsigned, "NumInputs")
+      .addMember(MemberType::Unsigned, "VectorSize")
+      .autoVerify(VerifyKind::NoVerify);
+
   //===--------------------------------------------------------------------===//
   //                Non-linearities
   //===--------------------------------------------------------------------===//
+  BB.newInstr("Relu")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Src", OperandKind::In)
+      .inplaceOperand({
+          "Dest",
+          "Src",
+      })
+      .dataParallel()
+      .autoIRGen()
+      .addGradientInstr({"Dest"}, {"Dest", "Src"});
 
   BB.newInstr("Sigmoid")
       .addOperand("Dest", OperandKind::Out)
@@ -465,8 +636,7 @@ int main(int argc, char **argv) {
           "Src",
       })
       .dataParallel()
-      .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
-      .autoVerify(VerifyKind::SameShape, {"Dest", "Src"})
+      .autoVerify(VerifyKind::SameType, {"Dest", "Src"})
       .autoIRGen();
 
   BB.newInstr("Tanh")
@@ -477,8 +647,7 @@ int main(int argc, char **argv) {
           "Src",
       })
       .dataParallel()
-      .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
-      .autoVerify(VerifyKind::SameShape, {"Dest", "Src"})
+      .autoVerify(VerifyKind::SameType, {"Dest", "Src"})
       .autoIRGen();
 
   //===--------------------------------------------------------------------===//
@@ -499,17 +668,22 @@ int main(int argc, char **argv) {
       .autoVerify(VerifyKind::NoVerify)
       .autoIRGen();
 
+  BB.newInstr("Touch")
+      .addOperand("Dest", OperandKind::Out)
+      .dataParallel()
+      .autoVerify(VerifyKind::NoVerify);
+
   BB.newInstr("InsertTensor")
       .addOperand("Dest", OperandKind::InOut)
       .addOperand("Src", OperandKind::In)
-      .addMember(MemberType::VectorSizeT, "Offsets")
+      .addMember(MemberType::VectorDimT, "Offsets")
       .addMember(MemberType::Unsigned, "Count")
       .addMember(MemberType::Unsigned, "Axis");
 
   BB.newInstr("ExtractTensor")
       .addOperand("Dest", OperandKind::Out)
       .addOperand("Src", OperandKind::In)
-      .addMember(MemberType::VectorSizeT, "Offsets");
+      .addMember(MemberType::VectorDimT, "Offsets");
 
   BB.newInstr("Gather")
       .addOperand("Dest", OperandKind::Out)
@@ -528,12 +702,12 @@ int main(int argc, char **argv) {
       .autoVerify(VerifyKind::SameElementType, {"Ranges", "Lengths"})
       .autoIRGen();
 
-  BB.newInstr("ScatterAssign")
+  BB.newInstr("ScatterData")
       .addOperand("Data", OperandKind::InOut)
       .addOperand("Indices", OperandKind::In)
       .addOperand("Slices", OperandKind::In)
-      .autoVerify(VerifyKind::SameElementType,
-                  {"Indices", "ElemKind::Int64ITy"});
+      .addMember(MemberType::Boolean, "Cumulative")
+      .autoVerify(VerifyKind::NoVerify);
 
   BB.newInstr("BatchOneHot")
       .addOperand("Dest", OperandKind::Out)
@@ -550,6 +724,25 @@ int main(int argc, char **argv) {
       .addOperand("Src", OperandKind::In)
       .addMember(MemberType::Unsigned, "BlockSize")
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
+      .autoIRGen();
+
+  BB.newInstr("ResizeNearest")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Src", OperandKind::In)
+      .addMember(MemberType::VectorFloat, "Scale")
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
+      .autoIRGen();
+
+  //===--------------------------------------------------------------------===//
+  //                Reorder transformations
+  //===--------------------------------------------------------------------===//
+
+  BB.newInstr("Flip")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Src", OperandKind::In)
+      .addMember(MemberType::Unsigned, "Axis")
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
+      .autoVerify(VerifyKind::SameShape, {"Dest", "Src"})
       .autoIRGen();
 
   //===--------------------------------------------------------------------===//
@@ -636,16 +829,68 @@ int main(int argc, char **argv) {
       .autoIRGen();
 
   //===--------------------------------------------------------------------===//
+  //                Pre Processing
+  //===--------------------------------------------------------------------===//
+
+  BB.newInstr("AudioSpectrogram")
+      .addOperand("Spectrogram", OperandKind::Out)
+      .addOperand("Input", OperandKind::In)
+      .addOperand("Window", OperandKind::In)
+      .addOperand("TwiddleFactors", OperandKind::In)
+      .addOperand("BitReverseIndices", OperandKind::In)
+      .addOperand("ComplexToRealWeights", OperandKind::In)
+      .addMember(MemberType::Int64, "WindowSize")
+      .addMember(MemberType::Int64, "WindowStride")
+      .addMember(MemberType::Boolean, "MagnitudeSquared")
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Spectrogram", "Input", "Window", "TwiddleFactors",
+                   "ComplexToRealWeights", "ElemKind::FloatTy"})
+      .autoVerify(VerifyKind::SameElementType,
+                  {"BitReverseIndices", "ElemKind::Int32ITy"})
+      .autoIRGen();
+
+  BB.newInstr("MFCC")
+      .addOperand("Coefficients", OperandKind::Out)
+      .addOperand("Spectrogram", OperandKind::In)
+      .addOperand("MelWeights", OperandKind::In)
+      .addOperand("MelRanges", OperandKind::In)
+      .addOperand("DctMat", OperandKind::In)
+      .addMember(MemberType::Float, "SampleRate")
+      .addMember(MemberType::Float, "LowerFrequency")
+      .addMember(MemberType::Float, "UpperFrequency")
+      .addMember(MemberType::Int64, "FilterBankCount")
+      .addMember(MemberType::Int64, "NumCoefficients")
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Coefficients", "Spectrogram", "MelWeights", "DctMat",
+                   "ElemKind::FloatTy"})
+      .autoVerify(VerifyKind::SameElementType,
+                  {"MelRanges", "ElemKind::Int32ITy"})
+      .autoIRGen();
+
+  //===--------------------------------------------------------------------===//
+  //                Post Processing
+  //===--------------------------------------------------------------------===//
+
+  BB.newInstr("NonMaxSuppression")
+      .addOperand("Indices", OperandKind::Out)
+      .addOperand("NumberOfSelectedIndices", OperandKind::Out)
+      .addOperand("Boxes", OperandKind::In)
+      .addOperand("Scores", OperandKind::In)
+      .addMember(MemberType::Int64, "CenterPointBox")
+      .addMember(MemberType::Int64, "MaxOutputBoxesPerClass")
+      .addMember(MemberType::Float, "IouThreshold")
+      .addMember(MemberType::Float, "ScoreThreshold")
+      .addMember(MemberType::Boolean, "IsTFVersion4")
+      .autoVerify(VerifyKind::SameElementType, {"Boxes", "Scores"})
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Indices", "NumberOfSelectedIndices"})
+      .autoIRGen();
+
+  //===--------------------------------------------------------------------===//
   //                Backend-Specific Instructions
   //===--------------------------------------------------------------------===//
 
-#include "Backends/CPU/CPUSpecificInstrs.h"
-#include "Backends/OpenCL/OpenCLSpecificInstrs.h"
-  // Add here external backend specific instructions headers.
-  // Example:
-  // #ifdef GLOW_WITH_<NAME>
-  // #include "<Name>/ClassGen/<Name>SpecificInstrs.h"
-  // #endif
+#include "glow/InstrGenIncludes.h"
 
   return 0;
 }

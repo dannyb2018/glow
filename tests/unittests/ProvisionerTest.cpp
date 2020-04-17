@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 #include "glow/Runtime/Provisioner/Provisioner.h"
 #include "../../lib/Backends/CPU/CPUDeviceManager.h"
+#include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
 
 #include "gtest/gtest.h"
 
@@ -24,7 +25,7 @@ using namespace glow::runtime;
 class ProvisionerTest : public ::testing::Test {};
 
 std::unique_ptr<Module> setupModule(unsigned functionCount) {
-  auto mod = llvm::make_unique<Module>();
+  auto mod = glow::make_unique<Module>();
   for (unsigned int i = 0; i < functionCount; i++) {
     auto *F = mod->createFunction("function" + std::to_string(i));
     auto *X = mod->createPlaceholder(ElemKind::FloatTy, {16, 1024}, "X", false);
@@ -43,19 +44,19 @@ DAGListTy setupDAG(unsigned rootCount, unsigned childCount) {
   unsigned currentFunction = 0;
   for (unsigned int root = 0; root < rootCount; root++) {
     DAGNodePtrVec nodes;
-    auto rootNode = llvm::make_unique<DAGNode>();
-    auto firstNode = llvm::make_unique<DAGNode>();
+    auto rootNode = glow::make_unique<DAGNode>();
+    auto firstNode = glow::make_unique<DAGNode>();
     rootNode->name = "root" + std::to_string(root);
     rootNode->children.push_back(firstNode.get());
     firstNode->name = "function" + std::to_string(currentFunction);
     firstNode->logicalDevices = {0, 1};
-    firstNode->backendKind = BackendKind::CPU;
+    firstNode->backendName = "CPU";
     currentFunction++;
     for (unsigned int child = 0; child < childCount; child++) {
-      auto newChild = llvm::make_unique<DAGNode>();
+      auto newChild = glow::make_unique<DAGNode>();
       newChild->name = "function" + std::to_string(currentFunction);
       newChild->logicalDevices = {0};
-      newChild->backendKind = BackendKind::CPU;
+      newChild->backendName = "CPU";
       currentFunction++;
       firstNode->children.push_back(newChild.get());
       nodes.push_back(std::move(newChild));
@@ -73,13 +74,15 @@ TEST_F(ProvisionerTest, provisionDag) {
   DeviceManagerMapTy devices;
   for (int i = 0; i < 6; i++) {
     std::unique_ptr<DeviceManager> device(
-        new CPUDeviceManager(DeviceConfig(BackendKind::CPU)));
+        new CPUDeviceManager(DeviceConfig("CPU")));
     devices.emplace(i, std::move(device));
   }
-  auto provisioner = Provisioner(devices);
-  auto err = provisioner.provision(networks, *mod.get());
+
+  CompilationContext cctx;
+  Provisioner provisioner(devices);
+  auto err = provisioner.provision(networks, *mod.get(), cctx);
   // Expect that there was no Error when provisioning
-  EXPECT_FALSE(errToBool(std::move(err)));
+  EXPECT_FALSE(ERR_TO_BOOL(std::move(err)));
 }
 
 TEST_F(ProvisionerTest, provisionDagFail) {
@@ -88,12 +91,36 @@ TEST_F(ProvisionerTest, provisionDagFail) {
 
   DeviceManagerMapTy devices;
   for (int i = 0; i < 6; i++) {
-    std::unique_ptr<DeviceManager> device(
-        new CPUDeviceManager(DeviceConfig(BackendKind::CPU), 1000));
+    auto config = DeviceConfig("CPU");
+    config.setDeviceMemory(1000);
+    std::unique_ptr<DeviceManager> device(new CPUDeviceManager(config));
     devices.emplace(i, std::move(device));
   }
-  auto provisioner = Provisioner(devices);
-  auto err = provisioner.provision(networks, *mod.get());
-  // Expect that there was no Error when provisioning
-  EXPECT_TRUE(errToBool(std::move(err)));
+
+  CompilationContext cctx;
+  Provisioner provisioner(devices);
+  auto err = provisioner.provision(networks, *mod.get(), cctx);
+  // Expect that there was an Error when provisioning
+  EXPECT_TRUE(ERR_TO_BOOL(std::move(err)));
+}
+
+TEST_F(ProvisionerTest, provisionFailCleanup) {
+  // We want this provisioning to fail after adding the first partition
+  // successfully. This is to test that cleanup properly evicts networks.
+  DeviceConfig configBig("CPU");
+  DeviceConfig configSmall("CPU");
+  configSmall.setDeviceMemory(1);
+  std::unique_ptr<DeviceManager> deviceBig(new CPUDeviceManager(configBig));
+  std::unique_ptr<DeviceManager> deviceSmall(new CPUDeviceManager(configSmall));
+  DeviceManagerMapTy devices;
+  devices.emplace(0, std::move(deviceBig));
+  devices.emplace(1, std::move(deviceSmall));
+
+  auto mod = setupModule(2);
+  auto networks = setupDAG(2, 0);
+  CompilationContext cctx;
+  Provisioner provisioner(devices);
+  auto err = provisioner.provision(networks, *mod.get(), cctx);
+  // Expect that there was an Error when provisioning
+  EXPECT_TRUE(ERR_TO_BOOL(std::move(err)));
 }

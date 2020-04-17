@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -65,8 +65,8 @@ size_t glow::getOriginOffset(Value *V) {
       return off;
     }
 
-    llvm::ArrayRef<size_t> offsets = TVI->getOffsets();
-    llvm::ArrayRef<size_t> srcDims = TVI->getSrc()->getType()->dims();
+    llvm::ArrayRef<dim_t> offsets = TVI->getOffsets();
+    llvm::ArrayRef<dim_t> srcDims = TVI->getSrc()->getType()->dims();
 
     size_t numSrcDims = srcDims.size();
 

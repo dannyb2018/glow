@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,19 +14,20 @@
  * limitations under the License.
  */
 
-#include "InterpreterFunction.h"
+#include "glow/Backends/Interpreter/InterpreterFunction.h"
 
 #include "glow/IR/IR.h"
 #include "glow/IR/IRUtils.h"
 #include "glow/IR/Instrs.h"
+#include "glow/Support/ThreadPool.h"
 
 #include "llvm/Support/Casting.h"
 
 using namespace glow;
 
 InterpreterFunction::InterpreterFunction(std::unique_ptr<IRFunction> F,
-                                         const runtime::RuntimeBundle &bundle)
-    : CompiledFunction(bundle), F_(std::move(F)) {}
+                                         runtime::RuntimeBundle &&bundle)
+    : CompiledFunction(std::move(bundle)), F_(std::move(F)) {}
 
 InterpreterFunction::~InterpreterFunction() {
   for (const auto &p : constants_) {
@@ -49,11 +50,19 @@ void InterpreterFunction::collectConstants(const Module *module) {
   }
 }
 
-llvm::Error InterpreterFunction::execute(ExecutionContext *context) {
+void InterpreterFunction::addConstant(std::string name, Tensor *T) {
+  Tensor *newTensor = new Tensor;
+  newTensor->assign(T);
+  constants_[name] = newTensor;
+}
+
+Error InterpreterFunction::execute(ExecutionContext *context) {
   BoundInterpreterFunction boundFunc(constants_);
+  boundFunc.setIRInstructionProcessingHandler(
+      getIRInstructionProcessingHandler());
   auto res = boundFunc.execute(F_.get(), context);
   {
-    auto ev = context->scopedEvent("processInstrumentation");
+    TRACE_EVENT_SCOPE(context, TraceLevel::RUNTIME, "processInstrumentation");
     translateTraceEvents(context);
   }
   return res;
@@ -68,14 +77,13 @@ void InterpreterFunction::translateTraceEvents(
 
   TraceContext *traceContext = context->getTraceContext();
 
-  if (!traceContext || traceContext->getTraceLevel() == TraceLevel::NONE ||
-      traceContext->getTraceLevel() == TraceLevel::RUNTIME) {
+  if (!traceContext || !traceContext->shouldLog(TraceLevel::OPERATOR)) {
     return;
   }
 
   PlaceholderBindings *bindings = context->getPlaceholderBindings();
 
-  int tid = TraceEvent::getThreadId();
+  int tid = threads::getThreadId();
   auto &traceEvents = traceContext->getTraceEvents();
   for (auto &backing : traceInfo.events) {
     Tensor *backingTensor = bindings->get(backing.first);
@@ -93,14 +101,24 @@ void InterpreterFunction::translateTraceEvents(
                backingTensor->getUnsafePtr() +
                    (event.endIndex * traceInfo.dataSize),
                traceInfo.dataSize);
-        traceEvents.push_back({event.name, start, end - start, tid});
+        traceEvents.push_back({event.name,
+                               TraceLevel::OPERATOR,
+                               start,
+                               end - start,
+                               tid,
+                               {{"kind", event.kind}}});
       } else {
         uint64_t ts{0};
         memcpy(&ts,
                backingTensor->getUnsafePtr() +
                    (event.startIndex * traceInfo.dataSize),
                traceInfo.dataSize);
-        traceEvents.push_back({event.name, ts, event.type, tid});
+        traceEvents.push_back({event.name,
+                               TraceLevel::OPERATOR,
+                               ts,
+                               event.type,
+                               tid,
+                               {{"kind", event.kind}}});
       }
     }
   }
@@ -151,7 +169,7 @@ Tensor *BoundInterpreterFunction::getOrCreateTensor(const Value *v) {
 }
 
 Tensor *BoundInterpreterFunction::getOrCreateUnownedTensor(
-    const Value *v, const Value *src, llvm::ArrayRef<size_t> offsets) {
+    const Value *v, const Value *src, llvm::ArrayRef<dim_t> offsets) {
   assert(llvm::isa<TensorViewInst>(v) && "Expected a tensor view");
 
   // Pick the tensor.
@@ -178,10 +196,12 @@ void BoundInterpreterFunction::deleteTensor(const Value *v) {
   tensors_.erase(it);
 }
 
-llvm::Error BoundInterpreterFunction::execute(IRFunction *F,
-                                              ExecutionContext *context) {
+Error BoundInterpreterFunction::execute(IRFunction *F,
+                                        ExecutionContext *context) {
   {
-    auto ev = context->scopedEvent("registerTensors");
+    TRACE_EVENT_SCOPE(context, TraceLevel::RUNTIME, "registerTensors");
+    // Make sure all referenced tensors are on the host.
+    context->getPlaceholderBindings()->ensureOnHost();
 
     // Find all virtually padded tensors so they can be replaced.
     std::vector<Placeholder *> virtualPadded;
@@ -211,7 +231,16 @@ llvm::Error BoundInterpreterFunction::execute(IRFunction *F,
     }
   }
 
-// Do the forward pass.
+  // Do the forward pass.
+  auto &irInstructionProcessingHandler = getIRInstructionProcessingHandler();
+  // Dispatch the interpreter on each instruction in the program.
+  for (const auto &I : F->getInstrs()) {
+    // Perform custom processing if needed and proceed with standard processing
+    // if required.
+    if (!irInstructionProcessingHandler ||
+        !irInstructionProcessingHandler(
+            &I, IRInstructionProcessingStage::PROCESSING, this)) {
+      switch (I.getKind()) {
 #define DEF_VALUE(CLASS, NAME)
 #define DEF_INSTR(CLASS, NAME)                                                 \
   case Kinded::Kind::CLASS##Kind: {                                            \
@@ -219,18 +248,24 @@ llvm::Error BoundInterpreterFunction::execute(IRFunction *F,
     break;                                                                     \
   }
 #define DEF_BACKEND_SPECIFIC_INSTR(CLASS, NAME)
-  // Dispatch the interpreter on each instruction in the program:
-  for (const auto &I : F->getInstrs()) {
-    switch (I.getKind()) {
 #include "glow/AutoGenInstr.def"
 
-    default:
-      llvm_unreachable("Invalid instruction.");
+      default:
+        glow::errs() << "Invalid instruction: " << &I << "\n";
+        llvm_unreachable("Invalid instruction.");
+      }
+    }
+
+    // Perform post-processing of the instruction.
+    if (irInstructionProcessingHandler) {
+      irInstructionProcessingHandler(
+          &I, IRInstructionProcessingStage::POSTPROCESSING, this);
     }
   }
 
   {
-    auto ev = context->scopedEvent("eraseTensors");
+
+    TRACE_EVENT_SCOPE(context, TraceLevel::RUNTIME, "eraseTensors");
     // Remove the concrete tensors that back the placeholder tensors.
     for (auto &ph : context->getPlaceholderBindings()->pairs()) {
       auto *w = F->getWeightForNode(ph.first);
@@ -238,5 +273,5 @@ llvm::Error BoundInterpreterFunction::execute(IRFunction *F,
     }
   }
 
-  return llvm::Error::success();
+  return Error::success();
 }

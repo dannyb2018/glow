@@ -7,13 +7,13 @@ set -euxo pipefail
 export GLOW_SRC=$PWD
 export GLOW_BUILD_DIR=${GLOW_SRC}/build
 export LOADER=${GLOW_BUILD_DIR}/bin/image-classifier
-export LSAN_OPTIONS="suppressions=$GLOW_SRC/.circleci/suppressions.txt"
+export LSAN_OPTIONS="suppressions=$GLOW_SRC/.circleci/lsan_suppressions.txt"
 export ASAN_SYMBOLIZER_PATH=/usr/bin/llvm-symbolizer
 export IMAGES_DIR=${GLOW_SRC}/tests/images/
 
 # Pass in which tests to run (one of {test, test_unopt}).
 run_unit_tests() {
-    CTEST_PARALLEL_LEVEL=4 ninja "${1}" || ( cat Testing/Temporary/LastTest.log && exit 1 )
+    CTEST_PARALLEL_LEVEL=4 GLOG_minloglevel=3 ninja "${1}" || ( cat Testing/Temporary/LastTest.log && exit 1 )
 }
 
 run_and_check_lenet_mnist_bundle() {
@@ -46,27 +46,41 @@ run_and_check_resnet50_bundle() {
     done
 }
 
+run_pytorch_tests() {
+    cd "${GLOW_SRC}/torch_glow"
+    if hash sccache 2>/dev/null; then
+      export PATH="/tmp/sccache:$PATH"
+    fi
+    source /tmp/venv/bin/activate
+    pip install pytest-xdist
+    python "${GLOW_SRC}/torch_glow/setup.py" test --run_cmake
+    cd -
+    if hash sccache 2>/dev/null; then
+      sccache --show-stats
+    fi
+}
+
 # Run unit tests and bundle tests.
 cd "${GLOW_BUILD_DIR}"
 case ${CIRCLE_JOB} in
     ASAN)
-        # ASAN is not enabled in onnx, therefore we should skip it for now.
-        # TODO: Enable ASAN test.
         run_unit_tests check
         ;;
-    TSAN)
-        # Run only Glow tests.
+    OPENCL)
         run_unit_tests check
         ;;
     DEBUG)
         run_unit_tests check
         run_unit_tests test_unopt
         ;;
-
     SHARED)
         # No tests with shared libs; it's similar to DEBUG.
         ;;
-
+    32B_DIM_T)
+        # A lot of 32b dim_t issues are not revealed at build time, thus
+        # run the unit test suite also.
+        run_unit_tests check
+        ;;
     RELEASE_WITH_EXPENSIVE_TESTS)
         run_unit_tests check_expensive
         run_and_check_lenet_mnist_bundle
@@ -77,13 +91,16 @@ case ${CIRCLE_JOB} in
         cd build
         ../.circleci/run_coverage.sh
         ;;
-    CHECK_CLANG_FORMAT)
+    PYTORCH)
+        run_pytorch_tests
+        ;;
+    CHECK_CLANG_AND_PEP8_FORMAT)
         cd "${GLOW_SRC}"
         sudo ln -s /usr/bin/clang-format-7 /usr/bin/clang-format
         ./utils/format.sh check
         ;;
     *)
-        echo "Error, '${CIRCLE_JOB}' not valid mode; Must be one of {ASAN, TSAN, DEBUG, SHARED, RELEASE_WITH_EXPENSIVE_TESTS}."
+        echo "Error, '${CIRCLE_JOB}' not valid mode; Please, check .circleci/test.sh for list of supported tests."
         exit 1
         ;;
 esac

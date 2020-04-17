@@ -3,10 +3,14 @@ add_library(Support
               Error.cpp
               Random.cpp
               Support.cpp
-              ThreadPool.cpp)
+              ThreadPool.cpp
+              ZipUtils.cpp)
 target_link_libraries(Support
                       PUBLIC
                         LLVMSupport
-                        glog::glog)
+                        Miniz
+                        glog::glog
+                        folly_jemalloc
+                        )
 
 add_subdirectory(TensorPool)

@@ -12,7 +12,10 @@ target_link_libraries(Interpreter
                         Graph
                         IR
                         LLVMCore
-                        Optimizer
-                        QuantizationBase)
+                        IROptimizer
+                        IROptimizerPipeline
+                        GraphOptimizerPipeline
+                        QuantizationBase
+                        Runtime)
 
 set(linked_backends ${linked_backends} Interpreter PARENT_SCOPE)

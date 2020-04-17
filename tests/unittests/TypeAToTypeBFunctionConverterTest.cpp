@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2018-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,22 +13,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "BackendTestUtils.h"
 
+#include "glow/Converter/Float16Converter.h"
 #include "glow/Converter/TypeAToTypeBFunctionConverter.h"
 
 #include "glow/Backend/Backend.h"
 #include "glow/ExecutionEngine/ExecutionEngine.h"
+#include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
 
 #include "llvm/Support/Casting.h"
 
 #include "gtest/gtest.h"
 
 using namespace glow;
-
-struct AllBackends : public ::testing::TestWithParam<BackendKind> {
-protected:
-  ExecutionEngine EE_{GetParam()};
-};
 
 /// Check that a simple graph is converted properly.
 /// Namely, check that:
@@ -63,7 +61,7 @@ protected:
 /// \endverbatim
 ///
 /// In particular, the input and output of the network shouldn't be modified.
-TEST_P(AllBackends, SimpleOneUseConversionFloatToFloat16) {
+TEST(TypeAToTypeBFunctionConverter, SimpleOneUseConversionFloatToFloat16) {
   Module mod;
   Function *F = mod.createFunction("test");
   PlaceholderBindings bindings;
@@ -78,8 +76,9 @@ TEST_P(AllBackends, SimpleOneUseConversionFloatToFloat16) {
 
   size_t origGraphSize = F->getNodes().size();
 
+  PrecisionConfiguration precConfig;
   TypeAToTypeBFunctionConverter converter(*F, ElemKind::FloatTy,
-                                          ElemKind::Float16Ty);
+                                          ElemKind::Float16Ty, precConfig);
   converter.convert();
 
   // We should have 4 more nodes:
@@ -167,7 +166,8 @@ TEST_P(AllBackends, SimpleOneUseConversionFloatToFloat16) {
 /// \endverbatim
 ///
 /// In particular, the input and output of the network shouldn't be modified.
-TEST_P(AllBackends, SimpleChainOfComputationConversionFloatToFloat16) {
+TEST(TypeAToTypeBFunctionConverter,
+     SimpleChainOfComputationConversionFloatToFloat16) {
   Module mod;
   Function *F = mod.createFunction("test");
   PlaceholderBindings bindings;
@@ -184,8 +184,9 @@ TEST_P(AllBackends, SimpleChainOfComputationConversionFloatToFloat16) {
 
   size_t origGraphSize = F->getNodes().size();
 
+  PrecisionConfiguration precConfig;
   TypeAToTypeBFunctionConverter converter(*F, ElemKind::FloatTy,
-                                          ElemKind::Float16Ty);
+                                          ElemKind::Float16Ty, precConfig);
   converter.convert();
 
   // We should have 6 more nodes:
@@ -249,8 +250,8 @@ TEST_P(AllBackends, SimpleChainOfComputationConversionFloatToFloat16) {
             input);
 }
 
-/// Check that the conversion honor the doNotConvertKinds set (here ReLU)
-/// for a graph with a simple chain of computation.
+/// Check that the conversion honor the precision configuration for blacklisting
+/// a node kind (Relu here) for a graph with a simple chain of computation.
 /// Namely, check that:
 /// \verbatim
 /// Input: Placeholder(float)
@@ -290,7 +291,7 @@ TEST_P(AllBackends, SimpleChainOfComputationConversionFloatToFloat16) {
 /// \endverbatim
 ///
 /// In particular, the input and output of the network shouldn't be modified.
-TEST_P(AllBackends, DoNotConvertReLUConversionFloatToFloat16) {
+TEST(TypeAToTypeBFunctionConverter, DoNotConvertReLUConversionFloatToFloat16) {
   Module mod;
   Function *F = mod.createFunction("test");
   PlaceholderBindings bindings;
@@ -307,10 +308,10 @@ TEST_P(AllBackends, DoNotConvertReLUConversionFloatToFloat16) {
 
   size_t origGraphSize = F->getNodes().size();
 
-  KindSet doNotConvertKinds;
-  doNotConvertKinds.insert(Kinded::Kind::ReluNodeKind);
-  TypeAToTypeBFunctionConverter converter(
-      *F, ElemKind::FloatTy, ElemKind::Float16Ty, &doNotConvertKinds);
+  PrecisionConfiguration precConfig;
+  precConfig.precisionModeKindSet.insert(Kinded::Kind::ReluNodeKind);
+  TypeAToTypeBFunctionConverter converter(*F, ElemKind::FloatTy,
+                                          ElemKind::Float16Ty, precConfig);
   converter.convert();
 
   // We should have 4 more nodes:
@@ -360,6 +361,111 @@ TEST_P(AllBackends, DoNotConvertReLUConversionFloatToFloat16) {
             input);
 }
 
+/// Check that the conversion honor the precision configuration for whitelisting
+/// a node kind (Relu here) for a graph with a simple chain of computation.
+/// Namely, check that:
+/// \verbatim
+/// Input: Placeholder(float)
+///    |
+///    V
+///   FC(float)
+///    |
+///    V
+///   ReLU(float)  Output: Placeholder(float)
+///    |            |
+///    |    +-------+
+///    |   /
+///    V  V
+///   Save
+/// \endverbatim
+///
+/// Gets converted into:
+/// \verbatim
+/// Input: Placeholder(float)
+///    |
+///    V
+///   FC(float)
+///    |
+///    V
+/// ConvertTo(float16)
+///    |
+///    V
+///   ReLU(float16)
+///    |
+///    V
+/// ConvertTo(float)   Output: Placeholder(float)
+///    |                    |
+///    |    +---------------+
+///    |   /
+///    V  V
+///   Save
+/// \endverbatim
+///
+/// In particular, the input and output of the network shouldn't be modified.
+TEST(TypeAToTypeBFunctionConverter, OnlyReluConversionFloatToFloat16) {
+  Module mod;
+  Function *F = mod.createFunction("test");
+  PlaceholderBindings bindings;
+
+  auto *input =
+      mod.createPlaceholder(ElemKind::FloatTy, {20, 13}, "Input", false);
+  auto *output =
+      mod.createPlaceholder(ElemKind::FloatTy, {20, 10}, "Output", false);
+
+  auto *FC = F->createFullyConnected(bindings, "FC", input, 10);
+  auto *RN =
+      F->createRELU("Relu", FC, FC->getType(FullyConnectedNode::ResultIdx));
+  auto *result = F->createSave("save", RN, output);
+
+  size_t origGraphSize = F->getNodes().size();
+
+  PrecisionConfiguration precConfig;
+  precConfig.precisionModeKindSet.insert(Kinded::Kind::ReluNodeKind);
+  precConfig.useSetAsWhitelist = true;
+  TypeAToTypeBFunctionConverter converter(*F, ElemKind::FloatTy,
+                                          ElemKind::Float16Ty, precConfig);
+  converter.convert();
+
+  // We should have 4 more nodes:
+  // 1 conversion float to float16 for the input of Relu.
+  // 1 conversion float16 to float for the result of Relu.
+  EXPECT_EQ(F->getNodes().size(), origGraphSize + 2);
+  // Make sure the save node is still in the function and is unchanged.
+  EXPECT_TRUE(std::find(F->getNodes().begin(), F->getNodes().end(), *result) !=
+              F->getNodes().end());
+  EXPECT_EQ(result->getOutput(), output->getOutput());
+  // Check that the save is fed from a conversion from float16 to float.
+  auto *resultInput = llvm::dyn_cast<ConvertToNode>(result->getInput());
+  ASSERT_NE(resultInput, nullptr);
+  EXPECT_EQ(resultInput->getInput().getElementType(), ElemKind::Float16Ty);
+  EXPECT_EQ(resultInput->getResult().getElementType(), ElemKind::FloatTy);
+
+  // Check the Relu has FP16 inputs and outputs.
+  auto *convertedRelu = llvm::dyn_cast<ReluNode>(resultInput->getInput());
+  ASSERT_NE(convertedRelu, nullptr);
+  EXPECT_EQ(convertedRelu->getInput().getElementType(), ElemKind::Float16Ty);
+  EXPECT_EQ(convertedRelu->getResult().getElementType(), ElemKind::Float16Ty);
+
+  // Check that the Relu is fed from a conversion from float to float16.
+  auto *convertedToReluInput = llvm::dyn_cast<ConvertToNode>(RN->getInput());
+  ASSERT_NE(convertedToReluInput, nullptr);
+  EXPECT_EQ(convertedToReluInput->getInput().getElementType(),
+            ElemKind::FloatTy);
+  EXPECT_EQ(convertedToReluInput->getResult().getElementType(),
+            ElemKind::Float16Ty);
+
+  // Check that this conversion comes from the original float FC node.
+  EXPECT_EQ(convertedToReluInput->getInput().getNode(), FC);
+  EXPECT_EQ(FC->getResult().getElementType(), ElemKind::FloatTy);
+  // Check that all the input of FC are float.
+  for (unsigned idx = 0, end = FC->getNumInputs(); idx != end; ++idx) {
+    EXPECT_EQ(FC->getNthInput(idx).getElementType(), ElemKind::FloatTy);
+  }
+  // Check that the original placeholder is still the input to the FC and float.
+  EXPECT_EQ(FC->getInput().getNode(), input);
+  EXPECT_EQ(input->getOutput().getElementType(), ElemKind::FloatTy);
+}
+
 /// Check that don't convert types we didn't asked for.
 /// Namely, check that:
 /// \verbatim
@@ -403,7 +509,7 @@ TEST_P(AllBackends, DoNotConvertReLUConversionFloatToFloat16) {
 ///
 /// In particular, the input and outputs of the network shouldn't be modified
 /// as well as the Int64I result.
-TEST_P(AllBackends, int64IConversionFloatToFloat16) {
+TEST(TypeAToTypeBFunctionConverter, int64IConversionFloatToFloat16) {
   Module mod;
   Function *F = mod.createFunction("test");
   PlaceholderBindings bindings;
@@ -421,8 +527,9 @@ TEST_P(AllBackends, int64IConversionFloatToFloat16) {
 
   size_t origGraphSize = F->getNodes().size();
 
+  PrecisionConfiguration precConfig;
   TypeAToTypeBFunctionConverter converter(*F, ElemKind::FloatTy,
-                                          ElemKind::Float16Ty);
+                                          ElemKind::Float16Ty, precConfig);
   converter.convert();
 
   // We should have 2 more nodes:
@@ -520,7 +627,7 @@ TEST_P(AllBackends, int64IConversionFloatToFloat16) {
 /// \endverbatim
 ///
 /// In particular, the input and output of the network shouldn't be modified.
-TEST_P(AllBackends, OptimizeMiddleConversionsFloatToFloat16) {
+TEST(TypeAToTypeBFunctionConverter, OptimizeMiddleConversionsFloatToFloat16) {
   Module mod;
   Function *F = mod.createFunction("test");
   PlaceholderBindings bindings;
@@ -536,7 +643,7 @@ TEST_P(AllBackends, OptimizeMiddleConversionsFloatToFloat16) {
   Tensor origWeights;
   origWeights.assign(&weights->getPayload());
   auto *bias =
-      mod.createConstant(mod.uniqueType(ElemKind::FloatTy, {10, 20}), "bias");
+      mod.createConstant(mod.uniqueType(ElemKind::FloatTy, {10}), "bias");
   bias->getPayloadMutable().getHandle().randomize(-5.0, 5.0, mod.getPRNG());
   Tensor origBias;
   origBias.assign(&bias->getPayload());
@@ -552,8 +659,9 @@ TEST_P(AllBackends, OptimizeMiddleConversionsFloatToFloat16) {
 
   size_t origGraphSize = F->getNodes().size();
 
+  PrecisionConfiguration precConfig;
   TypeAToTypeBFunctionConverter converter(*F, ElemKind::FloatTy,
-                                          ElemKind::Float16Ty);
+                                          ElemKind::Float16Ty, precConfig);
   converter.convert();
 
   optimize(F, CompilationMode::Infer);
@@ -702,7 +810,7 @@ TEST_P(AllBackends, OptimizeMiddleConversionsFloatToFloat16) {
 /// In particular, the input and output of the network should be modified
 /// and the input of the last save node should be converted to the expected
 /// output type.
-TEST_P(AllBackends, convertPlaceholderFloatToFloat16) {
+TEST(TypeAToTypeBFunctionConverter, convertPlaceholderFloatToFloat16) {
   Module mod;
   Function *F = mod.createFunction("test");
   Function *F2 = mod.createFunction("test2");
@@ -746,8 +854,9 @@ TEST_P(AllBackends, convertPlaceholderFloatToFloat16) {
   size_t f2OrigGraphSize = F2->getNodes().size();
   size_t f3OrigGraphSize = F3->getNodes().size();
 
+  PrecisionConfiguration precConfig;
   TypeAToTypeBFunctionConverter converter(*F, ElemKind::FloatTy,
-                                          ElemKind::Float16Ty);
+                                          ElemKind::Float16Ty, precConfig);
   for (auto *placeholder : mod.getPlaceholders()) {
     if (output2 == placeholder) {
       continue;
@@ -870,20 +979,21 @@ TEST_P(AllBackends, convertPlaceholderFloatToFloat16) {
 /// |
 /// V
 /// Save
-TEST_P(AllBackends, convertExistingConversionToNoop) {
+TEST(TypeAToTypeBFunctionConverter, convertExistingConversionToNoop) {
   Module mod;
   Function *F = mod.createFunction("test");
   auto *placeholder =
       mod.createPlaceholder(ElemKind::FloatTy, {20, 13}, "Input", false);
 
-  TypeRef outTy = mod.uniqueType(ElemKind::Float16Ty, placeholder->dims());
-  auto *convert = F->createConvertTo("convert", placeholder, outTy);
+  auto *convert =
+      F->createConvertTo("convert", placeholder, ElemKind::Float16Ty);
   auto *save = F->createSave("save", convert);
 
   size_t origSize = F->getNodes().size();
 
+  PrecisionConfiguration precConfig;
   TypeAToTypeBFunctionConverter converter(*F, ElemKind::FloatTy,
-                                          ElemKind::Float16Ty);
+                                          ElemKind::Float16Ty, precConfig);
   converter.convert();
 
   EXPECT_EQ(F->getNodes().size(), origSize + 1);
@@ -905,14 +1015,421 @@ TEST_P(AllBackends, convertExistingConversionToNoop) {
   EXPECT_TRUE(F->verify());
 }
 
-INSTANTIATE_TEST_CASE_P(Interpreter, AllBackends,
-                        ::testing::Values(BackendKind::Interpreter));
+/// Helper for testing FRWQSLWS FP16 conversion, with and without FP16
+/// accumulation based on \p forceFP16AccumSLS.
+static void testConvertFRWQSLWS(bool forceFP16AccumSLS) {
+  Module mod;
+  Function *F = mod.createFunction("test");
+  Tensor data(ElemKind::FloatTy, {3, 1});
+  data.getHandle() = {
+      2.0,
+      -0.5,
+      13,
+  };
 
-#ifdef GLOW_WITH_CPU
-INSTANTIATE_TEST_CASE_P(CPU, AllBackends, ::testing::Values(BackendKind::CPU));
-#endif // GLOW_WITH_CPU
+  Constant *weights = mod.createConstant(ElemKind::FloatTy, {8}, "weights");
 
-#ifdef GLOW_WITH_OPENCL
-INSTANTIATE_TEST_CASE_P(OpenCL, AllBackends,
-                        ::testing::Values(BackendKind::OpenCL));
-#endif // GLOW_WITH_OPENCL
+  Placeholder *indices =
+      mod.createPlaceholder(ElemKind::Int64ITy, {8}, "indices",
+                            /* isTrainable */ false);
+  Placeholder *lengths =
+      mod.createPlaceholder(ElemKind::Int32ITy, {4}, "lengths",
+                            /* isTrainable */ false);
+  auto *R = F->createFusedRowwiseQuantizedSparseLengthsWeightedSum(
+      "RQSLWS", data, weights, indices, lengths, ElemKind::UInt8FusedQTy);
+  SaveNode *S = F->createSave("save", R);
+
+  size_t origSize = F->getNodes().size();
+
+  CompilationContext cctx;
+  PrecisionConfiguration &precConfig = cctx.precisionConfig;
+  precConfig.convertToFP16 = true;
+  precConfig.convertFusedToFP16 = true;
+  precConfig.forceFP16AccumSLS = forceFP16AccumSLS;
+  transformForPrecisionMode(MockBackend(), F, cctx);
+
+  // Should have added convert nodes for the Data, Weights, and Result. Data
+  // and Weights ConvertTo nodes should have been merged in, while Result stil
+  // has a ConvertTo.
+  EXPECT_EQ(F->getNodes().size(), origSize + 1);
+
+  auto *convertResult = llvm::dyn_cast<ConvertToNode>(S->getInput());
+  ASSERT_NE(convertResult, nullptr);
+  EXPECT_EQ(convertResult->getResult().getElementType(), ElemKind::FloatTy);
+
+  auto *SLWS =
+      llvm::dyn_cast<FusedRowwiseQuantizedSparseLengthsWeightedSumNode>(
+          convertResult->getInput());
+  ASSERT_NE(SLWS, nullptr);
+  EXPECT_EQ(SLWS->getResult().getElementType(), ElemKind::Float16Ty);
+  EXPECT_EQ(SLWS->getUseFP16Accumulation(), forceFP16AccumSLS);
+
+  EXPECT_EQ(SLWS->getData().getElementType(), ElemKind::UInt8FusedFP16QTy);
+  EXPECT_EQ(SLWS->getWeights().getElementType(), ElemKind::Float16Ty);
+
+  EXPECT_TRUE(F->verify());
+}
+
+/// Test conversion of a FusedRowwiseQuantizedSparseLengthsWeightedSumNode to
+/// FP16, instead of creating it directly. Use FP16 accumulation.
+TEST(TypeAToTypeBFunctionConverter, convertFRWQSLWS_FP16Accum) {
+  testConvertFRWQSLWS(/* forceFP16AccumSLS */ true);
+}
+
+/// Test conversion of a FusedRowwiseQuantizedSparseLengthsWeightedSumNode to
+/// FP16, instead of creating it directly. Do not use FP16 accumulation; note
+/// that conversion by default uses FP32 accumulation.
+TEST(TypeAToTypeBFunctionConverter, convertFRWQSLWS_FP32Accum) {
+  testConvertFRWQSLWS(/* forceFP16AccumSLS */ false);
+}
+
+/// Test skipping conversion of a
+/// FusedRowwiseQuantizedSparseLengthsWeightedSumNode to FP16.
+TEST(TypeAToTypeBFunctionConverter, skipConvertingFRWQSLWS) {
+  Module mod;
+  Function *F = mod.createFunction("test");
+  Tensor data(ElemKind::FloatTy, {3, 1});
+  data.getHandle() = {
+      2.0,
+      -0.5,
+      13,
+  };
+
+  Constant *weights = mod.createConstant(ElemKind::FloatTy, {8}, "weights");
+
+  Placeholder *indices =
+      mod.createPlaceholder(ElemKind::Int64ITy, {8}, "indices",
+                            /* isTrainable */ false);
+  Placeholder *lengths =
+      mod.createPlaceholder(ElemKind::Int32ITy, {4}, "lengths",
+                            /* isTrainable */ false);
+  auto *R = F->createFusedRowwiseQuantizedSparseLengthsWeightedSum(
+      "RQSLWS", data, weights, indices, lengths, ElemKind::UInt8FusedQTy);
+  SaveNode *S = F->createSave("save", R);
+
+  size_t origSize = F->getNodes().size();
+
+  PrecisionConfiguration precConfig;
+  precConfig.convertToFP16 = true;
+  precConfig.convertFusedToFP16 = true;
+  precConfig.precisionModeKindSet.insert(
+      Kinded::Kind::FusedRowwiseQuantizedSparseLengthsWeightedSumNodeKind);
+  convertFunctionToFloat16(F, precConfig);
+
+  // Should have done nothing since we skipped its conversion. Check the
+  // Function is the same as before.
+  EXPECT_EQ(F->getNodes().size(), origSize);
+
+  auto *SLWS =
+      llvm::dyn_cast<FusedRowwiseQuantizedSparseLengthsWeightedSumNode>(
+          S->getInput());
+  ASSERT_EQ(SLWS, R);
+
+  auto *origData = llvm::dyn_cast<Constant>(SLWS->getData());
+  ASSERT_EQ(origData, R->getData().getNode());
+  EXPECT_EQ(origData->getOutput().getElementType(), ElemKind::UInt8FusedQTy);
+
+  auto *origWeights = llvm::dyn_cast<Constant>(SLWS->getWeights());
+  ASSERT_EQ(origWeights, weights);
+  EXPECT_EQ(origWeights->getOutput().getElementType(), ElemKind::FloatTy);
+
+  EXPECT_TRUE(F->verify());
+}
+
+/// Test conversion of only Float16Ty inputs of Node and not UInt8FusedQTy.
+TEST(TypeAToTypeBFunctionConverter, convertOnlyFloat16Ty) {
+  Module mod;
+  Function *F = mod.createFunction("test");
+  Tensor data(ElemKind::FloatTy, {3, 1});
+  data.getHandle() = {
+      2.0,
+      -0.5,
+      13,
+  };
+
+  Constant *weights = mod.createConstant(ElemKind::FloatTy, {8}, "weights");
+
+  Placeholder *indices =
+      mod.createPlaceholder(ElemKind::Int64ITy, {8}, "indices",
+                            /* isTrainable */ false);
+  Placeholder *lengths =
+      mod.createPlaceholder(ElemKind::Int32ITy, {4}, "lengths",
+                            /* isTrainable */ false);
+  auto *R = F->createFusedRowwiseQuantizedSparseLengthsWeightedSum(
+      "RQSLWS", data, weights, indices, lengths, ElemKind::UInt8FusedQTy);
+  SaveNode *S = F->createSave("save", R);
+
+  size_t origSize = F->getNodes().size();
+
+  PrecisionConfiguration precConfig;
+  precConfig.convertToFP16 = true;
+  precConfig.convertFusedToFP16 = false;
+  convertFunctionToFloat16(F, precConfig);
+
+  // Should have added convert nodes for the weights and results.
+  EXPECT_EQ(F->getNodes().size(), origSize + 2);
+
+  auto *convertResult = llvm::dyn_cast<ConvertToNode>(S->getInput());
+  ASSERT_NE(convertResult, nullptr);
+  EXPECT_EQ(convertResult->getResult().getElementType(), ElemKind::FloatTy);
+
+  auto *SLWS =
+      llvm::dyn_cast<FusedRowwiseQuantizedSparseLengthsWeightedSumNode>(
+          convertResult->getInput());
+  ASSERT_NE(SLWS, nullptr);
+  EXPECT_EQ(SLWS->getResult().getElementType(), ElemKind::Float16Ty);
+
+  auto *origData = llvm::dyn_cast<Constant>(SLWS->getData());
+  ASSERT_NE(origData, nullptr);
+  EXPECT_EQ(origData->getOutput().getElementType(), ElemKind::UInt8FusedQTy);
+
+  auto *convertWeights = llvm::dyn_cast<ConvertToNode>(SLWS->getWeights());
+  ASSERT_NE(convertWeights, nullptr);
+  EXPECT_EQ(convertWeights->getResult().getElementType(), ElemKind::Float16Ty);
+
+  auto *origWeights = llvm::dyn_cast<Constant>(convertWeights->getInput());
+  ASSERT_NE(origWeights, nullptr);
+  EXPECT_EQ(origWeights->getOutput().getElementType(), ElemKind::FloatTy);
+  EXPECT_EQ(weights, origWeights);
+
+  EXPECT_TRUE(F->verify());
+}
+
+/// Test conversion of only UInt8FusedQTy inputs of Node and not Float16Ty.
+TEST(TypeAToTypeBFunctionConverter, convertOnlyUInt8FusedQTy) {
+  Module mod;
+  Function *F = mod.createFunction("test");
+  Tensor data(ElemKind::FloatTy, {3, 1});
+  data.getHandle() = {
+      2.0,
+      -0.5,
+      13,
+  };
+
+  Constant *weights = mod.createConstant(ElemKind::FloatTy, {8}, "weights");
+
+  Placeholder *indices =
+      mod.createPlaceholder(ElemKind::Int64ITy, {8}, "indices",
+                            /* isTrainable */ false);
+  Placeholder *lengths =
+      mod.createPlaceholder(ElemKind::Int32ITy, {4}, "lengths",
+                            /* isTrainable */ false);
+  auto *R = F->createFusedRowwiseQuantizedSparseLengthsWeightedSum(
+      "RQSLWS", data, weights, indices, lengths, ElemKind::UInt8FusedQTy);
+  SaveNode *S = F->createSave("save", R);
+
+  size_t origSize = F->getNodes().size();
+
+  PrecisionConfiguration precConfig;
+  precConfig.convertToFP16 = false;
+  precConfig.convertFusedToFP16 = true;
+  convertFunctionToFloat16(F, precConfig);
+
+  // Should have added a convert nodes for the data.
+  EXPECT_EQ(F->getNodes().size(), origSize + 1);
+
+  auto *SLWS =
+      llvm::dyn_cast<FusedRowwiseQuantizedSparseLengthsWeightedSumNode>(
+          S->getInput());
+  ASSERT_EQ(SLWS, R);
+
+  auto *convertData = llvm::dyn_cast<ConvertToNode>(SLWS->getData());
+  ASSERT_NE(convertData, nullptr);
+  EXPECT_EQ(convertData->getResult().getElementType(),
+            ElemKind::UInt8FusedFP16QTy);
+
+  auto *origData = llvm::dyn_cast<Constant>(convertData->getInput());
+  ASSERT_NE(origData, nullptr);
+  EXPECT_EQ(origData->getOutput().getElementType(), ElemKind::UInt8FusedQTy);
+
+  auto *origWeights = llvm::dyn_cast<Constant>(SLWS->getWeights());
+  ASSERT_EQ(origWeights, weights);
+  EXPECT_EQ(origWeights->getOutput().getElementType(), ElemKind::FloatTy);
+
+  EXPECT_TRUE(F->verify());
+}
+
+// Test that we don't insert Clips around non-numeric nodes.
+TEST(TypeAToTypeBFunctionConverter, convertWithoutClipAroundNonNumericNodes) {
+  Module mod;
+  Function *F = mod.createFunction("test");
+  const dim_t dims[] = {1, 5, 10, 15};
+  const dim_t dimsReshape[] = {10, 10, 15};
+  Node *I0 = mod.createPlaceholder(ElemKind::FloatTy, dims, "i0", false);
+  Node *I1 = mod.createPlaceholder(ElemKind::FloatTy, dims, "i1", false);
+  Node *I2 = mod.createPlaceholder(ElemKind::Int32ITy, {2, 2, 2}, "i2", false);
+  Node *CN = F->createConcat("concat", {I0, I1}, 1);
+  Node *R = F->createReshape("reshape", CN, dimsReshape);
+  Node *S = F->createSlice("slice", R, {0, 0, 0}, {5, 5, 5});
+  Node *G = F->createGather("gather", S, I2);
+  F->createSave("ret", G);
+
+  PrecisionConfiguration precConfig;
+  precConfig.convertToFP16 = true;
+  precConfig.clipFP16 = true;
+  convertFunctionToFloat16(F, precConfig);
+
+  int numClips = 0;
+  int numConvertTos = 0;
+  for (auto &n : F->getNodes()) {
+    if (n.getKind() == Kinded::Kind::ClipNodeKind) {
+      ++numClips;
+    } else if (n.getKind() == Kinded::Kind::ConvertToNodeKind) {
+      ++numConvertTos;
+    }
+  }
+
+  EXPECT_EQ(9, numConvertTos);
+  EXPECT_EQ(0, numClips);
+
+  EXPECT_TRUE(F->verify());
+}
+
+// Test that we don't insert Clips at the output of Tanh or Sigmoid
+TEST(TypeAToTypeBFunctionConverter, convertWithoutClipAfterTanhOrSigmoid) {
+  Module mod;
+  Function *F = mod.createFunction("test");
+  const dim_t dims[] = {10, 20};
+  const dim_t dims2[] = {10, 30};
+  Node *I0 = mod.createPlaceholder(ElemKind::FloatTy, dims, "i0", false);
+  Node *I1 = mod.createPlaceholder(ElemKind::FloatTy, dims2, "i1", false);
+  Node *T = F->createTanh("tanh", {I0});
+  Node *S = F->createSigmoid("sigmoid", {I1});
+  Node *CN = F->createConcat("concat", {T, S}, 1);
+  F->createSave("ret", CN);
+
+  PrecisionConfiguration precConfig;
+  precConfig.convertToFP16 = true;
+  precConfig.clipFP16 = true;
+  convertFunctionToFloat16(F, precConfig);
+
+  int numClips = 0;
+  int numConvertTos = 0;
+  for (auto &n : F->getNodes()) {
+    if (n.getKind() == Kinded::Kind::ClipNodeKind) {
+      ++numClips;
+    } else if (n.getKind() == Kinded::Kind::ConvertToNodeKind) {
+      ++numConvertTos;
+    }
+  }
+
+  EXPECT_EQ(7, numConvertTos);
+  EXPECT_EQ(2, numClips);
+
+  EXPECT_TRUE(F->verify());
+}
+
+// Test that we don't insert Clips at the output of ConvertTo if its input is
+// fp16
+TEST(TypeAToTypeBFunctionConverter, convertWithoutClipAfterFp16ConvertTo) {
+  Module mod;
+  Function *F = mod.createFunction("test");
+  const dim_t dims[] = {10, 20};
+  const dim_t dims2[] = {10, 30};
+  Node *I0 = mod.createPlaceholder(ElemKind::Float16Ty, dims, "i0", false);
+  Node *I1 = mod.createPlaceholder(ElemKind::Float16Ty, dims2, "i1", false);
+  Node *T = F->createConvertTo("c1", {I0}, ElemKind::FloatTy);
+  Node *S = F->createConvertTo("c2", {I1}, ElemKind::FloatTy);
+  Node *CN = F->createConcat("concat", {T, S}, 1);
+  F->createSave("ret", CN);
+
+  PrecisionConfiguration precConfig;
+  precConfig.convertToFP16 = true;
+  precConfig.clipFP16 = true;
+  convertFunctionToFloat16(F, precConfig);
+
+  int numClips = 0;
+  int numConvertTos = 0;
+  for (auto &n : F->getNodes()) {
+    if (n.getKind() == Kinded::Kind::ClipNodeKind) {
+      ++numClips;
+    } else if (n.getKind() == Kinded::Kind::ConvertToNodeKind) {
+      ++numConvertTos;
+    }
+  }
+
+  EXPECT_EQ(0, numClips);
+
+  EXPECT_TRUE(F->verify());
+}
+
+// Test that we only insert clips for outputs.
+TEST(TypeAToTypeBFunctionConverter, checkConvertOnlyOutputs) {
+  Module mod;
+  Function *F = mod.createFunction("test");
+  Node *I = mod.createPlaceholder(ElemKind::FloatTy, {10}, "i", false);
+  ReluNode *RN = F->createRELU("relu", I);
+  SaveNode *SN = F->createSave("ret", RN);
+
+  PrecisionConfiguration precConfig;
+  precConfig.convertToFP16 = true;
+  precConfig.clipFP16 = true;
+  precConfig.clipFP16SkipInputs = true;
+  precConfig.convertPlaceholdersToFP16 = true;
+  precConfig.convertConstantsToFP16 = true;
+  convertFunctionToFloat16(F, precConfig);
+
+  // PH -> ConvertToFP16 -> Clip -> ConvertToFP32 -> ConvertToFP16 -> Relu ->
+  // Clip -> ConvertToFP32 -> Save
+
+  ConvertToNode *convertRN = llvm::dyn_cast<ConvertToNode>(SN->getInput());
+  ASSERT_TRUE(convertRN);
+  EXPECT_EQ(convertRN->getResult().getType()->getElementType(),
+            ElemKind::FloatTy);
+  ClipNode *clipRN = llvm::dyn_cast<ClipNode>(convertRN->getInput());
+  ASSERT_TRUE(clipRN);
+  ASSERT_TRUE(clipRN->getInput() == RN->getResult());
+  ConvertToNode *convert32To16 = llvm::dyn_cast<ConvertToNode>(RN->getInput());
+  ASSERT_TRUE(convert32To16);
+  EXPECT_EQ(convert32To16->getResult().getType()->getElementType(),
+            ElemKind::Float16Ty);
+  ConvertToNode *convert16To32 =
+      llvm::dyn_cast<ConvertToNode>(convert32To16->getInput());
+  ASSERT_TRUE(convert16To32);
+  EXPECT_EQ(convert16To32->getResult().getType()->getElementType(),
+            ElemKind::FloatTy);
+  ClipNode *clipPH = llvm::dyn_cast<ClipNode>(convert16To32->getInput());
+  ASSERT_TRUE(clipPH);
+  ConvertToNode *convertPH = llvm::dyn_cast<ConvertToNode>(clipPH->getInput());
+  ASSERT_TRUE(convertPH);
+  EXPECT_EQ(convertPH->getResult().getType()->getElementType(),
+            ElemKind::Float16Ty);
+
+  EXPECT_TRUE(F->verify());
+}
+
+// Test that we only insert clips for outputs.
+TEST(TypeAToTypeBFunctionConverter, checkConvertClipStorage) {
+  Module mod;
+  Function *F = mod.createFunction("test");
+  Node *PH = mod.createPlaceholder(ElemKind::FloatTy, {10}, "ph", false);
+  Node *C = mod.createConstant(ElemKind::FloatTy, {10, 1}, "c");
+  SaveNode *SPH = F->createSave("ret", PH);
+  SaveNode *SC = F->createSave("ret", C);
+
+  PrecisionConfiguration precConfig;
+  precConfig.convertToFP16 = true;
+  precConfig.clipFP16 = true;
+  precConfig.clipFP16SkipInputs = true;
+  precConfig.convertPlaceholdersToFP16 = true;
+  precConfig.convertConstantsToFP16 = true;
+  convertFunctionToFloat16(F, precConfig);
+
+  ConvertToNode *convertFP32PH = llvm::dyn_cast<ConvertToNode>(SPH->getInput());
+  ASSERT_TRUE(convertFP32PH);
+  ClipNode *clipPH = llvm::dyn_cast<ClipNode>(convertFP32PH->getInput());
+  ASSERT_TRUE(clipPH);
+  ConvertToNode *convertFP16PH =
+      llvm::dyn_cast<ConvertToNode>(clipPH->getInput());
+  ASSERT_TRUE(convertFP16PH);
+
+  ConvertToNode *convertFP32C = llvm::dyn_cast<ConvertToNode>(SC->getInput());
+  ASSERT_TRUE(convertFP32C);
+  ClipNode *clipC = llvm::dyn_cast<ClipNode>(convertFP32C->getInput());
+  ASSERT_TRUE(clipC);
+  ConvertToNode *convertFP16C =
+      llvm::dyn_cast<ConvertToNode>(clipC->getInput());
+  ASSERT_TRUE(convertFP16C);
+
+  EXPECT_TRUE(F->verify());
+}

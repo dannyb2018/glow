@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,10 @@
 #define GLOW_BACKENDS_TRACEEVENTS_H
 
 #include "glow/Graph/Nodes.h"
+#include "glow/Support/ThreadPool.h"
 #include "llvm/ADT/DenseMap.h"
 
+#include <list>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -31,11 +33,27 @@ class PlaceholderBindings;
 /// Designed to match the Google Trace Event Format for Chrome:
 /// https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU
 struct TraceEvent {
+  /// The amount and type of TraceEvents that should appear in the trace.
+  enum TraceLevel {
+    NONE = 0x00,     // No trace events.
+    REQUEST = 0x01,  // Request timing events only.
+    RUNTIME = 0x02,  // Glow runtime events only.
+    COPY = 0x04,     // Memory copies and DMA.
+    OPERATOR = 0x08, // Backend operator instrumentation only.
+    DEBUG = 0x10,    // Full debug events with extra information.
+    STANDARD = REQUEST | RUNTIME | COPY |
+               OPERATOR, // Glow runtime events and backend operator events.
+  };
+
   /// Event Types.
-  static constexpr auto BeginType = "B";
-  static constexpr auto EndType = "E";
-  static constexpr auto InstantType = "I";
-  static constexpr auto CompleteType = "X";
+  static constexpr auto BeginType = 'B';
+  static constexpr auto EndType = 'E';
+  static constexpr auto InstantType = 'I';
+  static constexpr auto CompleteType = 'X';
+  static constexpr auto AsyncBeginType = 'b';
+  static constexpr auto AsyncEndType = 'e';
+  /// MetadataType is used for the thread name mapping.
+  static constexpr auto MetadataType = 'M';
 
   /// Human readable name for the item, will be used to match up begin and end.
   std::string name;
@@ -45,7 +63,7 @@ struct TraceEvent {
 
   /// Type of the event, a (usually) one char code (see Event Descriptions in
   /// the Trace Event Format spec). e.g. 'B' for begin event, 'E' for end event.
-  std::string type;
+  char type;
 
   /// Thread Id for this event. All Events on the same tid will be shown on the
   /// same row of the trace.
@@ -54,32 +72,41 @@ struct TraceEvent {
   /// Duration of the event (for Complete events).
   uint64_t duration{0};
 
+  /// Async event id (-1 == no id)
+  int id{-1};
+
+  /// The type/verbosity of this event.
+  TraceLevel level{NONE};
+
   /// Arbitrary TraceEvent arguments (from spec).
   std::map<std::string, std::string> args;
 
-  TraceEvent(llvm::StringRef n, uint64_t ts, llvm::StringRef c, int t)
-      : name(n), timestamp(ts), type(c), tid(t) {}
+  TraceEvent(llvm::StringRef n, TraceLevel l, uint64_t ts, char c, int t,
+             int d = -1)
+      : name(n), timestamp(ts), type(c), tid(t), id(d), level(l) {}
 
-  TraceEvent(llvm::StringRef n, uint64_t ts, llvm::StringRef c, int t,
-             std::map<std::string, std::string> a)
-      : name(n), timestamp(ts), type(c), tid(t), args(a) {}
+  TraceEvent(llvm::StringRef n, TraceLevel l, uint64_t ts, char c, int t,
+             std::map<std::string, std::string> a, int d = -1)
+      : name(n), timestamp(ts), type(c), tid(t), id(d), level(l), args(a) {}
 
-  TraceEvent(llvm::StringRef n, uint64_t ts, uint64_t dur, int t,
-             std::map<std::string, std::string> a = {})
+  TraceEvent(llvm::StringRef n, TraceLevel l, uint64_t ts, uint64_t dur, int t,
+             std::map<std::string, std::string> a = {}, int d = -1)
       : name(n), timestamp(ts), type(CompleteType), tid(t), duration(dur),
-        args(a) {}
+        id(d), level(l), args(a) {}
 
   static void
-  dumpTraceEvents(std::vector<TraceEvent> &events, llvm::StringRef filename,
+  dumpTraceEvents(std::list<TraceEvent> &events, llvm::StringRef filename,
                   const std::string &processName = "",
                   const std::map<int, std::string> &threadNames = {});
 
-  // Return the current time in microseconds in the timestamp domain.
+  /// Return the current time in microseconds in the timestamp domain.
   static uint64_t now();
 
-  // Returns a unique id associated with the current thread.
-  static size_t getThreadId();
+  /// Returns a string representation of the provided \p level.
+  static llvm::StringRef traceLevelToString(TraceLevel level);
 };
+
+using TraceLevel = TraceEvent::TraceLevel;
 
 /// Tracing / Profiling events map for a CompiledFunction.
 /// This class encodes information on how to read event metrics out of Tensors
@@ -102,19 +129,20 @@ struct TraceInfo {
     size_t startIndex;
     size_t endIndex;
     std::string name;
-    std::string type;
+    char type;
 
     // additional info per backend. May not be present.
     std::string context;
+    std::string kind;
   };
 
   std::map<Placeholder *, std::vector<Event>> events;
 
-  void add(Placeholder *PH, size_t index, std::string name, std::string type) {
+  void add(Placeholder *PH, size_t index, std::string name, char type) {
     events[PH].push_back({index, 0, std::move(name), std::move(type), ""});
   }
 
-  void add(Placeholder *PH, size_t index, std::string name, std::string type,
+  void add(Placeholder *PH, size_t index, std::string name, char type,
            std::string context) {
     events[PH].push_back(
         {index, 0, std::move(name), std::move(type), std::move(context)});
@@ -122,72 +150,78 @@ struct TraceInfo {
 
   /// Add data for a Complete TraceEvent.
   void add(Placeholder *PH, size_t startIndex, size_t endIndex,
-           std::string name, std::string context = "") {
+           std::string name, std::string context = "", std::string kind = "") {
     events[PH].push_back({startIndex, endIndex, std::move(name),
-                          TraceEvent::CompleteType, std::move(context)});
+                          TraceEvent::CompleteType, std::move(context),
+                          std::move(kind)});
   }
-};
-
-/// The amount and type of TraceEvents that should appear in the trace.
-enum class TraceLevel {
-  NONE,     // No trace events.
-  RUNTIME,  // Glow runtime events only.
-  OPERATOR, // Backend operator instrumentation only.
-  STANDARD, // Glow runtime events and backend operator events.
-  DEBUG     // Full debug events with extra information.
 };
 
 /// A context for storing TraceEvents throughout a run (ie. between
 /// partitioned CompiledFunctions).
 class TraceContext {
   /// The list of materialized Events filled out with timestamp and metadata.
-  std::vector<TraceEvent> traceEvents_;
+  std::list<TraceEvent> traceEvents_;
 
   /// Human readable name mapping for trace Threads.
   std::map<int, std::string> threadNames_;
 
   /// The detail level of tracing for this run.
-  TraceLevel traceLevel_{TraceLevel::NONE};
+  int traceLevel_{TraceLevel::NONE};
 
   /// Lock around traceEvents_.
   std::mutex lock_;
 
 public:
-  TraceContext(TraceLevel level) : traceLevel_(level) {}
+  TraceContext(int level) : traceLevel_(level) {}
 
   /// \returns TraceEvents for the last run.
-  std::vector<TraceEvent> &getTraceEvents() { return traceEvents_; }
-
-  /// \returns TraceEvents for the last run.
-  llvm::ArrayRef<TraceEvent> getTraceEvents() const { return traceEvents_; }
+  std::list<TraceEvent> &getTraceEvents() { return traceEvents_; }
 
   /// \returns the level of verbosity allowed for TraceEvents.
-  TraceLevel getTraceLevel() { return traceLevel_; }
+  int getTraceLevel() { return traceLevel_; }
 
   /// Sets the level of verbosity for TraceEvents.
   void setTraceLevel(TraceLevel level) { traceLevel_ = level; }
 
-  /// Logs a new TraceEvent at the current time with the given \p name, \p
-  /// type and optionally additional attributes.
-  void
-  logTraceEvent(llvm::StringRef name,
-                llvm::StringRef type = TraceEvent::InstantType,
-                std::map<std::string, std::string> additionalAttributes = {});
+  /// \returns true if should log an event of the provided \p level.
+  bool shouldLog(TraceLevel level) { return (traceLevel_ & level) != 0; }
 
-  // Logs a new TraceEvent at the provided \p timestamp, with the given \p
-  // name, \p type and optionally additional attributes.
+  /// Logs a new TraceEvent at the current time with the given \p name, \p
+  /// type and optionally additional attributes and threadId.
   void
-  logTraceEvent(llvm::StringRef name, llvm::StringRef type, uint64_t timestamp,
-                std::map<std::string, std::string> additionalAttributes = {});
+  logTraceEvent(llvm::StringRef name, TraceLevel level,
+                char type = TraceEvent::InstantType,
+                std::map<std::string, std::string> additionalAttributes = {},
+                size_t tid = threads::getThreadId(), int id = -1);
+
+  /// Logs a new TraceEvent at the provided \p timestamp, with the given \p
+  /// name, \p type and optionally additional attributes.
+  void
+  logTraceEvent(llvm::StringRef name, TraceLevel level, char type,
+                uint64_t timestamp,
+                std::map<std::string, std::string> additionalAttributes = {},
+                size_t tid = threads::getThreadId(), int id = -1);
+
+  /// Check if event should be logged and then log pre-created TraceEvent
+  void logTraceEvent(TraceEvent &&ev);
 
   /// Logs a new TraceEvent with the Complete event type, the start time is
   /// provided and uses the current time to determine duration.
   void logCompleteTraceEvent(
-      llvm::StringRef name, uint64_t startTimestamp,
+      llvm::StringRef name, TraceLevel level, uint64_t startTimestamp,
       std::map<std::string, std::string> additionalAttributes = {});
+  void logCompleteTraceEvent(
+      llvm::StringRef name, TraceLevel level, uint64_t startTimestamp,
+      std::map<std::string, std::string> additionalAttributes, size_t tid);
 
   /// Sets the human readable \p name for thread \tid.
   void setThreadName(int tid, llvm::StringRef name);
+
+  /// Sets the human readable \p name for the current thread (by
+  /// threads::getThreadId()).
+  void setThreadName(llvm::StringRef name);
+
   /// \returns the list of human readable thread names.
   std::map<int, std::string> &getThreadNames() { return threadNames_; }
 
@@ -196,10 +230,11 @@ public:
   void dump(llvm::StringRef filename, const std::string &processName = "");
 
   /// Moves all TraceEvents and thread names in \p other into this context.
+  /// This will clear in the input TraceContext.
   void merge(TraceContext *other);
 
   /// Moves all TraceEvents and thread names in \p other into this context.
-  /// This version is destructive of the other TraceContext.
+  /// This will clear in the input TraceContext.
   void merge(std::unique_ptr<TraceContext> other) { merge(other.get()); }
 };
 
@@ -207,36 +242,55 @@ public:
 /// given TraceContext.
 
 /// Logs a new "Begin" event, beginning an event with duration.
-#define TRACE_EVENT_BEGIN(ctx, name)                                           \
+#define TRACE_EVENT_BEGIN(ctx, level, name)                                    \
   if (ctx) {                                                                   \
-    ctx->logTraceEvent(name, TraceEvent::BeginType);                           \
+    ctx->logTraceEvent(name, level, TraceEvent::BeginType);                    \
   }
 
 /// Logs a new "End" event, ending an event with duration.
-#define TRACE_EVENT_END(ctx, name)                                             \
+#define TRACE_EVENT_END(ctx, level, name)                                      \
   if (ctx) {                                                                   \
-    ctx->logTraceEvent(name, TraceEvent::EndType);                             \
+    ctx->logTraceEvent(name, level, TraceEvent::EndType);                      \
   }
 
 /// Logs a new "Instant" event, which has an associated time, but no duration.
-#define TRACE_EVENT_INSTANT(ctx, name)                                         \
+#define TRACE_EVENT_INSTANT(ctx, level, name)                                  \
   if (ctx) {                                                                   \
-    ctx->logTraceEvent(name, TraceEvent::InstantType);                         \
+    ctx->logTraceEvent(name, level, TraceEvent::InstantType);                  \
   }
 
 /// Logs a new TraceEvent with the provided type and timestamp.
-#define TRACE_EVENT_LOG(ctx, name, type, ts)                                   \
+#define TRACE_EVENT_LOG(ctx, level, name, type, ts)                            \
   if (ctx) {                                                                   \
-    ctx->logTraceEvent(name, type, ts);                                        \
+    ctx->logTraceEvent(name, level, type, ts);                                 \
+  }
+
+/// Logs a new TraceEvent with the provided type and timestamp.
+#define TRACE_EVENT_LOG_ID(ctx, level, name, type, ts, id)                     \
+  if (ctx) {                                                                   \
+    ctx->logTraceEvent(name, level, type, ts, {}, threads::getThreadId(), id); \
+  }
+
+/// Create TraceEvent, don't log it
+#define TRACE_EVENT_CREATE(variable, level, name, type, id)                    \
+  TraceEvent variable(name, level, TraceEvent::now(), type,                    \
+                      threads::getThreadId(), {}, id)
+
+/// Logs a pre-created TraceEvent
+#define TRACE_EVENT_LOG_PRE_CREATED(ctx, ev)                                   \
+  if (ctx) {                                                                   \
+    ev.tid = threads::getThreadId();                                           \
+    ctx->logTraceEvent(std::move(ev));                                         \
   }
 
 /// Logs a new TraceEvent which begins and ends in the current scope block.
-#define TRACE_EVENT_SCOPE(ctx, name) ScopedTraceBlock __event__(ctx, name);
+#define TRACE_EVENT_SCOPE(ctx, level, name)                                    \
+  ScopedTraceBlock __event__(ctx, level, name);
 
 /// Logs a new scoped TraceEvent with the provided name, allowing multiple
 /// within the same scope.
-#define TRACE_EVENT_SCOPE_NAMED(ctx, name, objName)                            \
-  ScopedTraceBlock objName(ctx, name);
+#define TRACE_EVENT_SCOPE_NAMED(ctx, level, name, objName)                     \
+  ScopedTraceBlock objName(ctx, level, name);
 
 /// End a scoped TraceEvent before its scope exits.
 #define TRACE_EVENT_SCOPE_END() __event__.end();
@@ -244,12 +298,17 @@ public:
 /// End a named scoped TraceEvent before its scope exits.
 #define TRACE_EVENT_SCOPE_END_NAMED(name) name.end();
 
+class ExecutionContext;
+
 /// Helper class which uses RAII for the start and end times of a TraceEvent.
 /// At creation will create a "begin" TraceEvent and at destuction (or end())
 /// will create an "end" TraceEvent.
 class ScopedTraceBlock {
   /// The context to log to.
   TraceContext *context_;
+
+  /// The TraceLevel of the associated TraceEvent.
+  TraceLevel level_;
 
   /// The name of the event.
   llvm::StringRef name_;
@@ -266,7 +325,11 @@ class ScopedTraceBlock {
   bool end_{false};
 
 public:
-  ScopedTraceBlock(TraceContext *context, llvm::StringRef name);
+  ScopedTraceBlock(TraceContext *context, TraceLevel level,
+                   llvm::StringRef name);
+
+  ScopedTraceBlock(ExecutionContext *context, TraceLevel level,
+                   llvm::StringRef name);
   ~ScopedTraceBlock();
 
   /// Adds an argument to the metadata for this object.

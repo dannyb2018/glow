@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2018-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -139,11 +139,11 @@ TEST(HyphenTest, mapLetter) {
 /// Map a 6-letter window of a word to an input tensor using a one-hot encoding.
 ///
 /// The tensor must be N x 6 x 27: batch x position x letter.
-static void mapLetterWindow(const string &window, size_t idx,
+static void mapLetterWindow(const string &window, dim_t idx,
                             Handle<float> tensor) {
   EXPECT_EQ(window.size(), 6);
-  for (size_t row = 0; row < 6; row++) {
-    size_t col = mapLetter(window[row]);
+  for (dim_t row = 0; row < 6; row++) {
+    dim_t col = mapLetter(window[row]);
     tensor.at({idx, row, col}) = 1;
   }
 }
@@ -283,21 +283,17 @@ struct HyphenNetwork {
 
   // Run `inputs` through the inference function and check the results against
   // `hyphens`. Return the number of errors.
-  unsigned inferenceErrors(ExecutionEngine &EE, llvm::StringRef name,
+  unsigned inferenceErrors(ExecutionEngine &EE, llvm::StringRef fName,
                            Tensor &inputs, const vector<bool> &hyphens,
                            TrainingConfig &TC) {
-    // Compilation is destructive because of target-specific lowering.
-    // Compile a clone of the inference function.
-    auto *CF = infer_->clone(name);
-    EE.compile(CompilationMode::Infer, CF);
-
-    auto batchSize = TC.batchSize;
-    auto numSamples = inputs.dims()[0];
+    dim_t batchSize = TC.batchSize;
+    dim_t numSamples = inputs.dims()[0];
     EXPECT_LE(batchSize, numSamples);
-    auto resultHandle = bindings_.get(result_->getPlaceholder())->getHandle<>();
+    auto resultHandle =
+        bindings_.get(bindings_.getPlaceholderByName("result"))->getHandle<>();
     unsigned errors = 0;
 
-    for (size_t bi = 0; bi < numSamples; bi += batchSize) {
+    for (dim_t bi = 0; bi < numSamples; bi += batchSize) {
       // Get a batch-sized slice of inputs and run them through the inference
       // function. Do a bit of overlapping if the batch size doesn't divide the
       // number of samples.
@@ -306,10 +302,10 @@ struct HyphenNetwork {
       }
       auto batchInputs = inputs.getUnowned({batchSize, 6, 27}, {bi, 0, 0});
       updateInputPlaceholders(bindings_, {input_}, {&batchInputs});
-      EE.run(bindings_);
+      EE.run(bindings_, fName);
 
       // Check each output in the batch.
-      for (size_t i = 0; i != batchSize; i++) {
+      for (dim_t i = 0; i != batchSize; i++) {
         // Note that the two softmax outputs always sum to 1, so we only look at
         // one.
         float value = resultHandle.at({i, 1});
@@ -324,7 +320,7 @@ struct HyphenNetwork {
 } // namespace
 
 TEST(HyphenTest, network) {
-  ExecutionEngine EE(BackendKind::CPU);
+  ExecutionEngine EE("CPU");
 
   // Convert the training data to word windows and labels.
   vector<string> words;
@@ -334,7 +330,7 @@ TEST(HyphenTest, network) {
   }
 
   // This depends on the training data, of course.
-  const size_t numSamples = 566;
+  const dim_t numSamples = 566;
   ASSERT_EQ(hyphens.size(), numSamples);
   ASSERT_EQ(words.size(), numSamples);
 
@@ -350,9 +346,10 @@ TEST(HyphenTest, network) {
   // Convert words and hyphens to a tensor representation.
   Tensor inputs(ElemKind::FloatTy, {numSamples, 6, 27});
   Tensor expected(ElemKind::Int64ITy, {numSamples, 1});
+  inputs.zero();
   auto inputHandle = inputs.getHandle<float>();
   auto expectedHandle = expected.getHandle<int64_t>();
-  for (size_t i = 0; i != numSamples; i++) {
+  for (dim_t i = 0; i != numSamples; i++) {
     mapLetterWindow(words[i], i, inputHandle);
     expectedHandle.at({i, 0}) = hyphens[i];
   }
@@ -362,21 +359,32 @@ TEST(HyphenTest, network) {
   TC.learningRate = 0.8;
   TC.batchSize = 50;
   HyphenNetwork net(EE.getModule(), TC);
+  auto fName = net.infer_->getName();
+  auto tfName = net.train_->getName();
 
   // This variable records the number of the next sample to be used for
   // training.
   size_t sampleCounter = 0;
 
   // Train using mini-batch SGD.
-  EE.compile(CompilationMode::Train, net.train_);
+  EE.compile(CompilationMode::Train);
   runBatch(EE, net.bindings_, 1000, sampleCounter, {net.input_, net.expected_},
-           {&inputs, &expected});
+           {&inputs, &expected}, tfName);
 
   // Now test inference on the trained network.
   // Note that we have probably overfitted the data, so we expect 100% accuracy.
-  EXPECT_EQ(net.inferenceErrors(EE, "cpu", inputs, hyphens, TC), 0);
+  EXPECT_EQ(net.inferenceErrors(EE, fName, inputs, hyphens, TC), 0);
 
   // See of the interpreter gets the same result.
-  EE.setBackend(BackendKind::Interpreter);
-  EXPECT_EQ(net.inferenceErrors(EE, "interpreter", inputs, hyphens, TC), 0);
+
+  ExecutionEngine EE2("CPU");
+  HyphenNetwork netInterpreter(EE2.getModule(), TC);
+  EE2.compile(CompilationMode::Train);
+  // Copy the trained weights from the CPU run.
+  net.bindings_.copyToTarget("bias", netInterpreter.bindings_);
+  net.bindings_.copyToTarget("bias__1", netInterpreter.bindings_);
+  net.bindings_.copyToTarget("weights", netInterpreter.bindings_);
+  net.bindings_.copyToTarget("weights__1", netInterpreter.bindings_);
+
+  EXPECT_EQ(netInterpreter.inferenceErrors(EE2, fName, inputs, hyphens, TC), 0);
 }

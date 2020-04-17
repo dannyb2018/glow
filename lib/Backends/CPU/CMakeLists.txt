@@ -1,3 +1,5 @@
+add_subdirectory(ClassGen)
+
 if("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang")
   set(CLANG_BIN ${CMAKE_CXX_COMPILER})
 else()
@@ -11,10 +13,13 @@ if(NOT LLVM_LINK_BIN)
   if(MSVC)
     set(LLVM_LINK_BIN ${LLVM_BINARY_DIR}/$(Configuration)/bin/llvm-link)
   else()
-    set(LLVM_LINK_BIN ${LLVM_BINARY_DIR}/bin/llvm-link)
+    find_program(LLVM_LINK_BIN NAMES llvm-link)
+    if(NOT EXISTS ${LLVM_LINK_BIN})
+      set(LLVM_LINK_BIN ${LLVM_BINARY_DIR}/bin/llvm-link)
+    endif()
   endif()
 endif()
-if(NOT EXISTS ${LLVM_LINK_BIN})
+if(NOT EXISTS ${LLVM_LINK_BIN} AND NOT MSVC)
   message(SEND_ERROR "unable to find llvm-link, cannot build the CPU runtime")
 endif()
 
@@ -22,9 +27,22 @@ set(CPURunttimeCompilationOptions
       -std=c++14
       -ffast-math
       -fno-finite-math-only
-      -g0
+      -g
+      -I${CMAKE_SOURCE_DIR}/include
       -emit-llvm
-      -O0)
+      -O0
+
+      # When building for a custom target, use this as an example of how to
+      # set up cross-compilation correctly. Then, when building bundles,
+      # do not forget to specify the -target= option with the same target
+      # string. Also, when building bundles, specify the -llvm-compiler option
+      # together with -llvm-compiler-opt to specify custom compilation flags for
+      # cross-compilation.
+
+      # --sysroot=/usr/arm-linux-gnueabihf/
+      # -target armv7-neon-linux-gnueabihf
+      # -I/usr/arm-linux-gnueabihf/include/c++/7.4.0/arm-linux-gnueabihf/
+      ${LLVMCPURuntimeExtraFlags})
 
 set(libjit_files "libjit;libjit_conv;libjit_matmul")
 
@@ -55,15 +73,15 @@ add_custom_command(
     DEPENDS  ${CPURuntime_OBJS} ${CPURuntime_SRCS}
     WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
 
-file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/glow/CPU)
+file(MAKE_DIRECTORY ${GLOW_BINARY_DIR}/glow/CPU)
 add_custom_command(
-    OUTPUT ${CMAKE_BINARY_DIR}/glow/CPU/libjit_bc.inc
-    COMMAND include-bin "${CMAKE_BINARY_DIR}/CPU/libjit.bc" "${CMAKE_BINARY_DIR}/glow/CPU/libjit_bc.inc"
+    OUTPUT ${GLOW_BINARY_DIR}/glow/CPU/libjit_bc.inc
+    COMMAND include-bin "${GLOW_BINARY_DIR}/CPU/libjit.bc" "${GLOW_BINARY_DIR}/glow/CPU/libjit_bc.inc"
     DEPENDS ${GLOW_BINARY_DIR}/CPU/libjit.bc
     WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
 
 add_custom_target(CPURuntime
-  DEPENDS ${CMAKE_BINARY_DIR}/glow/CPU/libjit_bc.inc
+  DEPENDS ${GLOW_BINARY_DIR}/glow/CPU/libjit_bc.inc
   WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
 
 if (NOT MSVC)
@@ -74,7 +92,7 @@ if (NOT MSVC)
 endif(NOT MSVC)
 
 add_library(CPUBackend
-            "${CMAKE_BINARY_DIR}/glow/CPU/libjit_bc.inc"
+            "${GLOW_BINARY_DIR}/glow/CPU/libjit_bc.inc"
             CPUBackend.cpp
             CPUDeviceManager.cpp
             CPUFactory.cpp
@@ -88,8 +106,11 @@ target_link_libraries(CPUBackend
                         CodeGen
                         Graph
                         IR
-                        Optimizer
+                        IROptimizer
+                        IROptimizerPipeline
+                        GraphOptimizerPipeline
                         QuantizationBase
+                        Runtime
                         LLVMIRCodeGen)
 add_dependencies(CPUBackend CPURuntime)
 

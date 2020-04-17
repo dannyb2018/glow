@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,14 @@
 #ifndef GLOW_SUPPORT_SUPPORT_H
 #define GLOW_SUPPORT_SUPPORT_H
 
+#include "glow/Support/Error.h"
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <chrono>
 #include <iostream>
+#include <map>
 #include <sstream>
 
 namespace glow {
@@ -113,7 +116,7 @@ void report(const char *msg);
 inline void report(const std::string &str) { report(str.c_str()); }
 inline void report(llvm::StringRef str) { report(str.data()); }
 
-/// Legalize \p name used in Module. In GLow module, the name of placeholders
+/// Legalize \p name used in Module. In Glow module, the name of placeholders
 /// and constants should look like valid C identifiers. Therefore, those symbols
 /// can be inspected under debugger.
 std::string legalizeName(llvm::StringRef name);
@@ -127,21 +130,25 @@ struct MultiLineStr {
 struct DeviceConfigHelper {
   /// Device Name.
   std::string name_;
-  /// BackendKind name.
-  std::string kindName_;
+  /// Backend name.
+  std::string backendName_;
   /// A string with multi lines. Each line represents a param.
   MultiLineStr parameters_;
   DeviceConfigHelper() = default;
-  DeviceConfigHelper(std::string &name, std::string &kindName)
-      : name_(name), kindName_(kindName) {}
-  DeviceConfigHelper(std::string &kindName, std::string &name,
+  DeviceConfigHelper(std::string &name, std::string &backendName)
+      : name_(name), backendName_(backendName) {}
+  DeviceConfigHelper(std::string &backendName, std::string &name,
                      MultiLineStr &parameters)
-      : name_(name), kindName_(kindName), parameters_(parameters) {}
+      : name_(name), backendName_(backendName), parameters_(parameters) {}
 };
 
 /// Deserialize quantization infos from the file \p fileName.
 std::vector<DeviceConfigHelper>
 deserializeDeviceConfigFromYaml(llvm::StringRef fileName);
+
+/// Deserialize string to string map from the file \p fileName.
+std::map<std::string, std::string>
+deserializeStrStrMapFromYaml(llvm::StringRef fileName);
 
 /// Printf-like formatting for std::string.
 const std::string strFormat(const char *format, ...)
@@ -149,6 +156,71 @@ const std::string strFormat(const char *format, ...)
     __attribute__((__format__(__printf__, 1, 2)));
 #endif
 ;
+
+/// Printf-like formatting for std::string. The returned string lives until the
+/// end of the program execution.
+const std::string &staticStrFormat(const char *format, ...)
+#ifndef _MSC_VER
+    __attribute__((__format__(__printf__, 1, 2)));
+#endif
+;
+
+/// Helper that converts and \returns an enum class to an unsigned. Useful when
+/// using an enum class in a bitset.
+template <class T> inline constexpr unsigned convertEnumToUnsigned(T e) {
+  static_assert(std::is_enum<T>::value, "Can only pass enums.");
+  return static_cast<unsigned>(e);
+}
+
+/// Add helpers for custom location logging. Heavily based on glog/logging.h.
+#if GOOGLE_STRIP_LOG == 0
+#define COMPACT_GOOGLE_LOG_CUSTOM_LOC_INFO(FILE_, LINE_)                       \
+  google::LogMessage(FILE_, LINE_)
+#else
+#define COMPACT_GOOGLE_LOG_CUSTOM_LOC_INFO(FILE_, LINE_) google::NullStream()
+#endif
+
+#if GOOGLE_STRIP_LOG <= 1
+#define COMPACT_GOOGLE_LOG_CUSTOM_LOC_WARNING(FILE_, LINE_)                    \
+  google::LogMessage(FILE_, LINE_, google::GLOG_WARNING)
+#else
+#define COMPACT_GOOGLE_LOG_CUSTOM_LOC_WARNING(FILE_, LINE_) google::NullStream()
+#endif
+
+#if GOOGLE_STRIP_LOG <= 2
+#define COMPACT_GOOGLE_LOG_CUSTOM_LOC_ERROR(FILE_, LINE_)                      \
+  google::LogMessage(FILE_, LINE_, google::GLOG_ERROR)
+#else
+#define COMPACT_GOOGLE_LOG_CUSTOM_LOC_ERROR(FILE_, LINE_) google::NullStream()
+#endif
+
+#if GOOGLE_STRIP_LOG <= 3
+#define COMPACT_GOOGLE_LOG_CUSTOM_LOC_FATAL(FILE_, LINE_)                      \
+  google::LogMessageFatal(FILE_, LINE_)
+#else
+#define COMPACT_GOOGLE_LOG_CUSTOM_LOC_FATAL(FILE_, LINE_)                      \
+  google::NullStreamFatal()
+#endif
+
+#define LOG_CUSTOM_LOC(severity, FILE_, LINE_)                                 \
+  COMPACT_GOOGLE_LOG_CUSTOM_LOC_##severity(FILE_, LINE_).stream()
+
+/// Char used for signifying the start of an attribute name to value mapping.
+constexpr char startChar = '$';
+/// Char used for separating attribute name from attribute value.
+constexpr char sepChar = ':';
+
+/// Convert a string to int. \returns the int or Error if problem parsing.
+Expected<int> getIntFromStr(llvm::StringRef input);
+
+/// A helper type for creating compile-time strings.
+template <char... letters> struct string_t {
+  static char const *str() {
+    static constexpr char string[] = {letters..., '\0'};
+    return string;
+  }
+};
+
 } // namespace glow
 
 #endif // GLOW_SUPPORT_SUPPORT_H

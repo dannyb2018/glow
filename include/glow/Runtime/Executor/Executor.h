@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,17 +23,7 @@
 #include <memory>
 
 namespace glow {
-
-class PlaceholderBindings;
-
 namespace runtime {
-
-class DeviceManager;
-
-/// This enum lists the available executors.
-enum class ExecutorKind {
-  ThreadPool, // Executor backed by a thread pool.
-};
 
 /// This is an interface to an executor that can run and results the results of
 /// a partitioned graph.
@@ -56,13 +46,14 @@ public:
   /// Shutdown the Executor. Should block until all active requests are complete
   /// and prevent new requests from being initiated.
   virtual void shutdown() = 0;
-};
 
-/// Create an executor of kind \p kind that will call into the DeviceManager
-/// instances provided in \deviceManagers. \returns a pointer to the
-/// executor.
-Executor *createExecutor(const DeviceManagerMapTy &deviceManagers,
-                         ExecutorKind executorKind = ExecutorKind::ThreadPool);
+  /// Setup context pool for new network.
+  virtual void createPool(const DAGNode *root, unsigned poolSize,
+                          bool enableP2P, bool enableDRT) = 0;
+
+  /// Free the context pool for given network.
+  virtual void freePool(const DAGNode *root) = 0;
+};
 
 } // namespace runtime
 } // namespace glow

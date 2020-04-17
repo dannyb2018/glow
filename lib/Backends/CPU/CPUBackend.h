@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
  */
 #ifndef GLOW_BACKENDS_CPU_CPUBACKEND_H
 #define GLOW_BACKENDS_CPU_CPUBACKEND_H
+
+#include "CPUDeviceManager.h"
 
 #include "glow/Backend/Backend.h"
 #include "glow/Base/Tensor.h"
@@ -34,18 +36,33 @@ public:
   /// @name Backend methods.
   /// This is the implementation of the Backend interface.
   ///@{
-  BackendKind getBackendKind() const override { return BackendKind::CPU; }
   virtual ~CPUBackend() override = default;
 
-  std::string getBackendName() const override { return getName(); }
+  std::string getBackendName() const override {
+    return Named::getName().empty() ? getName() : Named::getName().str();
+  }
   static std::string getName() { return "CPU"; }
+  static unsigned numDevices();
 
-  bool transformPostLowering(Function *F,
-                             CompilationContext &cctx) const override;
+  Expected<bool> transformPostLowering(
+      Function *F, CompilationContext &cctx,
+      const glow::runtime::DeviceInfo *devInfo = nullptr) const override;
 
   bool isOpSupported(const NodeInfo &NI) const override;
 
   bool shouldLower(const Node *N) const override;
+
+  runtime::DeviceManager *
+  createDeviceManager(const runtime::DeviceConfig &deviceConfig) override {
+    return createCPUDeviceManager(deviceConfig);
+  }
+
+  /// \returns true if network supports Type Lowering from \p T1 to \p T2.
+  /// Populates PrecisionConfiguration with black list of operations that can't
+  /// be converted.
+  virtual bool
+  canDoIndexTypeDemotion(ElemKind fromTy, ElemKind toTy,
+                         PrecisionConfiguration &precConfig) const override;
   /// @}
 
 public:
@@ -57,9 +74,9 @@ public:
               AllocationsInfo &allocationsInfo) const override;
 
 protected:
-  virtual std::unique_ptr<CompiledFunction> createCompiledFunction(
-      std::unique_ptr<llvm::orc::GlowJIT> JIT,
-      const runtime::RuntimeBundle &runtimeBundle) const override;
+  virtual std::unique_ptr<CompiledFunction>
+  createCompiledFunction(std::unique_ptr<llvm::orc::GlowJIT> JIT,
+                         runtime::RuntimeBundle &&runtimeBundle) const override;
 
   virtual llvm::StringRef getLibjitBitcode() const override;
   /// @}

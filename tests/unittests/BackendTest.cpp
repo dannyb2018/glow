@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,41 +13,38 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "BackendTestUtils.h"
 
 #include "glow/Backend/BackendUtils.h"
+#include "glow/Backends/Interpreter/Interpreter.h"
 #include "glow/ExecutionEngine/ExecutionEngine.h"
 #include "glow/Graph/Graph.h"
 #include "glow/Graph/PlaceholderBindings.h"
 #include "glow/IR/IRBuilder.h"
+#include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
+#include "glow/Optimizer/IROptimizer/IROptimizer.h"
 
 #include "gtest/gtest.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Casting.h"
 
+#include <future>
+
 using namespace glow;
 
-class BackendTest : public ::testing::TestWithParam<BackendKind> {
+/// An enum to indicate what type placholder it is.
+enum class PlaceholderType {
+  InputPlaceholder = 0,
+  InputOutputPlaceholder = 1,
+  OutputPlaceholder = 2,
+  NonePlaceholder = 3
+};
+
+class BackendExecTest : public ::testing::TestWithParam<std::string> {
 public:
   ExecutionEngine EE_{GetParam()};
 };
-
-TEST(Interpreter, NotImplementedSave) {
-  // Interpreter backend does not support a save method.
-  // Exercise it and make sure that it fails.
-  ExecutionEngine EE;
-  PlaceholderBindings bindings;
-  auto &mod = EE.getModule();
-
-  // Create a few nodes to make sure IR can be normally generated.
-  Function *F = mod.createFunction("main");
-  F->createSave("save",
-                mod.createPlaceholder(ElemKind::FloatTy, {2}, "A", false));
-
-  CompilationContext cctx;
-  cctx.compMode = CompilationMode::Infer;
-  EXPECT_DEATH(EE.save(F, cctx, "output", "network"), "");
-}
 
 TEST(Interpreter, profileQuantizationForANetwork) {
   ExecutionEngine EE;
@@ -62,6 +59,7 @@ TEST(Interpreter, profileQuantizationForANetwork) {
   Node *O = F->createFullyConnected(bindings, "fc", A, 4);
   O = F->createRELU("relu", O);
   O = F->createRegression("reg", O, Ex);
+  F->createSave("ret", O);
 
   LoweredInfoMap loweredMap;
   CompilationContext cctx{&bindings, &loweredMap};
@@ -69,12 +67,16 @@ TEST(Interpreter, profileQuantizationForANetwork) {
 
   bindings.allocate(A);
   bindings.allocate(Ex);
-  EE.compile(F, cctx);
+  EE.compile(cctx);
+  bindings.allocate(mod.getPlaceholders());
 
   // TODO: Verify histogram itself, for now just verify min and max.
   // Run inference first time and capture tensor stats.
   updateInputPlaceholders(bindings, {A}, {&inputs});
   EE.run(bindings);
+  // Because we are quantizing the partitioner deleted the original function and
+  // created a new one, get the new function.
+  F = mod.getFunctions().front();
 
   QuantizationProfileNode *profile{nullptr};
   // Find QPN for node A.
@@ -108,10 +110,180 @@ TEST(Interpreter, profileQuantizationForANetwork) {
   EXPECT_NEAR(1.6, max, 0.00001);
 }
 
+#ifdef GLOW_WITH_CPU
+
+/// A couple of counters to check that custom processing has happened.
+static unsigned numCustomProcessedSupportedInstructions;
+static unsigned numCustomProcessedUnsupportedInstructions;
+
+/// An interceptor to be invoked when executing the interpreter instructions.
+static IRInstructionProcessingFn customInterpreterHook =
+    [](const Instruction *I, IRInstructionProcessingStage executionStage,
+       void *ctx) -> bool {
+  // Only handle instructions in the processing stage.
+  if (executionStage != IRInstructionProcessingStage::PROCESSING) {
+    return false;
+  }
+  llvm::outs() << "Intercept instruction execution: " << I << "\n";
+  // This is an example of handling an instruction that is normally not
+  // supported by a vanilla interpreter. This way new backends or tests can
+  // extend the functionality of the interpreter and support custom
+  // instructions.
+  if (llvm::isa<CPUMaxSplatInst>(I)) {
+    llvm::outs() << "Apply special processing for an instruction not supported "
+                    "by the interpreter: "
+                 << I << "\n";
+    numCustomProcessedUnsupportedInstructions++;
+    // Tell the backend to skip standard processing of this instruction.
+    return true;
+  }
+  // This is an example of implementing a custom handling of an instruction that
+  // is supported by a vanilla interpreter. This way new backends or tests can
+  // change the behavior of the interpreter for specific instructions.
+  if (llvm::isa<ElementSubInst>(I)) {
+    llvm::outs() << "Apply special processing instruction: " << I << "\n";
+    numCustomProcessedSupportedInstructions++;
+    // Tell the backend to skip standard processing of this instruction.
+    return true;
+  }
+  return false;
+};
+
+/// Creates an interpreter with a given \p name and custom instruction handler
+/// \p hook. \retruns a newly created custom interpreter.
+static Backend *createCustomInterpreter(llvm::StringRef name,
+                                        IRInstructionProcessingFn hook) {
+  auto interpreter = new Interpreter();
+  interpreter->setIRInstructionProcessingHandler(hook);
+  interpreter->setName(name);
+  return interpreter;
+}
+
+/// Check support for intercepting and customizing the processing of
+/// instructions suppored by Interpreter.
+TEST(Interpreter, customPrePostAroundProcessing) {
+  // Register a custom backend.
+  REGISTER_DYNAMIC_GLOW_BACKEND_FACTORY(
+      CustomInterpreterFactory, Interpreter, "CustomInterpreter",
+      createCustomInterpreter("CustomInterpreter", customInterpreterHook))
+
+  ExecutionEngine EE("CustomInterpreter");
+  auto &mod = EE.getModule();
+  auto *F = mod.createFunction("test");
+  auto *input1 =
+      mod.createPlaceholder(ElemKind::FloatTy, {1, 10, 10, 3}, "in1", false);
+  auto *input2 =
+      mod.createPlaceholder(ElemKind::FloatTy, {1, 10, 10, 3}, "in2", false);
+  auto *add = F->createAdd("add", input1, input2);
+  auto *sub = F->createSub("sub", add, input1);
+  F->createSave("save", sub);
+  PlaceholderBindings bindings;
+  bindings.allocate({input1, input2});
+  EE.compile(CompilationMode::Infer);
+  numCustomProcessedSupportedInstructions = 0;
+  numCustomProcessedUnsupportedInstructions = 0;
+  // Process the function by means of the custom backend.
+  EE.run(bindings);
+  // Sub operation should have been processed in a custom way.
+  EXPECT_EQ(numCustomProcessedSupportedInstructions, 1);
+  EXPECT_EQ(numCustomProcessedUnsupportedInstructions, 0);
+}
+
+TEST(Interpreter, customHandleUnsupportedInstruction) {
+  // Register a custom Interpreter-based backend.
+  REGISTER_DYNAMIC_GLOW_BACKEND_FACTORY(
+      CustomInterpreterFactory, Interpreter, "CustomInterpreter",
+      createCustomInterpreter("CustomInterpreter", customInterpreterHook))
+  // Create CPU and custom interpreter backends.
+  ExecutionEngine cpuEE("CPU");
+  ExecutionEngine customInterpreterEE("CustomInterpreter");
+  auto *customInterpreterBackend =
+      &customInterpreterEE.getBackend("CustomInterpreter");
+  auto *cpuBackend = &cpuEE.getBackend("CPU");
+  auto &mod = cpuEE.getModule();
+  auto *F = mod.createFunction("test");
+  auto *input1 =
+      mod.createPlaceholder(ElemKind::FloatTy, {1, 10, 10, 3}, "in1", false);
+  auto *relu = F->createRELU("relu", input1);
+  auto *save = F->createSave("save", relu);
+  std::unique_ptr<PlaceholderBindings> cpuBindings(new PlaceholderBindings);
+  cpuBindings->allocate({input1, save->getPlaceholder()});
+  std::unique_ptr<PlaceholderBindings> customInterpreterBindings(
+      new PlaceholderBindings);
+  customInterpreterBindings->allocate({input1, save->getPlaceholder()});
+  CompilationContext cctx;
+  cctx.compMode = CompilationMode::Infer;
+  FAIL_TEST_IF_ERR(glow::optimizeFunction(F, *cpuBackend, cctx));
+  // Generate the low-level IR for the CPU backend.
+  std::unique_ptr<IRFunction> cpuIR =
+      glow::generateAndOptimizeIR(F, *cpuBackend, false);
+  // Clone the low-level IR.
+  auto clonedCpuIR = cpuIR->clone("newTest");
+  // Compile the cloned IR for the custom Interpreter backend.
+  std::unique_ptr<IRFunction> customInterpreterIR(clonedCpuIR);
+  auto customInterpreterCompiledF(
+      reinterpret_cast<BackendUsingGlowIR *>(customInterpreterBackend)
+          ->compileIR(std::move(customInterpreterIR)));
+  auto cpuCompiledF(reinterpret_cast<BackendUsingGlowIR *>(cpuBackend)
+                        ->compileIR(std::move(cpuIR)));
+  ExecutionContext cpuExecCtx(std::move(cpuBindings));
+  // Execute on the CPU backend.
+  FAIL_TEST_IF_ERR(cpuCompiledF->execute(&cpuExecCtx));
+  ExecutionContext customInterpreterExecCtx(
+      std::move(customInterpreterBindings));
+  numCustomProcessedUnsupportedInstructions = 0;
+  // Execute on the custom Interpreter backend. The usual Interpreter backend
+  // would not be able to handle some of the custom IR instructions defined by
+  // the CPU backend, but the custom interpreter backend can process them.
+  numCustomProcessedSupportedInstructions = 0;
+  numCustomProcessedUnsupportedInstructions = 0;
+  FAIL_TEST_IF_ERR(
+      customInterpreterCompiledF->execute(&customInterpreterExecCtx));
+  EXPECT_EQ(numCustomProcessedUnsupportedInstructions, 1);
+}
+
+#endif
+
+/// Check that new backends and backend factories can be registered dynamically.
+TEST(Interpreter, DynamicBackendFactory) {
+  // Use a static variable here, because the macro invocation below creates a
+  // new class and C++ does not allow for capturing of local variables.
+  static std::string backendName;
+  for (unsigned i = 0; i < 16; ++i) {
+    {
+      backendName = "CustomInterpreter" + std::to_string(i);
+      // Dynamically create a new backend factory and register it.
+      REGISTER_DYNAMIC_GLOW_BACKEND_FACTORY(CustomInterpreterFactory,
+                                            Interpreter, backendName,
+                                            []() -> Backend * {
+                                              // Dynamically create a backend
+                                              // and give it a name.
+                                              auto *backend = new Interpreter;
+                                              backend->setName(backendName);
+                                              return backend;
+                                            }())
+      ExecutionEngine EE(backendName);
+      auto *backend = &EE.getBackend(backendName);
+      ASSERT_NE(backend, nullptr);
+      // Check that a new backend is registered.
+      auto backends = getAvailableBackends();
+      EXPECT_NE(std::find(backends.begin(), backends.end(), backendName),
+                backends.end());
+      // The new backend factory will be destroyed at the end of this scope.
+    }
+    // Check that a new backend is not registered anymore after its factory was
+    // destroyed.
+    auto backends = getAvailableBackends();
+    EXPECT_EQ(std::find(backends.begin(), backends.end(), backendName),
+              backends.end());
+  }
+}
+
 /// Test that the symbol category for a symbol is properly set.
 TEST(RuntimeBundle, BundleSymbolInfo) {
-  Module mod;
+
   ExecutionEngine EE;
+  auto &mod = EE.getModule();
   PlaceholderBindings bindings;
 
   Tensor inputs(ElemKind::FloatTy, {1, 10, 10, 3});
@@ -131,24 +303,28 @@ TEST(RuntimeBundle, BundleSymbolInfo) {
   auto *S = F->createSave("ret", SM);
   auto *qp = F->createQuantizationProfile(bindings, "qp", input);
 
-  EE.compile(CompilationMode::Infer, F);
-  auto table = EE.getCompiledFunction().getRuntimeBundle().getSymbolTable();
+  EE.compile(CompilationMode::Infer);
+  runtime::DAG *dag;
+  ASSIGN_VALUE_OR_FAIL_TEST(dag, EE.getDAG("main"));
+  assert(dag->nodes.size() > 0 && "Empty DAG list");
+  auto table = dag->nodes[0]->runtimeBundle->getSymbolTable();
+
   // Check that placeholders and constants are correctly labelled.
-  EXPECT_EQ(table.find(S->getName())->second.symbolCategory,
+  EXPECT_EQ(table.find(S->getPlaceholder()->getName())->second.symbolCategory,
             glow::runtime::SymbolCategory::Placeholder);
   EXPECT_EQ(table.find(ex->getName())->second.symbolCategory,
             glow::runtime::SymbolCategory::Constant);
   // Check that activations are labelled correctly.
-  EXPECT_EQ(table.find("fc_add_bias_res")->second.symbolCategory,
+  EXPECT_EQ(table.find("FC_res")->second.symbolCategory,
             glow::runtime::SymbolCategory::Activation);
   // Check that tensor views have the same label as their parent symbol. In this
   // case same as "input".
-  EXPECT_EQ(table.find("tensorview_reshape")->second.symbolCategory,
+  EXPECT_EQ(table.find("FC_reshape2D_tensorview")->second.symbolCategory,
             glow::runtime::SymbolCategory::PlaceholderTensorView);
 
   // Check that placeholders and constants input/output flags are correctly set.
-  EXPECT_EQ(table.find(S->getName())->second.input, false);
-  EXPECT_EQ(table.find(S->getName())->second.output, true);
+  EXPECT_EQ(table.find(S->getPlaceholder()->getName())->second.input, false);
+  EXPECT_EQ(table.find(S->getPlaceholder()->getName())->second.output, true);
   EXPECT_EQ(table.find(ex->getName())->second.input, false);
   EXPECT_EQ(table.find(ex->getName())->second.output, false);
   EXPECT_EQ(table.find(input->getName())->second.input, true);
@@ -158,14 +334,92 @@ TEST(RuntimeBundle, BundleSymbolInfo) {
   EXPECT_EQ(table.find(qp->getHistogramPlaceholder()->getName())->second.output,
             true);
   // Check that activations are labelled correctly.
-  EXPECT_EQ(table.find("fc_add_bias_res")->second.input, false);
-  EXPECT_EQ(table.find("fc_add_bias_res")->second.output, false);
+  EXPECT_EQ(table.find("FC_res")->second.input, false);
+  EXPECT_EQ(table.find("FC_res")->second.output, false);
   // Check that tensor views are labelled correctly.
-  EXPECT_EQ(table.find("tensorview_reshape")->second.input, false);
-  EXPECT_EQ(table.find("tensorview_reshape")->second.output, false);
+  EXPECT_EQ(table.find("FC_reshape2D_tensorview")->second.input, false);
+  EXPECT_EQ(table.find("FC_reshape2D_tensorview")->second.output, false);
 }
 
-TEST_P(BackendTest, simpleInference) {
+// Test if the placeholders are allocated contiguously as
+// Input|InputOutput|Output.
+TEST(RuntimeBundle, ContiguousPlaceholder) {
+  ExecutionEngine EE;
+  PlaceholderBindings bindings;
+  auto &mod = EE.getModule();
+  Function *F = mod.createFunction("main");
+  Tensor inputs(ElemKind::FloatTy, {1, 4});
+  inputs.getHandle() = {1, 1.2f, 0.5f, 1.3f};
+
+  auto *A = mod.createPlaceholder(ElemKind::FloatTy, {1, 4}, "A", false);
+  auto *B = mod.createPlaceholder(ElemKind::FloatTy, {1, 4}, "B", false);
+  auto *Ex = mod.createPlaceholder(ElemKind::FloatTy, {1, 4}, "E", false);
+  auto *add = F->createAdd("add", A, Ex);
+  auto *sub = F->createSub("sub", B, add);
+  F->createSave("ret", sub);
+
+  LoweredInfoMap loweredMap;
+  CompilationContext cctx{&bindings, &loweredMap};
+  cctx.precisionConfig.quantMode = QuantizationMode::Profile;
+
+  bindings.allocate(A);
+  bindings.allocate(Ex);
+  EE.compile(cctx);
+  runtime::DAG *dag;
+  ASSIGN_VALUE_OR_FAIL_TEST(dag, EE.getDAG("main"));
+  auto &table = dag->nodes[0]->runtimeBundle->getSymbolTable();
+
+  std::vector<glow::runtime::RuntimeSymbolInfo> tableContainer;
+  // Only check placeholders.
+  for (auto v : table) {
+    if (v.second.symbolCategory == glow::runtime::SymbolCategory::Placeholder) {
+      tableContainer.push_back(v.second);
+    }
+  }
+  // Sort the placeholders by offset.
+  sort(tableContainer.begin(), tableContainer.end(),
+       [](const glow::runtime::RuntimeSymbolInfo &a,
+          const glow::runtime::RuntimeSymbolInfo &b) {
+         return (a.offset < b.offset);
+       });
+
+  // Define the order of placeholders.
+  auto order = [](glow::runtime::RuntimeSymbolInfo i) -> PlaceholderType {
+    if (i.input) {
+      if (!i.output) {
+        // input only
+        return PlaceholderType::InputPlaceholder;
+      } else {
+        // input & output
+        return PlaceholderType::InputOutputPlaceholder;
+      }
+    } else {
+      if (i.output) {
+        // output only
+        return PlaceholderType::OutputPlaceholder;
+      } else {
+        // neither
+        return PlaceholderType::NonePlaceholder;
+      }
+    }
+  };
+  // The order function of placeholders should be increasing.
+  PlaceholderType prev = PlaceholderType::InputPlaceholder;
+  bool flag = true;
+  for (auto v : tableContainer) {
+    PlaceholderType tmp = order(v);
+    if (tmp > prev) {
+      prev = tmp;
+    } else if (tmp < prev) {
+      flag = false;
+      break;
+    }
+  }
+
+  EXPECT_EQ(flag, true);
+}
+
+TEST_P(BackendExecTest, simpleInference) {
   Tensor inputs(ElemKind::FloatTy, {1, 32, 32, 3});
   PlaceholderBindings bindings;
 
@@ -181,15 +435,17 @@ TEST_P(BackendTest, simpleInference) {
   auto *RL0 = F->createRELU("relu1", CV0);
   auto *MP0 = F->createMaxPool("pool1", RL0, 2, 2, 0);
 
-  auto *CV1 = F->createConv(bindings, "conv2", MP0, 20, 5, 1, 2, 1);
+  auto *CV1 =
+      F->createConv(bindings, "conv2", MP0->getResult(), 20, 5, 1, 2, 1);
   auto *RL1 = F->createRELU("relu2", CV1);
   auto *MP1 = F->createMaxPool("pool2", RL1, 2, 2, 0);
 
-  auto *CV2 = F->createConv(bindings, "conv3", MP1, 20, 5, 1, 2, 1);
+  auto *CV2 =
+      F->createConv(bindings, "conv3", MP1->getResult(), 20, 5, 1, 2, 1);
   auto *RL2 = F->createRELU("relu3", CV2);
   auto *MP2 = F->createMaxPool("pool3", RL2, 2, 2, 0);
 
-  auto *FCL1 = F->createFullyConnected(bindings, "fc", MP2, 10);
+  auto *FCL1 = F->createFullyConnected(bindings, "fc", MP2->getResult(), 10);
   auto *RL3 = F->createRELU("relu4", FCL1);
   auto *SM = F->createSoftMax("sm", RL3, ex);
   auto *S = F->createSave("ret", SM);
@@ -197,7 +453,7 @@ TEST_P(BackendTest, simpleInference) {
   bindings.allocate(input);
   bindings.allocate(ex);
   bindings.allocate(S->getPlaceholder());
-  EE_.compile(CompilationMode::Infer, F);
+  EE_.compile(CompilationMode::Infer);
 
   updateInputPlaceholders(bindings, {input}, {&inputs});
   EE_.run(bindings);
@@ -206,10 +462,10 @@ TEST_P(BackendTest, simpleInference) {
 /// Test that the DebugPrint instruction works correctly for the backend. Note
 /// that the backend being tested must inherit from BackendUsingGlowIR and
 /// implement the compileIR() function for this test to work.
-TEST_P(BackendTest, debugPrint) {
+TEST_P(BackendExecTest, debugPrint) {
   Tensor input{0.0, 1.0, 2.0, 3.0};
-  Module mod;
-  auto ctx = llvm::make_unique<ExecutionContext>();
+  auto &mod = EE_.getModule();
+  auto ctx = glow::make_unique<ExecutionContext>();
   Function *F = mod.createFunction("main");
   auto *IV = mod.createPlaceholder(input.getElementType(), input.dims(),
                                    "input", false);
@@ -218,20 +474,55 @@ TEST_P(BackendTest, debugPrint) {
   auto *save = F->createSave("save", IV);
   ctx->getPlaceholderBindings()->allocate(save->getPlaceholder());
 
-  std::unique_ptr<BackendUsingGlowIR> backend(
-      static_cast<BackendUsingGlowIR *>(createBackend(GetParam())));
-  auto IR = llvm::make_unique<IRFunction>(F);
+  std::unique_ptr<Backend> backend(createBackend(GetParam()));
+  auto IR = glow::make_unique<IRFunction>(F);
   IR->generateIR(*backend.get());
   IRBuilder(IR.get()).createDebugPrintInst("print", *IR->getWeights().begin());
 
-  auto function = backend->compileIR(std::move(IR));
-  EE_.insertCompiledFunction("main", std::move(function));
-  EE_.run(*ctx.get());
+  auto function = reinterpret_cast<BackendUsingGlowIR *>(backend.get())
+                      ->compileIR(std::move(IR));
+
+  // Since we are compiling IR by hand we cannot go through the normal EE route.
+  // Create and initialize the device.
+  auto config =
+      glow::make_unique<runtime::DeviceConfig>(backend->getBackendName());
+  std::unique_ptr<runtime::DeviceManager> device(
+      runtime::DeviceManager::createDeviceManager(*config));
+  EXIT_ON_ERR(device->init());
+  // Load the function on the device.
+  std::string name = "main";
+  runtime::FunctionMapTy functionMap;
+  functionMap[name] = function.get();
+
+  std::promise<void> addPromise;
+  auto fut = addPromise.get_future();
+  Error addErr = Error::empty();
+  device->addNetwork(&EE_.getModule(), std::move(functionMap),
+                     [&addPromise, &addErr](const Module *, Error err) {
+                       addErr = std::move(err);
+                       addPromise.set_value();
+                     });
+  fut.wait();
+  EXIT_ON_ERR(std::move(addErr));
+  // Run the function.
+  std::promise<void> runPromise;
+  fut = runPromise.get_future();
+  Error runErr = Error::empty();
+  device->runFunction(name, std::move(ctx),
+                      [&runPromise, &runErr,
+                       &ctx](runtime::RunIdentifierTy, Error err,
+                             std::unique_ptr<ExecutionContext> contextPtr) {
+                        ctx = std::move(contextPtr);
+                        runErr = std::move(err);
+                        runPromise.set_value();
+                      });
+  fut.wait();
+  EXIT_ON_ERR(std::move(runErr));
 }
 
 /// Test the compile method on the backend completes without error when
 /// collectConstants is false.
-TEST_P(BackendTest, CompileWithoutConstants) {
+TEST_P(BackendExecTest, CompileWithoutConstants) {
   Module mod;
   PlaceholderBindings bindings;
   Function *F = mod.createFunction("main");
@@ -249,7 +540,7 @@ TEST_P(BackendTest, CompileWithoutConstants) {
 
 /// Test that the runtimeBundle includes only symbols from its function and not
 /// the whole module.
-TEST_P(BackendTest, BundleFunctionSymbolsOnly) {
+TEST_P(BackendExecTest, BundleFunctionSymbolsOnly) {
   Module mod;
   PlaceholderBindings bindings;
   Function *F = mod.createFunction("main");
@@ -279,7 +570,7 @@ TEST_P(BackendTest, BundleFunctionSymbolsOnly) {
 }
 
 /// Test that a shared constant is in the bundle of both functions.
-TEST_P(BackendTest, BundleSharedConstant) {
+TEST_P(BackendExecTest, BundleSharedConstant) {
   Module mod;
   PlaceholderBindings bindings;
   Function *F = mod.createFunction("main");
@@ -307,7 +598,7 @@ TEST_P(BackendTest, BundleSharedConstant) {
 }
 
 /// Test compiling a vector of functions completes without error.
-TEST_P(BackendTest, compileVectorOfFunctions) {
+TEST_P(BackendExecTest, compileVectorOfFunctions) {
   Module mod;
   std::vector<Function *> functions;
   for (unsigned int i = 0; i < 3; i++) {
@@ -320,14 +611,15 @@ TEST_P(BackendTest, compileVectorOfFunctions) {
   }
   std::unique_ptr<Backend> backend(createBackend(GetParam()));
   BackendOptions opts;
-  auto function = backend->compileFunctions(functions, opts);
+  auto functionOrErr = backend->compileFunctions(functions, opts);
+  ASSERT_TRUE((bool)functionOrErr);
 }
 
 /// This test checks that we can compile a function without depending on the
 /// graph representation. We compile some function and then delete the function.
 /// Later we execute the code and check that things work.
-TEST_P(BackendTest, decoupleCodegenFromGraph) {
-  Module mod;
+TEST_P(BackendExecTest, decoupleCodegenFromGraph) {
+  auto &mod = EE_.getModule();
   PlaceholderBindings bindings;
 
   Function *F = mod.createFunction("main");
@@ -337,10 +629,7 @@ TEST_P(BackendTest, decoupleCodegenFromGraph) {
   auto *pow = F->createPow("Pow1", X, 2.0);
   auto *save = F->createSave("save", pow);
   auto *saveTensor = bindings.allocate(save->getPlaceholder());
-  EE_.compile(CompilationMode::Infer, F);
-
-  // Collect constants to fill out the RuntimeBundle.
-  EE_.getCompiledFunction().collectConstants(&mod);
+  EE_.compile(CompilationMode::Infer);
 
   // Erase all of the functions to ensure that the compiled code does not
   // depend on the graph.
@@ -358,7 +647,7 @@ TEST_P(BackendTest, decoupleCodegenFromGraph) {
 
 /// Check that we can pass information to the execution engine using Placeholder
 /// variables and read it back using Save nodes (in variables).
-TEST_P(BackendTest, simplePlaceholderValue) {
+TEST_P(BackendExecTest, simplePlaceholderValue) {
   Tensor data{99.0, 35.0, 2.0, 3.0};
   auto &mod = EE_.getModule();
   Function *F = mod.createFunction("main");
@@ -367,14 +656,14 @@ TEST_P(BackendTest, simplePlaceholderValue) {
   SaveNode *S = F->createSave("ret", input);
   auto *STensor = bindings.allocate(S->getPlaceholder());
 
-  EE_.compile(CompilationMode::Infer, F);
+  EE_.compile(CompilationMode::Infer);
   EE_.run(bindings);
   EXPECT_TRUE(STensor->isEqual(data));
 }
 
 /// Add and compile a network, then add and compile another so that the first
 /// CompiledFunction does not know about every Placeholder in the module.
-TEST_P(BackendTest, compileThenAddNetwork) {
+TEST_P(BackendExecTest, compileThenAddNetwork) {
   PlaceholderBindings bindings1, bindings2;
 
   auto &mod = EE_.getModule();
@@ -396,8 +685,6 @@ TEST_P(BackendTest, compileThenAddNetwork) {
   Placeholder *FC_weights =
       llvm::dyn_cast<Placeholder>(FC->getWeights().getNode());
 
-  EE_.compile(CompilationMode::Infer, F);
-
   // Recreate that graph in a different Function.
   Function *F2 = mod.createFunction("other");
   auto *input2 =
@@ -416,7 +703,7 @@ TEST_P(BackendTest, compileThenAddNetwork) {
   auto *SM2 = F2->createSoftMax("sm", RL2, ex2);
   auto *S2 = F2->createSave("ret", SM2);
 
-  EE_.compile(CompilationMode::Infer, F2, /* clearOtherFunctions */ false);
+  EE_.compile(CompilationMode::Infer);
 
   // Allocate all placeholders.
   bindings1.allocate(mod.getPlaceholders());
@@ -488,20 +775,8 @@ TEST(PlaceholderBindings, basicPlaceholderBindingsTest) {
   EXPECT_EQ(nullptr, C.getFirstUnallocated(mod.getPlaceholders()));
 }
 
-INSTANTIATE_TEST_CASE_P(Interpreter, BackendTest,
-                        ::testing::Values(BackendKind::Interpreter));
-
-#ifdef GLOW_WITH_CPU
-INSTANTIATE_TEST_CASE_P(JIT, BackendTest, ::testing::Values(BackendKind::CPU));
-#endif // GLOW_WITH_CPU
-
-#ifdef GLOW_WITH_OPENCL
-INSTANTIATE_TEST_CASE_P(OpenCL, BackendTest,
-                        ::testing::Values(BackendKind::OpenCL));
-#endif // GLOW_WITH_OPENCL
-
 /// Check if the dump function works for Type.
-TEST(BackendTest, dumpType) {
+TEST(BackendExecTest, dumpType) {
   Module mod;
   TypeRef tyA = mod.uniqueType(ElemKind::FloatTy, {1, 32, 32, 3});
   std::string storage;
@@ -512,3 +787,5 @@ TEST(BackendTest, dumpType) {
   EXPECT_EQ(mesA, expectA);
   EXPECT_EQ(mesA, os.str());
 }
+
+INSTANTIATE_BACKEND_TEST(BackendTest);

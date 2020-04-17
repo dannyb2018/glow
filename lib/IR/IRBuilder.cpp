@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,48 +48,98 @@ void IRBuilder::deallocateActiveInstrs() {
       continue;
     }
 
-    createDeallocActivationInst("dealloc", AA);
+    createDeallocActivationInst("dealloc." + AA->getName().str(), AA);
   }
 }
 
 //===----------------------------------------------------------------------===//
 //                        High level operators.
 //===----------------------------------------------------------------------===//
-MaxPoolWithXYInst *IRBuilder::createMaxPoolWithXYOp(
+MaxPoolWithArgmaxInst *IRBuilder::createMaxPoolWithArgmaxOp(
     llvm::StringRef name, Value *input, llvm::ArrayRef<unsigned_t> kernels,
-    llvm::ArrayRef<unsigned_t> strides, llvm::ArrayRef<unsigned_t> pads) {
-  ShapeNHWC idim = ShapeNHWC(input->dims());
+    llvm::ArrayRef<unsigned_t> strides, llvm::ArrayRef<unsigned_t> pads,
+    unsigned_t layout, ElemKind argMaxIndicesTy) {
+  TypeRef outTy{nullptr};
+  Value *argmax{nullptr};
 
-  auto outSz =
-      calculateConvPoolOutputDims(idim.h, idim.w, kernels, strides, pads);
+  if (layout == NHWC) {
+    ShapeNHWC idim = ShapeNHWC(input->dims());
 
-  // Allocate cache arrays that store the x and y coordinates of the incoming
-  // gradient for each max element.
-  Value *srcXY =
-      createAllocActivationInst(name.str() + ".srcXY", ElemKind::Int64ITy,
-                                {idim.n, outSz.first, outSz.second, idim.c, 2});
+    auto outSz =
+        calculateConvPoolOutputDims(idim.h, idim.w, kernels, strides, pads);
 
-  auto outTy = F_->getGraph()->getParent()->uniqueTypeWithNewShape(
-      input->getType(), {idim.n, outSz.first, outSz.second, idim.c});
+    // Allocate storage for flattened NCHW index of max element.
+    argmax =
+        createAllocActivationInst(name.str() + ".argmax", argMaxIndicesTy,
+                                  {idim.n, outSz.first, outSz.second, idim.c});
+
+    outTy = F_->getGraph()->getParent()->uniqueTypeWithNewShape(
+        input->getType(), {idim.n, outSz.first, outSz.second, idim.c});
+  } else {
+    ShapeNCHW idim(input->dims());
+
+    auto outSz =
+        calculateConvPoolOutputDims(idim.h, idim.w, kernels, strides, pads);
+
+    // Allocate storage for flattened NCHW index of max element.
+    argmax =
+        createAllocActivationInst(name.str() + ".argmax", argMaxIndicesTy,
+                                  {idim.n, idim.c, outSz.first, outSz.second});
+
+    outTy = F_->getGraph()->getParent()->uniqueTypeWithNewShape(
+        input->getType(), {idim.n, idim.c, outSz.first, outSz.second});
+  }
+
   Value *dest = createAllocActivationInst(name.str() + ".res", outTy);
 
-  return createMaxPoolWithXYInst(name, dest, input, srcXY, kernels, strides,
-                                 pads);
+  return createMaxPoolWithArgmaxInst(name, dest, input, argmax, kernels,
+                                     strides, pads, layout);
+}
+
+ArgMaxInst *IRBuilder::createArgMaxOp(llvm::StringRef name, Value *input,
+                                      unsigned_t axis, bool keepDims,
+                                      ElemKind outIndicesTy) {
+  auto idim = input->dims();
+
+  ShapeVector odim;
+  for (size_t i = 0, e = 4; i < e; i++) {
+    if (i == axis && !keepDims) {
+      continue;
+    } else {
+      odim.push_back(i == axis ? 1 : idim[i]);
+    }
+  }
+
+  // Allocate storage for flattened NCHW index of max element.
+  Value *argmax =
+      createAllocActivationInst(name.str() + ".argmax", outIndicesTy, odim);
+  return createArgMaxInst(name, argmax, input, axis, keepDims);
 }
 
 AvgPoolInst *IRBuilder::createAvgPoolOp(Value *input,
                                         llvm::ArrayRef<unsigned_t> kernels,
                                         llvm::ArrayRef<unsigned_t> strides,
-                                        llvm::ArrayRef<unsigned_t> pads) {
-  ShapeNHWC idim = ShapeNHWC(input->dims());
+                                        llvm::ArrayRef<unsigned_t> pads,
+                                        unsigned_t layout) {
 
-  auto outSz =
-      calculateConvPoolOutputDims(idim.h, idim.w, kernels, strides, pads);
-  auto outTy = F_->getGraph()->getParent()->uniqueTypeWithNewShape(
-      input->getType(), {idim.n, outSz.first, outSz.second, idim.c});
+  TypeRef outTy;
+
+  if (layout == NHWC) {
+    ShapeNHWC idim(input->dims());
+    auto outSz =
+        calculateConvPoolOutputDims(idim.h, idim.w, kernels, strides, pads);
+    outTy = F_->getGraph()->getParent()->uniqueTypeWithNewShape(
+        input->getType(), {idim.n, outSz.first, outSz.second, idim.c});
+  } else {
+    ShapeNCHW idim(input->dims());
+    auto outSz =
+        calculateConvPoolOutputDims(idim.h, idim.w, kernels, strides, pads);
+    outTy = F_->getGraph()->getParent()->uniqueTypeWithNewShape(
+        input->getType(), {idim.n, idim.c, outSz.first, outSz.second});
+  }
+
   Value *dest = createAllocActivationInst("pool.res", outTy);
-
-  return createAvgPoolInst("pool", dest, input, kernels, strides, pads);
+  return createAvgPoolInst("pool", dest, input, kernels, strides, pads, layout);
 }
 
 CrossEntropyLossInst *IRBuilder::createCrossEntropyLossOp(llvm::StringRef name,
@@ -109,16 +159,16 @@ CrossEntropyLossInst *IRBuilder::createCrossEntropyLossOp(llvm::StringRef name,
 /// \param offsets is a vector of offsets into the Tensor for this view of the
 /// Tensor.
 TensorViewInst *IRBuilder::createTensorView(ElemKind elemKind,
-                                            llvm::ArrayRef<size_t> dims,
+                                            llvm::ArrayRef<dim_t> dims,
                                             Value *src, llvm::StringRef name,
-                                            llvm::ArrayRef<size_t> offsets) {
+                                            llvm::ArrayRef<dim_t> offsets) {
   auto ty =
       getIRFunction().getGraph()->getParent()->uniqueType(Type(elemKind, dims));
   return createTensorViewInst(
       name, src, ty,
       (offsets.size()
            ? offsets
-           : llvm::ArrayRef<size_t>(std::vector<size_t>(dims.size(), 0))));
+           : llvm::ArrayRef<dim_t>(std::vector<dim_t>(dims.size(), 0))));
 }
 
 LocalResponseNormalizationInst *IRBuilder::createLocalResponseNormalizationOp(
@@ -133,22 +183,24 @@ LocalResponseNormalizationInst *IRBuilder::createLocalResponseNormalizationOp(
                                               halfWindowSize, alpha, beta, k);
 }
 
-TopKInst *IRBuilder::createTopKOp(llvm::StringRef name, Value *input,
-                                  size_t k) {
+TopKInst *IRBuilder::createTopKOp(llvm::StringRef name, Value *input, size_t k,
+                                  ElemKind outIndicesTy) {
   auto inDims = input->dims();
   assert(inDims.size() > 0);
   assert(k <= inDims.back());
+  assert(outIndicesTy == ElemKind::Int32ITy ||
+         outIndicesTy == ElemKind::Int64ITy);
   ShapeVector outDims(inDims.begin(), inDims.end());
   outDims.back() = k;
   auto outTy = F_->getGraph()->getParent()->uniqueTypeWithNewShape(
       input->getType(), outDims);
   // Allocate enough scratch space to hold N values and N indices.
-  auto *scratch = createAllocActivationInst(
-      name.str() + ".scratch", ElemKind::Int64ITy, {inDims.back() * 2});
+  auto *scratch = createAllocActivationInst(name.str() + ".scratch",
+                                            outIndicesTy, {inDims.back() * 2});
   createSplatInst(name.str() + ".zero.scratch", scratch, 0);
   auto *values = createAllocActivationInst(name.str() + ".values", outTy);
-  auto *indices = createAllocActivationInst(name.str() + ".indices",
-                                            ElemKind::Int64ITy, outDims);
+  auto *indices =
+      createAllocActivationInst(name.str() + ".indices", outIndicesTy, outDims);
   return createTopKInst(name.str(), values, indices, input, scratch, k);
 }
 
@@ -164,7 +216,7 @@ Value *IRBuilder::createReturnOp(Value *input) {
 //===----------------------------------------------------------------------===//
 
 WeightVar *IRBuilder::createWeightVar(ElemKind elemTy,
-                                      llvm::ArrayRef<size_t> dims,
+                                      llvm::ArrayRef<dim_t> dims,
                                       llvm::StringRef name,
                                       WeightVar::MutabilityKind m) {
   auto T = F_->getGraph()->getParent()->uniqueType(elemTy, dims);
@@ -179,7 +231,7 @@ WeightVar *IRBuilder::createWeightVar(TypeRef T, llvm::StringRef name,
 }
 
 WeightVar *IRBuilder::createWeightVar(ElemKind elemTy,
-                                      llvm::ArrayRef<size_t> dims, float scale,
+                                      llvm::ArrayRef<dim_t> dims, float scale,
                                       int32_t offset, llvm::StringRef name,
                                       WeightVar::MutabilityKind m) {
   auto T = F_->getGraph()->getParent()->uniqueType(elemTy, dims, scale, offset);
@@ -188,7 +240,7 @@ WeightVar *IRBuilder::createWeightVar(ElemKind elemTy,
 
 AllocActivationInst *
 IRBuilder::createAllocActivationInst(llvm::StringRef name, ElemKind elemTy,
-                                     llvm::ArrayRef<size_t> dims) {
+                                     llvm::ArrayRef<dim_t> dims) {
   auto T = F_->getGraph()->getParent()->uniqueType(elemTy, dims);
   return createAllocActivationInst(name, T);
 }

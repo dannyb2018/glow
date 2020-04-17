@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #include "CPUFunction.h"
 
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace glow {
@@ -32,7 +33,9 @@ static llvm::cl::opt<unsigned, /* ExternalStorage */ true> GlowCPUMemoryOpt(
 DeviceManager *createCPUDeviceManager(const DeviceConfig &config) {
   if (GlowCPUMemory) {
     // Convert command line GlowCPUMemory to bytes from kilobytes.
-    return new CPUDeviceManager(config, uint64_t{GlowCPUMemory} * 1024);
+    auto configNew = config;
+    configNew.setDeviceMemory(uint64_t{GlowCPUMemory} * 1024);
+    return new CPUDeviceManager(configNew);
   }
   return new CPUDeviceManager(config);
 }
@@ -48,9 +51,24 @@ bool CPUDeviceManager::isMemoryAvailable(uint64_t estimate) const {
   return maxMemoryBytes_ >= (usedMemoryBytes_ + estimate);
 }
 
+DeviceInfo CPUDeviceManager::getDeviceInfo() const {
+  // TODO: these may need to be tweaked depending on specific CPU.
+  DeviceInfo info = DeviceInfo();
+  info.sramCapacity = 256 * 1024 * 1024;
+  info.peakCompute = 2.2 * 1024 * 1024 * 1024 * 1024;
+  info.peakDramBw = 110.0 * 1024 * 1024 * 1024;
+  info.peakSramBw = 1024.0 * 1024 * 1024 * 1024;
+  info.peakPCIeBw = 16.0 * 1024 * 1024 * 1024;
+  return info;
+}
+
 void CPUDeviceManager::addNetworkImpl(const Module *module,
                                       FunctionMapTy functions,
                                       ReadyCBTy readyCB) {
+  DCHECK(readyCB != nullptr);
+
+  uint64_t allFunctionsMemoryBytes{0};
+
   // First check for uniqueness of the function name.
   for (const auto &func : functions) {
     if (functions_.count(func.first) != 0) {
@@ -64,7 +82,7 @@ void CPUDeviceManager::addNetworkImpl(const Module *module,
       return;
     }
 
-    if (func.second->getCompileBackendKind() != BackendKind::CPU) {
+    if (func.second->getCompileBackendName() != "CPU") {
       readyCB(
           module,
           MAKE_ERR(
@@ -74,11 +92,15 @@ void CPUDeviceManager::addNetworkImpl(const Module *module,
                   .str()));
       return;
     }
+
+    allFunctionsMemoryBytes +=
+        func.second->getRuntimeBundle().getConstantWeightSize();
   }
 
-  if (usedMemoryBytes_ + functionCost_ > maxMemoryBytes_) {
-    readyCB(module, MAKE_ERR(GlowErr::ErrorCode::RUNTIME_OUT_OF_DEVICE_MEMORY,
-                             "Failed to add network: not enough memory"));
+  if (usedMemoryBytes_ + allFunctionsMemoryBytes > maxMemoryBytes_) {
+    readyCB(module,
+            MAKE_ERR(ErrorValue::ErrorCode::RUNTIME_OUT_OF_DEVICE_MEMORY,
+                     "Failed to add network: not enough memory"));
     return;
   }
 
@@ -88,47 +110,55 @@ void CPUDeviceManager::addNetworkImpl(const Module *module,
       func.second->getRuntimeBundle().collectConstants(module);
     }
     functions_.emplace(func.first, func.second);
-    usedMemoryBytes_ += functionCost_; // TODO:: static moduleSize
   }
 
+  usedMemoryBytes_ += allFunctionsMemoryBytes;
   assert(usedMemoryBytes_ <= maxMemoryBytes_);
 
+  // Export change in memory usage.
+  exportMemoryCounters();
+
   // Fire the ready CB.
-  readyCB(module, llvm::Error::success());
+  readyCB(module, Error::success());
 }
 
 void CPUDeviceManager::evictNetworkImpl(std::string functionName,
                                         EvictFunctionCBTy evictCB) {
-  llvm::Error err = llvm::Error::success();
+  DCHECK(evictCB != nullptr);
 
-  if (functions_.erase(functionName)) {
-    usedMemoryBytes_ -= functionCost_; // TODO: static moduleSize
+  auto it = functions_.find(functionName);
+  if (it != functions_.end()) {
+    usedMemoryBytes_ -= it->second->getRuntimeBundle().getConstantWeightSize();
+    functions_.erase(it);
   } else {
-    err =
-        MAKE_ERR(GlowErr::ErrorCode::RUNTIME_NET_NOT_FOUND,
-                 llvm::formatv("Could not find function with name {0} to evict",
-                               functionName)
-                     .str());
+    evictCB(functionName,
+            MAKE_ERR(ErrorValue::ErrorCode::RUNTIME_NET_NOT_FOUND,
+                     strFormat("Could not find function with name %s to evict",
+                               functionName.c_str())));
+    return;
   }
+  // Export change in memory usage.
+  exportMemoryCounters();
 
-  if (evictCB) {
-    evictCB(functionName, std::move(err));
-  } else {
-    llvm::errs() << llvm::toString(std::move(err));
-  }
+  evictCB(functionName, Error::success());
 }
 
 void CPUDeviceManager::runFunctionImpl(
     RunIdentifierTy id, std::string function,
     std::unique_ptr<ExecutionContext> context, ResultCBTy resultCB) {
-  TRACE_EVENT_SCOPE_NAMED(context->getTraceContext(), "DeviceManager::run",
-                          dmRun);
+  DCHECK(resultCB != nullptr);
+
+  TRACE_EVENT_SCOPE_NAMED(context->getTraceContext(), TraceLevel::RUNTIME,
+                          "DeviceManager::run", dmRun);
+  if (context->getTraceContext()) {
+    context->getTraceContext()->setThreadName("CPU DeviceManager");
+  }
   auto funcIt = functions_.find(function);
   if (funcIt == functions_.end()) {
     dmRun.addArg("reason", "function not found");
     TRACE_EVENT_SCOPE_END_NAMED(dmRun);
     resultCB(id,
-             MAKE_ERR(GlowErr::ErrorCode::RUNTIME_NET_NOT_FOUND,
+             MAKE_ERR(ErrorValue::ErrorCode::RUNTIME_NET_NOT_FOUND,
                       llvm::formatv("Function {0} not found", function).str()),
              std::move(context));
     return;

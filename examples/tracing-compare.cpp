@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 #include "glow/ExecutionEngine/ExecutionEngine.h"
 #include "glow/Graph/Graph.h"
 #include "glow/Importer/Caffe2ModelLoader.h"
-#include "glow/Optimizer/Optimizer.h"
+#include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
 #include "glow/Runtime/RuntimeTypes.h"
 
 #include "llvm/Support/CommandLine.h"
@@ -32,11 +32,9 @@ using namespace glow;
 using namespace glow::runtime;
 
 #if (GLOW_WITH_OPENCL)
-std::array<BackendKind, 3> supportedBackends{
-    BackendKind::CPU, BackendKind::Interpreter, BackendKind::OpenCL};
+std::array<std::string, 3> supportedBackends{{"CPU", "Interpreter", "OpenCL"}};
 #else
-std::array<BackendKind, 2> supportedBackends{BackendKind::CPU,
-                                             BackendKind::Interpreter};
+std::array<std::string, 2> supportedBackends{{"CPU", "Interpreter"}};
 #endif
 
 namespace {
@@ -46,10 +44,11 @@ llvm::cl::opt<std::string>
                               "a png with standard imagenet normalization"),
                llvm::cl::init("../tests/images/imagenet/dog_207.png"),
                llvm::cl::Positional, llvm::cl::cat(category));
-llvm::cl::opt<std::string>
-    outputJson(llvm::cl::desc("path to write output json trace events"),
-               llvm::cl::init("./glow-trace.json"), llvm::cl::Positional,
-               llvm::cl::cat(category));
+
+llvm::cl::opt<std::string> tracePath("trace-path",
+                                     llvm::cl::desc("Write trace logs to disk"),
+                                     llvm::cl::init("./glow-trace.json"),
+                                     llvm::cl::cat(category));
 
 } // namespace
 
@@ -73,12 +72,12 @@ std::pair<Placeholder *, Placeholder *> loadResnet50Model(TypeRef inputType,
 
 /// Compiles the resnet50 function.
 std::unique_ptr<CompiledFunction> compileModel(Module &module,
-                                               BackendKind backendKind) {
-  auto *backend = createBackend(backendKind);
+                                               llvm::StringRef backendName) {
+  auto *backend = createBackend(backendName);
   Function *F = module.getFunction("resnet50");
-  Function *F_ = F->clone("resnet50" + std::to_string((int)backendKind));
+  Function *F_ = F->clone("resnet50." + backendName.str());
 
-  llvm::outs() << "Starting compile on " << (int)backendKind << ".\n";
+  llvm::outs() << "Starting compile on " << backendName << " device.\n";
   CompilationContext cctx;
   cctx.compMode = CompilationMode::Infer;
   cctx.backendOpts.autoInstrument = true;
@@ -91,18 +90,16 @@ std::future<void> addToDevice(unsigned int id, DeviceManager *device,
   auto compilePromise = std::make_shared<std::promise<void>>();
   auto future = compilePromise->get_future();
 
-  device->addNetwork(&module, functions,
-                     [compilePromise, id](const Module *, llvm::Error err) {
-                       if (err) {
-                         llvm::errs() << "Failed to compile model for device "
-                                      << id << ".\n";
-                         EXIT_ON_ERR(std::move(err));
-                       } else {
-                         llvm::outs()
-                             << "Successfully added to Device " << id << ".\n";
-                       }
-                       compilePromise->set_value();
-                     });
+  device->addNetwork(
+      &module, functions, [compilePromise, id](const Module *, Error err) {
+        if (err) {
+          llvm::errs() << "Failed to compile model for device " << id << ".\n";
+          EXIT_ON_ERR(std::move(err));
+        } else {
+          llvm::outs() << "Successfully added to Device " << id << ".\n";
+        }
+        compilePromise->set_value();
+      });
 
   return future;
 }
@@ -111,7 +108,7 @@ int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(
       argc, argv, "Run resnet and export a json file containing trace events");
 
-  std::array<DeviceManager *, supportedBackends.size()> devices;
+  std::vector<DeviceManager *> devices(supportedBackends.size());
   for (unsigned i = 0, e = supportedBackends.size(); i < e; ++i) {
     devices[i] =
         DeviceManager::createDeviceManager(DeviceConfig(supportedBackends[i]));
@@ -126,9 +123,8 @@ int main(int argc, char **argv) {
 
   std::tie(input, output) = loadResnet50Model(inputType, module);
 
-  std::array<std::unique_ptr<CompiledFunction>, supportedBackends.size()>
-      compiledFunctions;
-
+  std::vector<std::unique_ptr<CompiledFunction>> compiledFunctions(
+      supportedBackends.size());
   for (unsigned i = 0, e = supportedBackends.size(); i < e; ++i) {
     compiledFunctions[i] = compileModel(module, supportedBackends[i]);
 
@@ -146,46 +142,41 @@ int main(int argc, char **argv) {
   Tensor batch = image.getUnowned(inputType->dims());
 
   llvm::outs() << "Starting Run.\n";
-  std::array<std::promise<std::unique_ptr<ExecutionContext>>,
-             supportedBackends.size()>
-      promises;
+  std::vector<std::promise<std::unique_ptr<ExecutionContext>>> promises(
+      supportedBackends.size());
 
   for (unsigned i = 0, e = supportedBackends.size(); i < e; ++i) {
-    auto context = llvm::make_unique<ExecutionContext>();
+    auto context = glow::make_unique<ExecutionContext>();
     context->setTraceContext(
-        llvm::make_unique<TraceContext>(TraceLevel::STANDARD));
+        glow::make_unique<TraceContext>(TraceLevel::STANDARD));
     context->getPlaceholderBindings()->allocate(module.getPlaceholders());
     updateInputPlaceholders(*(context->getPlaceholderBindings()), {input},
                             {&batch});
 
     devices[i]->runFunction(
         "resnet50", std::move(context),
-        [&promises, i](RunIdentifierTy, llvm::Error err,
+        [&promises, i](RunIdentifierTy, Error err,
                        std::unique_ptr<ExecutionContext> context) {
           EXIT_ON_ERR(std::move(err));
           promises[i].set_value(std::move(context));
         });
   }
 
-  std::vector<TraceEvent> allEvents;
-
-  allEvents.push_back({"thread_name", 0, "M", 0, {{"name", "CPU"}}});
-  allEvents.push_back({"thread_name", 0, "M", 1, {{"name", "Interpreter"}}});
-#if (GLOW_WITH_OPENCL)
-  allEvents.push_back({"thread_name", 0, "M", 2, {{"name", "OpenCL"}}});
-#endif
+  TraceContext allEvents(TraceLevel::STANDARD);
+  size_t index = 0;
+  for (auto backend : supportedBackends) {
+    allEvents.setThreadName(index++, backend);
+  }
 
   for (unsigned i = 0, e = supportedBackends.size(); i < e; ++i) {
     auto f = promises[i].get_future();
     f.wait_for(/* timeout_duration */ std::chrono::seconds(30));
     auto runbindings = f.get();
-    assert(runbindings->getTraceContext());
-    auto &events = runbindings->getTraceContext()->getTraceEvents();
-    std::move(events.begin(), events.end(), std::back_inserter(allEvents));
+    allEvents.merge(runbindings->getTraceContext());
   }
 
-  llvm::outs() << "Dumping json to " << outputJson << ".\n";
-  TraceEvent::dumpTraceEvents(allEvents, outputJson);
+  llvm::outs() << "Dumping json to " << tracePath << ".\n";
+  allEvents.dump(tracePath, "tracing-compare");
 
   return 0;
 }

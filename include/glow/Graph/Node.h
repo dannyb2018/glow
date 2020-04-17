@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,13 +49,8 @@ class Node : public Named,
   friend llvm::ilist_traits<Node>;
 
 protected:
-  /// This is the maximum number of results that a node may have.
-  static constexpr unsigned maxNodeResno_ = 6;
-
   /// The output types for the results of the node.
-  std::array<TypeRef, maxNodeResno_> types_;
-  /// The number of results that the node has.
-  unsigned numRes_{0};
+  llvm::SmallVector<TypeRef, 6> types_;
   /// A nullable reference to some tensor value that may predicate the execution
   /// of the current node.
   NodeHandle predicate_;
@@ -80,7 +75,7 @@ public:
   bool hasPredicate() const;
 
   /// \returns the number of results that the node has.
-  unsigned getNumResults() const { return numRes_; }
+  unsigned getNumResults() const { return types_.size(); }
   /// \returns the \p idx result of the node.
   NodeValue getNthResult(unsigned idx);
   /// \returns the n'th result of the node.
@@ -103,6 +98,8 @@ public:
   llvm::StringRef getOutputName(unsigned idx) const;
   bool hasSideEffects() const;
   bool isArithmetic() const;
+  bool isCanonical() const;
+  bool isDataParallel() const;
 
   /// \returns true if this input is being overwritten by the node.
   bool isOverwrittenNthInput(unsigned idx) const;
@@ -165,10 +162,20 @@ public:
   ///       responsible to update these if need be.
   void setType(unsigned idx, TypeRef ty);
 
+  /// Set the \p idx'th result type of the node, without checking if the dims of
+  /// the old type match the dims of the new one.
+  /// \note This setter only changes the type of this one
+  ///       result. If that type is incompatible with
+  ///       the inputs of the node, the caller is
+  ///       responsible to update these if need be.
+  ///       This function does not check for validity
+  ///       of input dims and whether the result exists.
+  void setTypeUnsafe(unsigned idx, TypeRef ty);
+
   /// Methods that forward to the result type (that must be valid):
   /// @{
   ElemKind getElementType(unsigned resNo) const;
-  llvm::ArrayRef<size_t> dims(unsigned resNo) const;
+  llvm::ArrayRef<dim_t> dims(unsigned resNo) const;
   /// @}
 
 protected:
@@ -243,10 +250,10 @@ public:
   }
 
   /// \returns the input types.
-  llvm::ArrayRef<TypeRef> getInTypes() { return inTypes_; }
+  llvm::ArrayRef<TypeRef> getInTypes() const { return inTypes_; }
 
   /// \returns the output types.
-  llvm::ArrayRef<TypeRef> getOutTypes() { return outTypes_; }
+  llvm::ArrayRef<TypeRef> getOutTypes() const { return outTypes_; }
 
   /// \returns the input type located at \p idx.
   const TypeRef getInTy(size_t idx) const {
@@ -394,6 +401,16 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Node &node);
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Node *node);
 
+/// Helper to get the Kind of a Node (e.g. Kinded::Kind::AddNodeKind) given its
+/// \p nodeName (e.g. Add).
+inline Kinded::Kind getKindFromNodeName(llvm::StringRef nodeName) {
+#define DEF_NODE(CLASS, NAME)                                                  \
+  if (nodeName == #NAME) {                                                     \
+    return Kinded::Kind::CLASS##Kind;                                          \
+  }
+#include "glow/AutoGenNodes.def"
+  LOG(FATAL) << "Unknown node name: " << nodeName.str();
+}
 } // namespace glow
 
 namespace llvm {

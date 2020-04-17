@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
  */
 
 #include "glow/Base/Tensor.h"
+
+#include "glow/Base/Type.h"
 
 #include "llvm/Support/NativeFormatting.h"
 #include "llvm/Support/raw_ostream.h"
@@ -64,6 +66,14 @@ template <class ElemTy> static char valueToChar(ElemTy input) {
   return ch;
 }
 
+static void dumpShape(llvm::ArrayRef<dim_t> shape, llvm::raw_ostream &os) {
+  os << "shape: ( ";
+  for (auto &d : shape) {
+    os << d << " ";
+  }
+  os << ")";
+}
+
 template <class ElemTy>
 static void dumpGenericImpl(Handle<ElemTy> handle, llvm::raw_ostream &os,
                             unsigned maxNumElem) {
@@ -80,11 +90,8 @@ static void dumpGenericImpl(Handle<ElemTy> handle, llvm::raw_ostream &os,
   }
 
   // Output shape.
-  os << "shape: ( ";
-  for (auto &d : shape) {
-    os << d << " ";
-  }
-  os << ")\n";
+  dumpShape(shape, os);
+  os << "\n";
 
   ElemTy mx = handle.raw(0);
   ElemTy mn = handle.raw(0);
@@ -157,8 +164,8 @@ static void dumpAsciiGenericImpl(Handle<ElemTy> handle, llvm::raw_ostream &os) {
   auto d = handle.dims();
 
   if (d.size() == 2) {
-    for (size_t x = 0; x < d[0]; x++) {
-      for (size_t y = 0; y < d[1]; y++) {
+    for (dim_t x = 0; x < d[0]; x++) {
+      for (dim_t y = 0; y < d[1]; y++) {
         auto val = handle.at({x, y});
         os << valueToChar(val);
       }
@@ -167,18 +174,18 @@ static void dumpAsciiGenericImpl(Handle<ElemTy> handle, llvm::raw_ostream &os) {
   } else if (d.size() == 3) {
     // Print monochrome (one-color channel) tensors:
     if (d[2] == 1) {
-      for (size_t x = 0; x < d[0]; x++) {
-        for (size_t y = 0; y < d[1]; y++) {
+      for (dim_t x = 0; x < d[0]; x++) {
+        for (dim_t y = 0; y < d[1]; y++) {
           auto val = handle.at({x, y, 0});
           os << valueToChar(val);
         }
         os << "\n";
       }
     } else {
-      for (size_t z = 0; z < d[2]; z++) {
+      for (dim_t z = 0; z < d[2]; z++) {
         os << "\n";
-        for (size_t x = 0; x < d[0]; x++) {
-          for (size_t y = 0; y < d[1]; y++) {
+        for (dim_t x = 0; x < d[0]; x++) {
+          for (dim_t y = 0; y < d[1]; y++) {
             auto val = handle.at({x, y, z});
             os << valueToChar(val);
           }
@@ -200,17 +207,17 @@ static void dumpAsciiGenericImpl(Handle<ElemTy> handle, llvm::raw_ostream &os) {
 template <class ElemTy>
 static void
 transposeGenericImpl(const Handle<ElemTy> &src, Handle<ElemTy> &dest,
-                     size_t *srcCoor, size_t *destCoor,
+                     dim_t *srcCoor, dim_t *destCoor,
                      llvm::ArrayRef<unsigned_t> shuffle, unsigned depth = 0) {
   if (depth == shuffle.size()) {
-    auto srcIdx = llvm::ArrayRef<size_t>(srcCoor, depth);
-    auto destIdx = llvm::ArrayRef<size_t>(destCoor, depth);
+    auto srcIdx = llvm::ArrayRef<dim_t>(srcCoor, depth);
+    auto destIdx = llvm::ArrayRef<dim_t>(destCoor, depth);
     dest.at(destIdx) = src.at(srcIdx);
     return;
   }
 
   // Iterate over one dimension and continue recursively to the next dim.
-  for (size_t x = 0, e = dest.dims()[depth]; x < e; x++) {
+  for (dim_t x = 0, e = dest.dims()[depth]; x < e; x++) {
     unsigned_t swizzledDepth = shuffle[depth];
     srcCoor[swizzledDepth] = x;
     destCoor[depth] = x;
@@ -227,11 +234,11 @@ template <class ElemTy>
 static bool tryTransposeFastImpl(const Handle<ElemTy> &src,
                                  Handle<ElemTy> &dest,
                                  llvm::ArrayRef<unsigned_t> shuffle) {
-  const size_t numDims = dest.dims().size();
-  size_t srcCoorArr[max_tensor_dimensions];
-  size_t destCoorArr[max_tensor_dimensions] = {0};
-  auto srcCoor = llvm::ArrayRef<size_t>(srcCoorArr, numDims);
-  auto destCoor = llvm::ArrayRef<size_t>(destCoorArr, numDims);
+  const dim_t numDims = dest.dims().size();
+  dim_t srcCoorArr[max_tensor_dimensions];
+  dim_t destCoorArr[max_tensor_dimensions] = {0};
+  auto srcCoor = llvm::ArrayRef<dim_t>(srcCoorArr, numDims);
+  auto destCoor = llvm::ArrayRef<dim_t>(destCoorArr, numDims);
 
   /// This defines a single depth of the for loop used to iterate over the
   /// source and destination tensors for transposing.
@@ -264,8 +271,8 @@ static void transposeSelectImpl(const Handle<ElemTy> &src, Handle<ElemTy> &dest,
                                 llvm::ArrayRef<unsigned_t> shuffle) {
   bool transposeOccurred = tryTransposeFastImpl(src, dest, shuffle);
   if (!transposeOccurred) {
-    size_t srcCoor[max_tensor_dimensions];
-    size_t destCoor[max_tensor_dimensions];
+    dim_t srcCoor[max_tensor_dimensions];
+    dim_t destCoor[max_tensor_dimensions];
     transposeGenericImpl(src, dest, srcCoor, destCoor, shuffle);
   }
 }
@@ -290,6 +297,10 @@ void glow::dumpAsciiImpl(const Tensor *T, llvm::raw_ostream &os) {
   case ElemKind::Int64ITy:
     return dumpAsciiGenericImpl(T->getHandle<int64_t>(), os);
   case ElemKind::UInt8FusedQTy:
+    return dumpAsciiGenericImpl(T->getHandle<uint8_t>(), os);
+  case ElemKind::UInt8FusedFP16QTy:
+    return dumpAsciiGenericImpl(T->getHandle<uint8_t>(), os);
+  case ElemKind::UInt4FusedFP16QTy:
     return dumpAsciiGenericImpl(T->getHandle<uint8_t>(), os);
   case ElemKind::BoolTy:
     return dumpAsciiGenericImpl(T->getHandle<bool>(), os);
@@ -319,6 +330,10 @@ void glow::dumpImpl(const Tensor *T, llvm::raw_ostream &os,
     return dumpGenericImpl(T->getHandle<int64_t>(), os, maxNumElem);
   case ElemKind::UInt8FusedQTy:
     return dumpGenericImpl(T->getHandle<uint8_t>(), os, maxNumElem);
+  case ElemKind::UInt8FusedFP16QTy:
+    return dumpGenericImpl(T->getHandle<uint8_t>(), os, maxNumElem);
+  case ElemKind::UInt4FusedFP16QTy:
+    return dumpGenericImpl(T->getHandle<uint8_t>(), os, maxNumElem);
   case ElemKind::BoolTy:
     return dumpGenericImpl(T->getHandle<bool>(), os, maxNumElem);
   }
@@ -339,6 +354,13 @@ std::string Tensor::toString() const {
   std::string storage;
   llvm::raw_string_ostream os(storage);
   dumpImpl(this, os);
+  return os.str();
+}
+
+std::string Tensor::getShapeToString() const {
+  std::string storage;
+  llvm::raw_string_ostream os(storage);
+  dumpShape(dims(), os);
   return os.str();
 }
 
@@ -366,7 +388,7 @@ void glow::genericTranspose(const Tensor *src, Tensor *dest,
       << "Invalid dimensions " << src->dims().size()
       << " != " << src->dims().size();
 
-  size_t newSizes[max_tensor_dimensions];
+  dim_t newSizes[max_tensor_dimensions];
 
   // Generate the swizzled dimensions.
   auto origDims = src->dims();
@@ -376,7 +398,16 @@ void glow::genericTranspose(const Tensor *src, Tensor *dest,
 
   // Resize the tensor to the transposed shape.
   auto destType = Type::newShape(src->getType(), {newSizes, origDims.size()});
-  dest->reset(destType);
+  // genericTranspose function doesn't know how to set non-trivial strides and
+  // alignments and it cannot figure out the correct ones as it can be
+  // backend-specific. Therefore set the type to destType only if it is not set
+  // properly by the caller yet.
+  // Reset should be called anyways to allocate memory for the tensor.
+  if (dest->dims() != destType.dims()) {
+    dest->reset(destType);
+  } else {
+    dest->reset(dest->getType());
+  }
 
   switch (src->getElementType()) {
   case ElemKind::FloatTy: {
@@ -430,6 +461,12 @@ void glow::genericTranspose(const Tensor *src, Tensor *dest,
   case ElemKind::UInt8FusedQTy: {
     llvm_unreachable("Transposing UInt8FusedQTy is unsupported.");
   }
+  case ElemKind::UInt8FusedFP16QTy: {
+    llvm_unreachable("Transposing UInt8FusedFP16QTy is unsupported.");
+  }
+  case ElemKind::UInt4FusedFP16QTy: {
+    llvm_unreachable("Transposing UInt4FusedFP16QTy is unsupported.");
+  }
   case ElemKind::BoolTy: {
     auto srcH = src->getHandle<bool>();
     auto destH = dest->getHandle<bool>();
@@ -439,7 +476,7 @@ void glow::genericTranspose(const Tensor *src, Tensor *dest,
   }
 }
 
-ShapeVector glow::expandDimsToMax(llvm::ArrayRef<size_t> currDims) {
+ShapeVector glow::expandDimsToMax(llvm::ArrayRef<dim_t> currDims) {
   ShapeVector newDims(currDims.begin(), currDims.end());
   for (size_t i = newDims.size(); i < max_tensor_dimensions; i++) {
     newDims.push_back(1);
@@ -448,6 +485,7 @@ ShapeVector glow::expandDimsToMax(llvm::ArrayRef<size_t> currDims) {
 }
 
 void Tensor::init(InitKind init, float val, PseudoRNG &PRNG) {
+  assert(!isDeviceResident() && "Tensor must reside on host to access data.");
   switch (init) {
   case InitKind::Zero:
     zero();
@@ -487,21 +525,28 @@ void Tensor::init(InitKind init, float val, PseudoRNG &PRNG) {
       getHandle<int64_t>().clear(val);
       break;
     }
-    case ElemKind::UInt8FusedQTy: {
-      DCHECK(dims().size() == 2)
-          << "Fused tensor must be 2-dimensional but instead has "
-          << dims().size() << " dimensions.";
-      DCHECK(dims()[1] > 8)
-          << "Fused tensor must have more than 8 columns but has " << dims()[1]
-          << " columns.";
-      auto H = getHandle<uint8_t>();
-      for (size_t i = 0; i < dims()[0]; i++) {
-        for (size_t j = 0, f = dims()[1] - 8; j < f; j++) {
-          H.at({i, j}) = val;
-        }
-      }
-      break;
-    }
+
+#define FUSED_CASE(ELEM_KIND, DATA_TYPE)                                       \
+  case ElemKind::ELEM_KIND: {                                                  \
+    DCHECK(dims().size() == 2)                                                 \
+        << "Fused tensor must be 2-dimensional but instead has "               \
+        << dims().size() << " dimensions.";                                    \
+    DCHECK(dims()[1] > 2 * sizeof(DATA_TYPE))                                  \
+        << "Fused tensor must have space for scale/offset, but only has  "     \
+        << dims()[1] << " columns.";                                           \
+    auto H = getHandle<uint8_t>();                                             \
+    for (dim_t i = 0; i < dims()[0]; i++) {                                    \
+      for (dim_t j = 0, f = dims()[1] - 2 * sizeof(DATA_TYPE); j < f; j++) {   \
+        H.at({i, j}) = val;                                                    \
+      }                                                                        \
+    }                                                                          \
+    break;                                                                     \
+  }
+      FUSED_CASE(UInt8FusedQTy, float);
+      FUSED_CASE(UInt8FusedFP16QTy, float16_t);
+      FUSED_CASE(UInt4FusedFP16QTy, float16_t);
+#undef FUSED_CASE
+
     case ElemKind::BoolTy: {
       getHandle<bool>().clear(val);
       break;
@@ -530,28 +575,96 @@ void Tensor::init(InitKind init, float val, PseudoRNG &PRNG) {
 }
 
 void Tensor::convertToType(ElemKind newTy) {
-  Tensor tmp(newTy, dims());
-  switch (newTy) {
-  case ElemKind::Float16Ty:
-    assert(getElementType() == ElemKind::FloatTy && "Cast not implemented");
-    tmp.copyWithCast<float16_t, float>(this);
-    break;
-  case ElemKind::FloatTy:
-    assert(getElementType() == ElemKind::Float16Ty && "Cast not implemented");
-    tmp.copyWithCast<float, float16_t>(this);
-    break;
-  default:
-    llvm_unreachable("Type not supported");
-  }
-  *this = std::move(tmp);
+  assert(!isDeviceResident() && "Tensor must reside on host to access data.");
+  *this = this->getCopyConvertedToType(newTy);
 }
 
-size_t Tensor::getUnpaddedSizeInBytes() const {
-  if (unpaddedSize_) {
-    return unpaddedSize_;
-  } else {
-    return type_.getSizeInBytes();
+Tensor Tensor::getCopyConvertedToType(ElemKind newKind) const {
+  assert(!isDeviceResident() && "Tensor must reside on host to access data.");
+  const ElemKind origKind = getElementType();
+  DCHECK((origKind == ElemKind::FloatTy && newKind == ElemKind::Float16Ty) ||
+         (origKind == ElemKind::FloatTy && newKind == ElemKind::Int32ITy) ||
+         (origKind == ElemKind::FloatTy && newKind == ElemKind::Int64ITy) ||
+         (origKind == ElemKind::Float16Ty && newKind == ElemKind::FloatTy) ||
+         (origKind == ElemKind::Int64ITy && newKind == ElemKind::Int32ITy) ||
+         (origKind == ElemKind::Int64ITy && newKind == ElemKind::FloatTy) ||
+         (origKind == ElemKind::Int32ITy && newKind == ElemKind::Int64ITy) ||
+         (origKind == ElemKind::Int32ITy && newKind == ElemKind::FloatTy) ||
+         (origKind == ElemKind::UInt8FusedQTy &&
+          newKind == ElemKind::UInt8FusedFP16QTy))
+      << "Conversion from " << Type::getElementName(origKind).str() << " to "
+      << Type::getElementName(newKind).str() << " is not yet implemented";
+
+  if (!isQuantizedElemKind(newKind)) {
+    Tensor tmp(newKind, dims());
+    switch (newKind) {
+    case ElemKind::Float16Ty:
+      tmp.copyWithCast<float16_t, float>(this);
+      break;
+
+    case ElemKind::FloatTy:
+      if (getElementType() == ElemKind::Int32ITy) {
+        tmp.copyWithCast<float, int32_t>(this);
+      } else if (getElementType() == ElemKind::Int64ITy) {
+        tmp.copyWithCast<float, int64_t>(this);
+      } else if (getElementType() == ElemKind::Float16Ty) {
+        tmp.copyWithCast<float, float16_t>(this);
+      } else if (getElementType() == ElemKind::FloatTy) {
+        tmp.copyRawFrom(this);
+      } else {
+        llvm_unreachable("Invalid conversion to FLOAT.");
+      }
+      break;
+
+    case ElemKind::Int32ITy:
+      if (getElementType() == ElemKind::Int64ITy) {
+        tmp.copyWithCast<int32_t, int64_t>(this);
+      } else if (getElementType() == ElemKind::FloatTy) {
+        tmp.copyWithCast<int32_t, float>(this);
+      } else {
+        llvm_unreachable("Invalid conversion from FLOAT.");
+      }
+      break;
+    case ElemKind::Int64ITy:
+      if (getElementType() == ElemKind::Int32ITy) {
+        tmp.copyWithCast<int64_t, int32_t>(this);
+      } else {
+        llvm_unreachable("Invalid conversion from FLOAT.");
+      }
+      break;
+
+    default:
+      llvm_unreachable("Type not supported");
+    }
+    return tmp;
   }
+
+  // Handle Fused conversion. Currently only supports UInt8FusedQTy ->
+  // UInt8FusedFP16QTy.
+  DCHECK(origKind == ElemKind::UInt8FusedQTy && dims().size() == 2)
+      << "UInt8FusedQTy must be 2 dimensional.";
+  Tensor tmp(newKind,
+             {dims()[0], dims()[1] - 2 * ((dim_t)sizeof(float) -
+                                          (dim_t)sizeof(float16_t))},
+             1.0, 0);
+
+  const size_t dstWidth = tmp.dims()[1];
+  auto srcH = getHandle<uint8_t>();
+  auto dstH = tmp.getHandle<uint8_t>();
+  for (dim_t i = 0, e = dims()[0]; i < e; i++) {
+    // Copy the scale/offset from src to dst.
+    float scale, offset;
+    std::tie(scale, offset) = srcH.getFusedScaleOffsetFromRow<float>(i);
+    dstH.setFusedScaleOffsetInRow<float16_t>(i, static_cast<float16_t>(scale),
+                                             static_cast<float16_t>(offset));
+
+    // Copy over the row's uint8 data from src to dst; scales and offsets were
+    // already copied over above.
+    for (dim_t j = 0, f = dstWidth - 2 * sizeof(float16_t); j < f; j++) {
+      dstH.at({i, j}) = srcH.at({i, j});
+    }
+  }
+  return tmp;
 }
 
 namespace glow {
@@ -564,6 +677,37 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Tensor *t) {
   assert(t != nullptr && "Null Pointer.");
   t->dump(os);
   return os;
+}
+
+void Tensor::moveToDevice(DeviceTensorTransferManager *deviceManager,
+                          void *locationContext) {
+  if (deviceResidency_ == nullptr) {
+    deviceResidency_ = new DeviceResidencyInfo();
+  }
+  deviceResidency_->deviceManager_ = deviceManager;
+  deviceResidency_->locationContext_ = locationContext;
+  deviceResidency_->tensorResidency_ =
+      DeviceResidencyInfo::TensorResidency::Device;
+}
+
+void Tensor::ensureOnHost() {
+  if (deviceResidency_ == nullptr) {
+    // already on host.
+    return;
+  }
+  if (deviceResidency_->isDeviceResident()) {
+    deviceResidency_->deviceManager_->transferFromDevice(*this);
+  }
+  assert(!isDeviceResident());
+}
+
+void Tensor::copyRawToDevice(const Tensor *t) {
+  assert(isDeviceResident());
+  void *locationContext = deviceResidency_->locationContext_;
+  DeviceTensorTransferManager *DM = deviceResidency_->deviceManager_;
+  clearDeviceResidency();
+  copyRawFrom(t);
+  DM->transferToDevice(*this, locationContext);
 }
 
 } // namespace glow

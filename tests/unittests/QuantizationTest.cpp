@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,42 +19,54 @@
 #include "glow/ExecutionEngine/ExecutionEngine.h"
 #include "glow/Graph/Graph.h"
 #include "glow/IR/IR.h"
+#include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
 #include "glow/Quantization/Base/Base.h"
+#include "glow/Quantization/Base/Calibration.h"
+#include "glow/Quantization/Base/Profile.h"
 #include "glow/Quantization/Quantization.h"
 #include "glow/Quantization/Serialization.h"
 
 #include "gtest/gtest.h"
 
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
 
 namespace glow {
 
 using llvm::cast;
 
-class Quantization : public ::testing::TestWithParam<BackendKind> {};
+class Quantization : public ::testing::TestWithParam<std::string> {};
 
 class Operator
-    : public ::testing::TestWithParam<::std::tuple<BackendKind, BackendKind>> {
+    : public ::testing::TestWithParam<::std::tuple<std::string, std::string>> {
 protected:
-  ExecutionEngine profileEE{BackendKind::Interpreter};
-  ExecutionEngine backendSpecificEE{BackendKind::Interpreter};
+  ExecutionEngine profileEE{};
+  ExecutionEngine backendSpecificEE{};
 
   void SetUp() override {
-    BackendKind backend1;
-    BackendKind backend2;
+    std::string backend1;
+    std::string backend2;
     std::tie(backend1, backend2) = GetParam();
-    profileEE.setBackend(backend1);
-    backendSpecificEE.setBackend(backend2);
+    profileEE.setBackendName(backend1);
+    backendSpecificEE.setBackendName(backend2);
   }
 };
 
 class InterpAndCPU : public Operator {};
 
+bool operator==(const std::vector<float> &lhs, const std::vector<float> &rhs) {
+  return std::equal(lhs.begin(), lhs.end(), rhs.begin());
+}
+
+bool operator==(const NodeProfilingInfo &lhs, const NodeProfilingInfo &rhs) {
+  return lhs.min() == rhs.min() && lhs.max() == rhs.max() &&
+         lhs.nodeOutputName_ == rhs.nodeOutputName_ &&
+         lhs.histogram() == rhs.histogram();
+}
+
 bool operator==(const NodeQuantizationInfo &lhs,
                 const NodeQuantizationInfo &rhs) {
-  return lhs.Scale() == rhs.Scale() && lhs.Offset() == rhs.Offset() &&
+  return lhs.scale() == rhs.scale() && lhs.offset() == rhs.offset() &&
          lhs.nodeOutputName_ == rhs.nodeOutputName_;
 }
 
@@ -64,19 +76,18 @@ class MockQuantBackend : public Backend {
   std::unique_ptr<Backend> backend_;
 
 public:
-  MockQuantBackend() {
-    backend_.reset(createBackend(BackendKind::Interpreter));
-  }
+  MockQuantBackend() { backend_.reset(createBackend("Interpreter")); }
 
-  BackendKind getBackendKind() const override {
-    return BackendKind::Interpreter;
-  }
+  std::string getBackendName() const override { return "Interpreter"; }
 
-  std::string getBackendName() const override { return "MockQuantBackend"; }
-
-  llvm::Expected<std::unique_ptr<CompiledFunction>>
+  Expected<std::unique_ptr<CompiledFunction>>
   compile(Function *F, const BackendOptions &opts) const override {
     return backend_->compile(F, opts);
+  }
+
+  runtime::DeviceManager *
+  createDeviceManager(const runtime::DeviceConfig &deviceConfig) override {
+    return nullptr;
   }
 
   bool isOpSupported(const NodeInfo &NI) const override {
@@ -94,30 +105,113 @@ public:
   }
 };
 
-void testSerialization(const std::vector<NodeQuantizationInfo> &expected) {
+/// Simple tests to verify the histogram rescale.
+TEST(Quantization, rescaleHistogramTest) {
+  EXPECT_EQ(quantization::rescaleHistogram({}, 0.0f, 1.0f, 0.0f, 2.0).size(),
+            0);
+  EXPECT_EQ(
+      quantization::rescaleHistogram({1, 2, 3, 4}, 0.0f, 1.0f, -1.0f, 1.0),
+      std::vector<float>({0, 0, 3, 7}));
+  EXPECT_EQ(
+      quantization::rescaleHistogram({2, 4, 6, 8}, -1.0f, 1.0f, 0.0f, 1.0),
+      std::vector<float>({3, 3, 4, 4}));
+}
+
+/// Simple tests to verify the KL optimization.
+TEST(Quantization, optimizeKLTest) {
+  // Test that an all-zero histogram does not raise exceptions.
+  std::vector<float> histAllZero(1000, 0);
+  quantization::FloatRange rangeAllZero =
+      quantization::optimizeKL(histAllZero, 0.f, 1.0f, 255);
+  EXPECT_EQ(rangeAllZero.first, 0.f);
+  EXPECT_EQ(rangeAllZero.second, 1.0f);
+
+  // Test that an empty histogram does not raise exceptions.
+  std::vector<float> histEmpty;
+  quantization::FloatRange rangeEmpty =
+      quantization::optimizeKL(histEmpty, 0.f, 1.0f, 255);
+  EXPECT_EQ(rangeEmpty.first, 0.f);
+  EXPECT_EQ(rangeEmpty.second, 1.0f);
+}
+
+void testProfilingInfosSerialization(
+    const std::vector<NodeProfilingInfo> &expected) {
   llvm::SmallVector<char, 10> resultPath;
   llvm::sys::fs::createTemporaryFile("prefix", "suffix", resultPath);
   std::string filePath(resultPath.begin(), resultPath.end());
-
-  serializeToYaml(filePath, expected);
-  std::vector<NodeQuantizationInfo> deserialized =
-      deserializeFromYaml(filePath);
+  serializeProfilingInfosToYaml(filePath, expected);
+  std::vector<NodeProfilingInfo> deserialized =
+      deserializeProfilingInfosFromYaml(filePath);
   llvm::sys::fs::remove(filePath);
   EXPECT_EQ(expected, deserialized);
 }
 
-TEST(Quantization, Serialize) {
-  std::vector<NodeQuantizationInfo> expected{
-      {"first", {1, 10}}, {"second", {-1, 3}}, {"third", {-10, 30}}};
+TEST(Quantization, ProfilingSerialize) {
+  std::vector<float> histEmpty;
+  std::vector<float> hist = {0, 1, 2, 3, 4};
+  std::vector<NodeProfilingInfo> expected{{"first", {1.0, 10.0, histEmpty}},
+                                          {"second", {-1.0, 3.0, hist}},
+                                          {"third", {-10.0, 30.0, hist}},
+                                          {"fourth", {0.1, 10.0, hist}},
+                                          {"fifth", {0.123, 30.0, hist}}};
+  testProfilingInfosSerialization(expected);
+}
 
-  testSerialization(expected);
+TEST(Quantization, ProfilingSerializePower2Range) {
+  std::vector<NodeProfilingInfo> expected{
+      {"pwr_0", {1.0000000000f, 1.0f}},   {"pwr_1", {0.5000000000f, 2.0f}},
+      {"pwr_2", {0.2500000000f, 4.0f}},   {"pwr_3", {0.1250000000f, 8.0f}},
+      {"pwr_4", {0.0625000000f, 16.0f}},  {"pwr_5", {0.0312500000f, 32.0f}},
+      {"pwr_6", {0.0156250000f, 64.0f}},  {"pwr_7", {0.0078125000f, 128.0f}},
+      {"pwr_8", {0.0039062500f, 256.0f}}, {"pwr_9", {0.0019531250f, 512.0f}}};
+  testProfilingInfosSerialization(expected);
 }
 
 #if LLVM_VERSION_MAJOR < 8
-TEST(Quantization, SerializeEmpty) {
+TEST(Quantization, ProfilingSerializeEmpty) {
+  std::vector<NodeProfilingInfo> expected;
+
+  testProfilingInfosSerialization(expected);
+}
+#endif
+
+void testQuantizationInfosSerialization(
+    const std::vector<NodeQuantizationInfo> &expected) {
+  llvm::SmallVector<char, 10> resultPath;
+  llvm::sys::fs::createTemporaryFile("prefix", "suffix", resultPath);
+  std::string filePath(resultPath.begin(), resultPath.end());
+
+  serializeQuantizationInfosToYaml(filePath, expected);
+  std::vector<NodeQuantizationInfo> deserialized =
+      deserializeQuantizationInfosFromYaml(filePath);
+  llvm::sys::fs::remove(filePath);
+  EXPECT_EQ(expected, deserialized);
+}
+
+TEST(Quantization, QuantizationSerialize) {
+  std::vector<NodeQuantizationInfo> expected{{"first", {1, 10}},
+                                             {"second", {-1, 3}},
+                                             {"third", {-10, 30}},
+                                             {"fourth", {0.1, -10}},
+                                             {"fifth", {0.123, -30}}};
+  testQuantizationInfosSerialization(expected);
+}
+
+TEST(Quantization, QuantizationSerializePower2Scale) {
+  std::vector<NodeQuantizationInfo> expected{
+      {"pwr_neg_0", {1.0000000000f, 0}}, {"pwr_neg_1", {0.5000000000f, 0}},
+      {"pwr_neg_2", {0.2500000000f, 0}}, {"pwr_neg_3", {0.1250000000f, 0}},
+      {"pwr_neg_4", {0.0625000000f, 0}}, {"pwr_neg_5", {0.0312500000f, 0}},
+      {"pwr_neg_6", {0.0156250000f, 0}}, {"pwr_neg_7", {0.0078125000f, 0}},
+      {"pwr_neg_8", {0.0039062500f, 0}}, {"pwr_neg_9", {0.0019531250f, 0}}};
+  testQuantizationInfosSerialization(expected);
+}
+
+#if LLVM_VERSION_MAJOR < 8
+TEST(Quantization, QuantizationSerializeEmpty) {
   std::vector<NodeQuantizationInfo> expected;
 
-  testSerialization(expected);
+  testQuantizationInfosSerialization(expected);
 }
 #endif
 
@@ -155,11 +249,39 @@ TEST(Quantization, quantScaleOffset) {
   }
 }
 
+TEST(Quantization, quantScaleOffsetPower2Scale) {
+  // Test different power of 2 scale values (from 2^-10 to 2^1).
+  float scales[] = {0.0009765625f, 0.0019531250f, 0.0039062500f, 0.0078125000f,
+                    0.0156250000f, 0.0312500000f, 0.0625000000f, 0.1250000000f,
+                    0.2500000000f, 0.5000000000f, 1.0000000000f, 2.0000000000f};
+
+  // Try all scale factors:
+  for (float scale : scales) {
+    // Try all legal integers within the range:
+    for (int8_t input = -128; input < 127; input++) {
+      int32_t sum32num = round(input / scale);
+      auto TR = quantization::quantizeScaleOffset32To8(scale, 0);
+      EXPECT_EQ(quantization::isFloatPowerOf2(scale), true);
+      EXPECT_EQ(TR.pre, 0);
+      int exp = quantization::getFloat2Exp(scale);
+      if (exp > 0) {
+        EXPECT_EQ(TR.scale, (int)scale);
+        EXPECT_EQ(TR.post, 0);
+      } else {
+        EXPECT_EQ(TR.scale, 1);
+        EXPECT_EQ(TR.post, -exp);
+      }
+      int32_t computed = TR.transform(sum32num);
+      EXPECT_NEAR(input, computed, 1);
+    }
+  }
+}
+
 template <class qtype>
 void quantizeTensorTest(ElemKind qTy, quantization::Schema schema) {
   // Map float [0.0; 6.0] to a quantized type using its entire value range.
   TensorQuantizationParams quantParams =
-      chooseQuantizationParams(0.0, 6.0, schema, qTy);
+      chooseQuantizationParams({0.0, 6.0}, schema, qTy);
 
   // Create an FP32 tensor with 6 elements and initialize it with numbers from 0
   // to 5.
@@ -238,10 +360,159 @@ TEST(Quantization, quantizeTensorSymmetricUInt32) {
   quantizeTensorTest<int32_t>(ElemKind::Int32QTy,
                               quantization::Schema::SymmetricWithUnsigned);
 }
+TEST(Quantization, quantizeTensorSymmetricPwr2Int8) {
+  quantizeTensorTest<int8_t>(ElemKind::Int8QTy,
+                             quantization::Schema::SymmetricWithPower2Scale);
+}
+TEST(Quantization, quantizeTensorSymmetricPwr2Int16) {
+  quantizeTensorTest<int16_t>(ElemKind::Int16QTy,
+                              quantization::Schema::SymmetricWithPower2Scale);
+}
+TEST(Quantization, quantizeTensorSymmetricPwr2Int32) {
+  quantizeTensorTest<int32_t>(ElemKind::Int32QTy,
+                              quantization::Schema::SymmetricWithPower2Scale);
+}
 
-/// Helper for quantizing a simple Conv with precision \p quantizationPrecision.
-static void quantizeSimpleConvGraph(ElemKind quantizationPrecision) {
-  ExecutionEngine EE;
+/// Test 4-bit fused rowwise quantization.
+TEST(Quantization, fused4BitsRowwiseQuantizeTensor) {
+  // Create an FP32 tensor with 12 elements and initialize it with numbers from
+  // -3 to 3.
+  Tensor inputFP32(ElemKind::FloatTy, {2, 6});
+  Tensor dequantized(ElemKind::FloatTy, {2, 6});
+  Tensor quantized(ElemKind::UInt4FusedFP16QTy, {2, 7}, /* dummy scale */ 1.0,
+                   /* dummy offset */ 0);
+  Handle<float> inputH = inputFP32.getHandle<float>();
+  for (dim_t i = 0; i < 2; i++) {
+    for (dim_t j = 0; j < 6; j++) {
+      inputH.at({i, j}) = (i + j) * 1.0f - 3;
+    }
+  }
+
+  quantization::tensorFusedRowwiseQuantization<float16_t>(inputFP32, quantized);
+  dequantized = quantization::tensor4BitsFusedRowwiseDequantization(quantized);
+
+  Handle<float> dequantizedH = dequantized.getHandle<float>();
+  for (dim_t i = 0; i < 2; i++) {
+    for (dim_t j = 0; j < 6; j++) {
+      EXPECT_NEAR(inputH.at({i, j}), dequantizedH.at({i, j}), 0.02f);
+    }
+  }
+}
+
+/// When quantizing a scalar the quantization should not lose precision: the
+/// quantize->dequantize pair applied to a float scalar should preserve the
+/// value (up to the precision lost by dividing/multiplying with the scale).
+void quantizeScalarTest(float val, ElemKind qTy, quantization::Schema schema) {
+  ExecutionEngine EE{};
+  auto &mod = EE.getModule();
+  Function *F = mod.createFunction("main");
+  PlaceholderBindings bindings;
+
+  // Choose quantization parameters
+  auto TQP = quantization::chooseQuantizationParams({val, val}, schema, qTy);
+
+  // Create quantize/dequantize network for a single float value
+  auto *input = mod.createPlaceholder(ElemKind::FloatTy, {1}, "val", false);
+  auto inputQTy = mod.uniqueType(qTy, {1}, TQP.scale, TQP.offset);
+  QuantizeNode *quant = F->createQuantize("quant", input, inputQTy);
+  DequantizeNode *dequant = F->createDequantize("dequant", quant);
+  SaveNode *save = F->createSave("save", dequant);
+
+  // Allocate placeholders, set input, run, get output
+  auto inpH = bindings.allocate(input)->getHandle();
+  auto outH = bindings.allocate(save->getPlaceholder())->getHandle();
+  inpH.at({0}) = val;
+  EE.compile(CompilationMode::Infer);
+  EE.run(bindings);
+  float outVal = outH.raw(0);
+  EXPECT_NEAR(val, outVal, 0.0000000001);
+}
+
+TEST(Quantization, quantizeScalarTestInt8) {
+  quantizeScalarTest(0.0, ElemKind::Int8QTy, quantization::Schema::Asymmetric);
+  quantizeScalarTest(0.0, ElemKind::Int8QTy, quantization::Schema::Symmetric);
+  quantizeScalarTest(0.0, ElemKind::Int8QTy,
+                     quantization::Schema::SymmetricWithUnsigned);
+  quantizeScalarTest(1.3, ElemKind::Int8QTy, quantization::Schema::Asymmetric);
+  quantizeScalarTest(1.3, ElemKind::Int8QTy, quantization::Schema::Symmetric);
+  quantizeScalarTest(1.3, ElemKind::Int8QTy,
+                     quantization::Schema::SymmetricWithUnsigned);
+  quantizeScalarTest(-1.3, ElemKind::Int8QTy, quantization::Schema::Asymmetric);
+  quantizeScalarTest(-1.3, ElemKind::Int8QTy, quantization::Schema::Symmetric);
+  quantizeScalarTest(-1.3, ElemKind::Int8QTy,
+                     quantization::Schema::SymmetricWithUnsigned);
+}
+
+TEST(Quantization, quantizeScalarTestInt16) {
+  quantizeScalarTest(0.0, ElemKind::Int16QTy, quantization::Schema::Asymmetric);
+  quantizeScalarTest(0.0, ElemKind::Int16QTy, quantization::Schema::Symmetric);
+  quantizeScalarTest(0.0, ElemKind::Int16QTy,
+                     quantization::Schema::SymmetricWithUnsigned);
+  quantizeScalarTest(1.3, ElemKind::Int16QTy, quantization::Schema::Asymmetric);
+  quantizeScalarTest(1.3, ElemKind::Int16QTy, quantization::Schema::Symmetric);
+  quantizeScalarTest(1.3, ElemKind::Int16QTy,
+                     quantization::Schema::SymmetricWithUnsigned);
+  quantizeScalarTest(-1.3, ElemKind::Int16QTy,
+                     quantization::Schema::Asymmetric);
+  quantizeScalarTest(-1.3, ElemKind::Int16QTy, quantization::Schema::Symmetric);
+  quantizeScalarTest(-1.3, ElemKind::Int16QTy,
+                     quantization::Schema::SymmetricWithUnsigned);
+}
+
+TEST(Quantization, quantizeScalarTestInt32) {
+  quantizeScalarTest(0.0, ElemKind::Int32QTy, quantization::Schema::Asymmetric);
+  quantizeScalarTest(0.0, ElemKind::Int32QTy, quantization::Schema::Symmetric);
+  quantizeScalarTest(0.0, ElemKind::Int32QTy,
+                     quantization::Schema::SymmetricWithUnsigned);
+  quantizeScalarTest(1.3, ElemKind::Int32QTy, quantization::Schema::Asymmetric);
+  quantizeScalarTest(1.3, ElemKind::Int32QTy, quantization::Schema::Symmetric);
+  quantizeScalarTest(1.3, ElemKind::Int32QTy,
+                     quantization::Schema::SymmetricWithUnsigned);
+  quantizeScalarTest(-1.3, ElemKind::Int32QTy,
+                     quantization::Schema::Asymmetric);
+  quantizeScalarTest(-1.3, ElemKind::Int32QTy, quantization::Schema::Symmetric);
+  quantizeScalarTest(-1.3, ElemKind::Int32QTy,
+                     quantization::Schema::SymmetricWithUnsigned);
+}
+
+/// Check corner case when bias is quantized as int32 with unconstrained
+/// scale and offset parameters and used within a subtraction bias - biasOffset
+/// which is expected to be within int32 limits.
+static void quantizeBiasInt32CornerCaseTest(float val) {
+  // Choose bias quantization parameters
+  float biasF = val;
+  auto biasTQP = quantization::chooseQuantizationParams(
+      {biasF, biasF}, quantization::Schema::Asymmetric, ElemKind::Int32QTy);
+
+  // Quantize the tensor.
+  Tensor biasTF(ElemKind::FloatTy, {1});
+  biasTF.getHandle<float>().at({0}) = biasF;
+  auto biasTQ =
+      quantization::quantizeTensor(biasTF, biasTQP, ElemKind::Int32QTy);
+  int32_t biasQ = biasTQ.getHandle<int32_t>().at({0});
+  int32_t biasOffset = biasTQP.offset;
+
+  // Compute difference and check against int32 limits.
+  int64_t diff = ((int64_t)biasQ) - ((int64_t)biasOffset);
+  EXPECT_TRUE(std::numeric_limits<int32_t>::min() <= diff);
+  EXPECT_TRUE(diff <= std::numeric_limits<int32_t>::max());
+}
+
+TEST(Quantization, quantizeBiasInt32CornerCaseTests) {
+  quantizeBiasInt32CornerCaseTest(0.0);
+  quantizeBiasInt32CornerCaseTest(0.3);
+  quantizeBiasInt32CornerCaseTest(-0.3);
+  quantizeBiasInt32CornerCaseTest(0.0000003);
+  quantizeBiasInt32CornerCaseTest(-0.0000003);
+  quantizeBiasInt32CornerCaseTest(30000000.0);
+  quantizeBiasInt32CornerCaseTest(-30000000.0);
+}
+
+/// Helper for quantizing a simple Conv with precision \p quantizationPrecision
+/// while the bias is quantized using \p quantizationPrecisionBias.
+static void quantizeSimpleConvGraph(ElemKind quantizationPrecision,
+                                    ElemKind quantizationPrecisionBias) {
+  ExecutionEngine EE{};
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
 
@@ -252,6 +523,8 @@ static void quantizeSimpleConvGraph(ElemKind quantizationPrecision) {
   auto outTy = mod.uniqueType(ElemKind::FloatTy, {1, 4, 8, 2});
   PlaceholderBindings bindings;
   bindings.allocate(input);
+  filter->getHandle().randomize(-1.0, 1.0, mod.getPRNG());
+  bias->getHandle().randomize(-1.0, 1.0, mod.getPRNG());
 
   auto *CN = F->createConv("Conv", input, filter, bias, outTy, {2, 2}, {1, 1},
                            {0, 2, 1, 3}, 1);
@@ -259,39 +532,50 @@ static void quantizeSimpleConvGraph(ElemKind quantizationPrecision) {
   bindings.allocate(S->getPlaceholder());
 
   quantization::QuantizationConfiguration quantConfig{{
-      {NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-       {0.2f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(filter->getName()),
-       {0.3f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(bias->getName()),
-       {0.4f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(CN->getName()), {0.6f, 0}},
+      {input->getOutput().generateNodeOutputName(), {0.0f, 2.0f}},
+      {filter->getOutput().generateNodeOutputName(), {0.0f, 3.0f}},
+      {bias->getOutput().generateNodeOutputName(), {0.0f, 4.0f}},
+      {CN->getResult().generateNodeOutputName(), {0.0f, 6.0f}},
   }};
 
   quantConfig.precision = quantizationPrecision;
+  quantConfig.precisionBias = quantizationPrecisionBias;
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend);
 
   // Make sure that graph can be compiled and run.
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
   EE.run(bindings);
 }
 
-/// Test that a simple Conv graph can be quantized in Int8QTy.
-TEST(Quantization, int8QuantizeGraph) {
-  quantizeSimpleConvGraph(ElemKind::Int8QTy);
+/// Test that a simple Conv graph can be quantized in Int8QTy and Int8QTy bias.
+TEST(Quantization, QuantizeGraph_Int8_BiasInt8) {
+  quantizeSimpleConvGraph(ElemKind::Int8QTy, ElemKind::Int8QTy);
 }
 
-/// Test that a simple Conv graph can be quantized in Int16QTy.
-TEST(Quantization, int16QuantizeGraph) {
-  quantizeSimpleConvGraph(ElemKind::Int16QTy);
+/// Test that a simple Conv graph can be quantized in Int8QTy and Int32QTy bias.
+TEST(Quantization, QuantizeGraph_Int8_BiasInt32) {
+  quantizeSimpleConvGraph(ElemKind::Int8QTy, ElemKind::Int32QTy);
+}
+
+/// Test that a simple Conv graph can be quantized in Int16QTy and Int16QTy
+/// bias.
+TEST(Quantization, QuantizeGraph_Int16_BiasInt16) {
+  quantizeSimpleConvGraph(ElemKind::Int16QTy, ElemKind::Int16QTy);
+}
+
+/// Test that a simple Conv graph can be quantized in Int16QTy and Int32QTy
+/// bias.
+TEST(Quantization, QuantizeGraph_Int16_BiasInt32) {
+  quantizeSimpleConvGraph(ElemKind::Int16QTy, ElemKind::Int32QTy);
 }
 
 /// Test that when a node is quantized before its users are quantized then the
 /// users correctly find the quantization parameters. This tests that updating
 /// the nodeToTQP_ map in FunctionQuantizer::postProcessing() works correctly.
 TEST(Quantization, TestQuantizedInputBeforeQuantizedNode) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
 
@@ -313,27 +597,25 @@ TEST(Quantization, TestQuantizedInputBeforeQuantizedNode) {
   // We need to optimize here first so that the two reshapes are merged.
   optimize(F, CompilationMode::Infer);
 
-  Node *newReshape = SN->getInput().getNode();
+  ReshapeNode *newReshape = llvm::dyn_cast<ReshapeNode>(SN->getInput());
   ASSERT_TRUE(newReshape);
-  ASSERT_TRUE(llvm::isa<ReshapeNode>(newReshape));
 
   quantization::QuantizationConfiguration quantConfig{{
-      {NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-       {0.2f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(newReshape->getName()),
-       {0.2f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(SN->getName()), {0.2f, 0}},
+      {input->getOutput().generateNodeOutputName(), {-1.0, 1.0}},
+      {newReshape->getResult().generateNodeOutputName(), {-1.0, 1.0}},
+      {NodeValue::generateNodeOutputName(SN->getName()), {-1.0, 1.0}},
   }};
 
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend);
 
   // Remove unnecessary conversions.
   optimize(F, CompilationMode::Infer);
 
   // Now we verify that the SliceNode was in fact quantized.
   {
-    auto *saveNode = llvm::dyn_cast<SaveNode>(F->getNodeByName("ret"));
+    auto *saveNode = llvm::dyn_cast<SaveNode>(F->getNodeByName(S->getName()));
     ASSERT_TRUE(saveNode);
     auto *deqNode =
         llvm::dyn_cast<DequantizeNode>(saveNode->getInput().getNode());
@@ -345,13 +627,15 @@ TEST(Quantization, TestQuantizedInputBeforeQuantizedNode) {
 }
 
 /// Test enabling RowwiseQuantizedFullyConnected in Glow quantization
-/// procuedure. A FC can be quantized and converted to a
+/// procedure. A FC can be quantized and converted to a
 /// RowwiseQuantizedFullyConnected if:
 /// 1. The weights of FC is constant;
 /// 2. Use -enable-rowwise option or set enableRowwise param in
 /// quantization::quantizeFunction to true. In unittest, the later one is used.
-TEST(Quantization, enableRowwiseQuantizedFullyConnected) {
-  ExecutionEngine EE;
+static void
+enableRowwiseQuantizedFullyConnected(ElemKind quantizationPrecision,
+                                     ElemKind quantizationPrecisionBias) {
+  ExecutionEngine EE{};
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
 
@@ -370,39 +654,39 @@ TEST(Quantization, enableRowwiseQuantizedFullyConnected) {
 
   LoweredInfoMap loweredMapForQuant;
   CompilationContext cctx(/* bindings */ nullptr, &loweredMapForQuant);
-  ::glow::lower(F, cctx, EE.getBackend());
+  ::glow::lower(F, cctx);
 
   // Get the MatMul node and the Batched_Add node.
-  Node *matMul, *batchedAdd;
+  MatMulNode *matMul;
+  BatchedAddNode *batchedAdd;
   for (Node &N : F->getNodes()) {
     if (N.getKind() == Kinded::Kind::MatMulNodeKind) {
-      matMul = &N;
+      matMul = llvm::cast<MatMulNode>(&N);
     }
     if (N.getKind() == Kinded::Kind::BatchedAddNodeKind) {
-      batchedAdd = &N;
+      batchedAdd = llvm::cast<BatchedAddNode>(&N);
     }
   }
   ASSERT_TRUE(matMul);
   ASSERT_TRUE(batchedAdd);
 
   quantization::QuantizationConfiguration quantConfig{{
-      {NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-       {0.2f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(WC->getName()), {0.3f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(B->getName()), {0.4f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(matMul->getName()),
-       {0.6f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(batchedAdd->getName()),
-       {0.6f, 0}},
+      {input->getOutput().generateNodeOutputName(), {0.2f, 2.0f}},
+      {WC->getOutput().generateNodeOutputName(), {0.3f, 3.0f}},
+      {B->getOutput().generateNodeOutputName(), {0.4f, 4.0f}},
+      {matMul->getResult().generateNodeOutputName(), {0.6f, 6.0f}},
+      {batchedAdd->getResult().generateNodeOutputName(), {0.6f, 6.0f}},
   }};
 
+  quantConfig.precision = quantizationPrecision;
+  quantConfig.precisionBias = quantizationPrecisionBias;
   quantConfig.enableRowwise = true;
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend(),
-                                 loweredMapForQuant);
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend, loweredMapForQuant);
 
   // Check the graph structure after quantization.
-  auto *saveNode = llvm::dyn_cast<SaveNode>(F->getNodeByName("ret"));
+  auto *saveNode = llvm::dyn_cast<SaveNode>(F->getNodeByName(S->getName()));
   ASSERT_TRUE(saveNode);
   auto *deqNode =
       llvm::dyn_cast<DequantizeNode>(saveNode->getInput().getNode());
@@ -423,14 +707,22 @@ TEST(Quantization, enableRowwiseQuantizedFullyConnected) {
 
   // Make sure that graph can be compiled and run. We check the correctness of
   // RowwiseQuantizedFullyConnected in operatorTests.cpp.
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 
   EE.run(bindings);
 }
 
+TEST(Quantization, enableRowwiseQuantizedFullyConnected_Int8_BiasInt8) {
+  enableRowwiseQuantizedFullyConnected(ElemKind::Int8QTy, ElemKind::Int8QTy);
+}
+
+TEST(Quantization, enableRowwiseQuantizedFullyConnected_Int8_BiasInt32) {
+  enableRowwiseQuantizedFullyConnected(ElemKind::Int8QTy, ElemKind::Int32QTy);
+}
+
 /// Test enabling RowwiseQuantizedFullyConnected with Symmetric quantization.
 TEST(Quantization, enableRowwiseQuantizedFullyConnectedSymmetric) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   auto &mod = EE.getModule();
   PlaceholderBindings bindings;
   Function *F = mod.createFunction("main");
@@ -449,14 +741,19 @@ TEST(Quantization, enableRowwiseQuantizedFullyConnectedSymmetric) {
   WC->getPayloadMutable().getHandle().randomize(-0.7, 1.1, mod.getPRNG());
   auto *BC = llvm::cast<Constant>(FC->getBias());
 
+  TensorProfilingParams inputTPP = {-1.0, 6.0};
+  TensorProfilingParams matmulTPP = {0.0, 10.0};
+  TensorProfilingParams batchedaddTPP = {0.0, 10.0};
+  TensorProfilingParams biasTPP = {0, 20};
+
   TensorQuantizationParams inputTQP = chooseQuantizationParams(
-      -1.0, 6.0, quantization::Schema::Symmetric, ElemKind::Int8QTy);
+      inputTPP, quantization::Schema::Symmetric, ElemKind::Int8QTy);
   TensorQuantizationParams matmulTQP = chooseQuantizationParams(
-      0.0, 10.0, quantization::Schema::Symmetric, ElemKind::Int8QTy);
+      matmulTPP, quantization::Schema::Symmetric, ElemKind::Int8QTy);
   TensorQuantizationParams batchedaddTQP = chooseQuantizationParams(
-      0.0, 10.0, quantization::Schema::Symmetric, ElemKind::Int8QTy);
+      batchedaddTPP, quantization::Schema::Symmetric, ElemKind::Int8QTy);
   TensorQuantizationParams biasTQP = chooseQuantizationParams(
-      0, 20, quantization::Schema::Symmetric, ElemKind::Int8QTy);
+      biasTPP, quantization::Schema::Symmetric, ElemKind::Int8QTy);
 
   EXPECT_EQ(inputTQP.offset, 0);
   EXPECT_EQ(matmulTQP.offset, 0);
@@ -465,16 +762,17 @@ TEST(Quantization, enableRowwiseQuantizedFullyConnectedSymmetric) {
 
   LoweredInfoMap loweredMapForQuant;
   CompilationContext cctx(/* bindings */ nullptr, &loweredMapForQuant);
-  ::glow::lower(F, cctx, EE.getBackend());
+  ::glow::lower(F, cctx);
 
   // Get the MatMul node and the Batched_Add node.
-  Node *matMul, *batchedAdd;
+  MatMulNode *matMul;
+  BatchedAddNode *batchedAdd;
   for (Node &N : F->getNodes()) {
     if (N.getKind() == Kinded::Kind::MatMulNodeKind) {
-      matMul = &N;
+      matMul = llvm::cast<MatMulNode>(&N);
     }
     if (N.getKind() == Kinded::Kind::BatchedAddNodeKind) {
-      batchedAdd = &N;
+      batchedAdd = llvm::cast<BatchedAddNode>(&N);
     }
   }
   ASSERT_TRUE(matMul);
@@ -483,24 +781,21 @@ TEST(Quantization, enableRowwiseQuantizedFullyConnectedSymmetric) {
   // Note: Using dummy offset for the weights, as it should be
   // rowwise-quantized.
   quantization::QuantizationConfiguration quantConfig{{
-      {NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-       inputTQP},
-      {NodeQuantizationInfo::generateNodeOutputName(WC->getName()), {1.0f, 1}},
-      {NodeQuantizationInfo::generateNodeOutputName(BC->getName()), biasTQP},
-      {NodeQuantizationInfo::generateNodeOutputName(matMul->getName()),
-       matmulTQP},
-      {NodeQuantizationInfo::generateNodeOutputName(batchedAdd->getName()),
-       batchedaddTQP},
+      {input->getOutput().generateNodeOutputName(), inputTPP},
+      {WC->getOutput().generateNodeOutputName(), {-0.7, 1.1}},
+      {BC->getOutput().generateNodeOutputName(), biasTPP},
+      {matMul->getResult().generateNodeOutputName(), matmulTPP},
+      {batchedAdd->getResult().generateNodeOutputName(), batchedaddTPP},
   }};
 
   quantConfig.schema = quantization::Schema::Symmetric;
   quantConfig.enableRowwise = true;
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend(),
-                                 loweredMapForQuant);
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend, loweredMapForQuant);
 
   // Check the graph structure after quantization.
-  auto *saveNode = llvm::dyn_cast<SaveNode>(F->getNodeByName("save"));
+  auto *saveNode = llvm::dyn_cast<SaveNode>(F->getNodeByName(res->getName()));
   ASSERT_TRUE(saveNode);
   auto *deqNode =
       llvm::dyn_cast<DequantizeNode>(saveNode->getInput().getNode());
@@ -525,14 +820,14 @@ TEST(Quantization, enableRowwiseQuantizedFullyConnectedSymmetric) {
 
   // Make sure that graph can be compiled and run. We check the correctness of
   // RowwiseQuantizedFullyConnected in operatorTests.cpp.
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 
   EE.run(bindings);
 }
 
 /// Check that SLWS is correctly fused rowwise-quantized by the quantizer.
 TEST(Quantization, enableRowwiseQuantizedSLWS) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
   PlaceholderBindings bindings;
@@ -559,24 +854,21 @@ TEST(Quantization, enableRowwiseQuantizedSLWS) {
   bindings.allocate(res->getPlaceholder());
 
   quantization::QuantizationConfiguration quantConfig{{
-      {NodeQuantizationInfo::generateNodeOutputName(
-           SLWS->getData().getNode()->getName()),
-       {0.2f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(
-           SLWS->getWeights().getNode()->getName()),
-       {0.3f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(SLWS->getName()),
-       {0.4f, 0}},
+      {SLWS->getData().generateNodeOutputName(), {0.2f, 2.0f}},
+      {SLWS->getWeights().generateNodeOutputName(), {0.3f, 3.0f}},
+      {SLWS->getResult().generateNodeOutputName(), {0.4f, 4.0f}},
   }};
 
   quantConfig.enableRowwise = true;
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
-
-  EE.compile(CompilationMode::Infer, F);
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend);
+  std::string saveName = std::string(res->getName());
+  EE.compile(CompilationMode::Infer);
 
   // Check the graph structure after quantization.
-  auto *saveNode = llvm::dyn_cast<SaveNode>(F->getNodeByName("save"));
+  F = EE.getModule().getFunctions().front();
+  auto *saveNode = llvm::dyn_cast<SaveNode>(F->getNodeByName(saveName));
   ASSERT_TRUE(saveNode);
   auto *FRWQSLWS =
       llvm::dyn_cast<FusedRowwiseQuantizedSparseLengthsWeightedSumNode>(
@@ -588,76 +880,90 @@ TEST(Quantization, enableRowwiseQuantizedSLWS) {
 /// has quantization parameters mapping to non-negative floating
 /// point range.
 TEST(Quantization, quantizeReLU) {
-  ExecutionEngine EE;
-  EE.setBackend(new MockQuantBackend());
+  ExecutionEngine EE{};
+  std::unique_ptr<Backend> backend(new MockQuantBackend);
+  EE.setBackendName("Interpreter");
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
   auto *input = mod.createPlaceholder(ElemKind::FloatTy, {1, 3}, "input", true);
   auto *relu = F->createRELU("ReLU", input);
   PlaceholderBindings bindings;
-  F->createSave("ret", relu);
+  auto *ret = F->createSave("ret", relu);
+  std::string retName = std::string(ret->getName());
   // Make sure that offset quantization parameter of ReLU is set
   // such that it produces non-negative floating point range.
   quantization::QuantizationConfiguration quantConfig{
-      {{NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-        {0.2f, 0}},
-       {NodeQuantizationInfo::generateNodeOutputName(relu->getName()),
-        {0.2f, -128}}}};
+      {{input->getOutput().generateNodeOutputName(), {0.2f, 2.0f}},
+       {relu->getResult().generateNodeOutputName(), {0.0f, 3.0f}}}};
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
-  EE.compile(CompilationMode::Infer, F);
+  quantization::quantizeFunction(F, quantConfig, *backend);
+  EE.compile(CompilationMode::Infer);
 
-  auto *save = llvm::cast<SaveNode>(F->getNodeByName("ret"));
+  // Compute tensor quantization parameters for verification.
+  auto reluTQP = chooseQuantizationParams({0.0f, 3.0f}, quantConfig.schema,
+                                          quantConfig.precision);
+
+  F = EE.getModule().getFunctions().front();
+  auto *save = llvm::cast<SaveNode>(F->getNodeByName(retName));
   ASSERT_TRUE(llvm::isa<DequantizeNode>(save->getInput().getNode()));
   auto *dequantize = llvm::cast<DequantizeNode>(save->getInput().getNode());
   ASSERT_TRUE(llvm::isa<MaxNode>(dequantize->getInput().getNode()));
 
   MaxNode *max = llvm::cast<MaxNode>(dequantize->getInput().getNode());
   ASSERT_TRUE(max->getResult().getType()->isQuantizedType());
-  EXPECT_EQ(max->getResult().getType()->getOffset(), -128);
-  EXPECT_EQ(max->getResult().getType()->getScale(), 0.2f);
+  EXPECT_EQ(max->getResult().getType()->getOffset(), reluTQP.offset);
+  EXPECT_EQ(max->getResult().getType()->getScale(), reluTQP.scale);
 }
 
 /// Quantize Log, Sigmoid, and Tanh nodes and make sure that quantized versions
 /// are implemented as IntLookupTables, because the Interpreter only supports
 /// them as such.
 TEST(Quantization, quantizeLookupTables) {
-  ExecutionEngine EE{BackendKind::Interpreter};
+  ExecutionEngine EE{};
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
   auto *input = mod.createPlaceholder(ElemKind::FloatTy, {1, 3}, "input", true);
   auto *LN = F->createLog("log", input);
   auto *SN = F->createSigmoid("sigmoid", LN);
   auto *TN = F->createTanh("tanh", SN);
-  F->createSave("ret", TN);
+  auto *ret = F->createSave("ret", TN);
 
   quantization::QuantizationConfiguration quantConfig{
-      {{NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-        {0.02f, -128}},
-       {NodeQuantizationInfo::generateNodeOutputName(LN->getName()),
-        {0.008f, 0}},
-       {NodeQuantizationInfo::generateNodeOutputName(SN->getName()),
-        {0.03f, 2}},
-       {NodeQuantizationInfo::generateNodeOutputName(TN->getName()),
-        {0.04f, 3}}}};
+      {{input->getOutput().generateNodeOutputName(), {0.2f, 2.0f}},
+       {LN->getResult().generateNodeOutputName(LN->getName()), {0.3f, 3.0f}},
+       {SN->getResult().generateNodeOutputName(), {0.4f, 4.0f}},
+       {TN->getResult().generateNodeOutputName(), {0.5f, 5.0f}}}};
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend);
   optimize(F, CompilationMode::Infer);
 
-  // Note: The scales/offsets used below are those expected based on
-  // Sigmoid/Tanh requirements, or on the input values for the Log.
+  // Compute the quantization parameters based on the requirements of the
+  // Sigmoid/Tanh or on the input/output values for Log.
+  auto logInpTQP = chooseQuantizationParams({0.2, 2.0}, quantConfig.schema,
+                                            quantConfig.precision);
+  auto logOutTQP = chooseQuantizationParams({0.3, 3.0}, quantConfig.schema,
+                                            quantConfig.precision);
+  auto sigmoidInpTQP = chooseQuantizationParams({-6.0, 6.0}, quantConfig.schema,
+                                                quantConfig.precision);
+  auto sigmoidOutTQP = chooseQuantizationParams({0.0, 1.0}, quantConfig.schema,
+                                                quantConfig.precision);
+  auto tanhInpTQP = chooseQuantizationParams({-3.0, 3.0}, quantConfig.schema,
+                                             quantConfig.precision);
+  auto tanhOutTQP = chooseQuantizationParams({-1.0, 1.0}, quantConfig.schema,
+                                             quantConfig.precision);
 
-  auto *save = llvm::cast<SaveNode>(F->getNodeByName("ret"));
+  auto *save = llvm::cast<SaveNode>(F->getNodeByName(ret->getName()));
   auto *dequantizeTanh =
       llvm::dyn_cast<DequantizeNode>(save->getInput().getNode());
   ASSERT_TRUE(dequantizeTanh);
   auto *tanhILT =
       llvm::dyn_cast<IntLookupTableNode>(dequantizeTanh->getInput().getNode());
   ASSERT_TRUE(tanhILT);
-  EXPECT_FLOAT_EQ(tanhILT->getResult().getType()->getScale(), 0.00784314);
-  EXPECT_EQ(tanhILT->getResult().getType()->getOffset(), 0);
-  EXPECT_FLOAT_EQ(tanhILT->getInput().getType()->getScale(), 0.02352941);
-  EXPECT_EQ(tanhILT->getInput().getType()->getOffset(), 0);
+  EXPECT_FLOAT_EQ(tanhILT->getResult().getType()->getScale(), tanhOutTQP.scale);
+  EXPECT_EQ(tanhILT->getResult().getType()->getOffset(), tanhOutTQP.offset);
+  EXPECT_FLOAT_EQ(tanhILT->getInput().getType()->getScale(), tanhInpTQP.scale);
+  EXPECT_EQ(tanhILT->getInput().getType()->getOffset(), tanhInpTQP.offset);
 
   auto *rescaleSigmoid =
       llvm::dyn_cast<RescaleQuantizedNode>(tanhILT->getInput().getNode());
@@ -665,10 +971,14 @@ TEST(Quantization, quantizeLookupTables) {
   auto *sigmoidILT =
       llvm::dyn_cast<IntLookupTableNode>(rescaleSigmoid->getInput().getNode());
   ASSERT_TRUE(sigmoidILT);
-  EXPECT_FLOAT_EQ(sigmoidILT->getResult().getType()->getScale(), 0.00392157);
-  EXPECT_EQ(sigmoidILT->getResult().getType()->getOffset(), -128);
-  EXPECT_FLOAT_EQ(sigmoidILT->getInput().getType()->getScale(), 0.047058824);
-  EXPECT_EQ(sigmoidILT->getInput().getType()->getOffset(), 0);
+  EXPECT_FLOAT_EQ(sigmoidILT->getResult().getType()->getScale(),
+                  sigmoidOutTQP.scale);
+  EXPECT_EQ(sigmoidILT->getResult().getType()->getOffset(),
+            sigmoidOutTQP.offset);
+  EXPECT_FLOAT_EQ(sigmoidILT->getInput().getType()->getScale(),
+                  sigmoidInpTQP.scale);
+  EXPECT_EQ(sigmoidILT->getInput().getType()->getOffset(),
+            sigmoidInpTQP.offset);
 
   auto *rescaleLog =
       llvm::dyn_cast<RescaleQuantizedNode>(sigmoidILT->getInput().getNode());
@@ -676,61 +986,74 @@ TEST(Quantization, quantizeLookupTables) {
   auto *logILT =
       llvm::dyn_cast<IntLookupTableNode>(rescaleLog->getInput().getNode());
   ASSERT_TRUE(logILT);
-  EXPECT_FLOAT_EQ(logILT->getResult().getType()->getScale(), 0.008);
-  EXPECT_EQ(logILT->getResult().getType()->getOffset(), 0);
-  EXPECT_FLOAT_EQ(logILT->getInput().getType()->getScale(), 0.02);
-  EXPECT_EQ(logILT->getInput().getType()->getOffset(), -128);
+  EXPECT_FLOAT_EQ(logILT->getResult().getType()->getScale(), logOutTQP.scale);
+  EXPECT_EQ(logILT->getResult().getType()->getOffset(), logOutTQP.offset);
+  EXPECT_FLOAT_EQ(logILT->getInput().getType()->getScale(), logInpTQP.scale);
+  EXPECT_EQ(logILT->getInput().getType()->getOffset(), logInpTQP.offset);
 }
 
 /// Quantize Log, Sigmoid, and Tanh nodes and make sure that they are not
 /// replaced by LookupTables because the backend supports them directly.
 TEST(Quantization, quantizeWithoutLookupTables) {
-  ExecutionEngine EE;
-  EE.setBackend(new MockQuantBackend());
+  ExecutionEngine EE{};
+  std::unique_ptr<Backend> backend(new MockQuantBackend);
+  EE.setBackendName("Interpreter");
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
   auto *input = mod.createPlaceholder(ElemKind::FloatTy, {1, 3}, "input", true);
   auto *LN = F->createLog("log", input);
   auto *SN = F->createSigmoid("sigmoid", LN);
   auto *TN = F->createTanh("tanh", SN);
-  F->createSave("ret", TN);
+  auto *ret = F->createSave("ret", TN);
 
   quantization::QuantizationConfiguration quantConfig{
-      {{NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-        {0.02f, -128}},
-       {NodeQuantizationInfo::generateNodeOutputName(LN->getName()),
-        {0.008f, 0}},
-       {NodeQuantizationInfo::generateNodeOutputName(SN->getName()),
-        {0.03f, 2}},
-       {NodeQuantizationInfo::generateNodeOutputName(TN->getName()),
-        {0.04f, 3}}}};
+      {{input->getOutput().generateNodeOutputName(), {0.2f, 2.0f}},
+       {LN->getResult().generateNodeOutputName(), {0.3f, 3.0f}},
+       {SN->getResult().generateNodeOutputName(), {0.4f, 4.0f}},
+       {TN->getResult().generateNodeOutputName(), {0.5f, 5.0f}}}};
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
+  quantization::quantizeFunction(F, quantConfig, *backend);
   optimize(F, CompilationMode::Infer);
 
-  auto *save = llvm::cast<SaveNode>(F->getNodeByName("ret"));
+  // Compute the quantization parameters for validation.
+  auto logInpTQP = chooseQuantizationParams({0.2, 2.0}, quantConfig.schema,
+                                            quantConfig.precision);
+  auto logOutTQP = chooseQuantizationParams({0.3, 3.0}, quantConfig.schema,
+                                            quantConfig.precision);
+  auto sigmoidInpTQP = chooseQuantizationParams({0.3, 3.0}, quantConfig.schema,
+                                                quantConfig.precision);
+  auto sigmoidOutTQP = chooseQuantizationParams(
+      {0.4f, 4.0f}, quantConfig.schema, quantConfig.precision);
+  auto tanhInpTQP = chooseQuantizationParams({0.4f, 4.0f}, quantConfig.schema,
+                                             quantConfig.precision);
+  auto tanhOutTQP = chooseQuantizationParams({0.5f, 5.0f}, quantConfig.schema,
+                                             quantConfig.precision);
+
+  auto *save = llvm::cast<SaveNode>(F->getNodeByName(ret->getName()));
   auto *dequantize = llvm::dyn_cast<DequantizeNode>(save->getInput().getNode());
   ASSERT_TRUE(dequantize);
   auto *tanh = llvm::dyn_cast<TanhNode>(dequantize->getInput());
   ASSERT_TRUE(tanh);
-  EXPECT_FLOAT_EQ(tanh->getResult().getType()->getScale(), 0.04);
-  EXPECT_EQ(tanh->getResult().getType()->getOffset(), 3);
-  EXPECT_FLOAT_EQ(tanh->getInput().getType()->getScale(), 0.03);
-  EXPECT_EQ(tanh->getInput().getType()->getOffset(), 2);
+  EXPECT_FLOAT_EQ(tanh->getResult().getType()->getScale(), tanhOutTQP.scale);
+  EXPECT_EQ(tanh->getResult().getType()->getOffset(), tanhOutTQP.offset);
+  EXPECT_FLOAT_EQ(tanh->getInput().getType()->getScale(), tanhInpTQP.scale);
+  EXPECT_EQ(tanh->getInput().getType()->getOffset(), tanhInpTQP.offset);
 
   auto *sigmoid = llvm::dyn_cast<SigmoidNode>(tanh->getInput());
   ASSERT_TRUE(sigmoid);
-  EXPECT_FLOAT_EQ(sigmoid->getResult().getType()->getScale(), 0.03);
-  EXPECT_EQ(sigmoid->getResult().getType()->getOffset(), 2);
-  EXPECT_FLOAT_EQ(sigmoid->getInput().getType()->getScale(), 0.008);
-  EXPECT_EQ(sigmoid->getInput().getType()->getOffset(), 0);
+  EXPECT_FLOAT_EQ(sigmoid->getResult().getType()->getScale(),
+                  sigmoidOutTQP.scale);
+  EXPECT_EQ(sigmoid->getResult().getType()->getOffset(), sigmoidOutTQP.offset);
+  EXPECT_FLOAT_EQ(sigmoid->getInput().getType()->getScale(),
+                  sigmoidInpTQP.scale);
+  EXPECT_EQ(sigmoid->getInput().getType()->getOffset(), sigmoidInpTQP.offset);
 
   auto *log = llvm::dyn_cast<LogNode>(sigmoid->getInput());
   ASSERT_TRUE(log);
-  EXPECT_FLOAT_EQ(log->getResult().getType()->getScale(), 0.008);
-  EXPECT_EQ(log->getResult().getType()->getOffset(), 0);
-  EXPECT_FLOAT_EQ(log->getInput().getType()->getScale(), 0.02);
-  EXPECT_EQ(log->getInput().getType()->getOffset(), -128);
+  EXPECT_FLOAT_EQ(log->getResult().getType()->getScale(), logOutTQP.scale);
+  EXPECT_EQ(log->getResult().getType()->getOffset(), logOutTQP.offset);
+  EXPECT_FLOAT_EQ(log->getInput().getType()->getScale(), logInpTQP.scale);
+  EXPECT_EQ(log->getInput().getType()->getOffset(), logInpTQP.offset);
 }
 
 /// Fills the tensor \p H with some stable random data with the seed \p seed
@@ -763,7 +1086,7 @@ static Function *createSimpleGraphForQuantization(Module *M,
   auto *RL = F->createRELU("relu", CV);
   auto *MP = F->createMaxPool("maxPool", RL, 2, 2, 1);
   // Just add noop transpose.
-  auto *T = F->createTranspose("transpose", MP, {0, 1, 2, 3});
+  auto *T = F->createTranspose("transpose", MP->getResult(), {0, 1, 2, 3});
   // Noop reshape, make sure conversion quantization procedure works well.
   auto *R = F->createReshape("reshape", T, T->getResult().dims());
   auto *AP = F->createAvgPool("avgPool", R, 2, 2, 1);
@@ -784,8 +1107,7 @@ static Function *createSimpleGraphForQuantization(Module *M,
   auto *SP = F->createSplat("splat", B->getType(), 10.0);
   auto *O = F->createConcat("concat", {CN, SP}, 0);
   auto *TN = F->createTranspose("transpose", O, {1, 0});
-  auto *MMN = F->createMatMul("batchedreduceadd", O, TN);
-  auto *BRAN = F->createBatchedReduceAdd("batchedreduceadd", MMN, 0);
+  auto *BRAN = F->createBatchedReduceAdd("batchedreduceadd", TN, 0);
   auto *TLN = F->createTile("tile", BRAN, 2, 0);
   auto *SN = F->createSplat("splat", TLN->getResult().getType(), 100.0);
   auto *MN = F->createMax("max", SN, TLN);
@@ -807,24 +1129,30 @@ testQuantizationEnd2End(ExecutionEngine &profileEE,
                         ElemKind quantizationPrecision,
                         const KindSet &keepOriginalPrecisionForNodes = {}) {
   auto *mod = &profileEE.getModule();
+  auto *modBackend = &backendSpecificEE.getModule();
   PlaceholderBindings bindings;
+  PlaceholderBindings bindingsBackend;
 
   auto *A =
       mod->createPlaceholder(ElemKind::FloatTy, {1, 32, 32, 2}, "A", false);
   auto *B = mod->createPlaceholder(ElemKind::FloatTy, {10, 9}, "B", false);
+  auto *AB = modBackend->createPlaceholder(ElemKind::FloatTy, {1, 32, 32, 2},
+                                           "A", false);
+  auto *BB =
+      modBackend->createPlaceholder(ElemKind::FloatTy, {10, 9}, "B", false);
 
   // STEP1 - Generate the first network to record the quantization parameters.
-  Function *F1 = createSimpleGraphForQuantization(mod, bindings, A, B, "main");
-  Function *F2 = F1->clone("main2");
-  SaveNode *result1 = cast<SaveNode>(F1->getNodeByName("save"));
+  createSimpleGraphForQuantization(mod, bindings, A, B, "main");
+  createSimpleGraphForQuantization(modBackend, bindingsBackend, AB, BB, "main");
 
   LoweredInfoMap loweredMapForProf;
   CompilationContext cctxProf{&bindings, &loweredMapForProf};
   cctxProf.precisionConfig.quantMode = QuantizationMode::Profile;
-  profileEE.compile(F1, cctxProf);
+  profileEE.compile(cctxProf);
+  bindings.allocate(mod->getPlaceholders());
 
   // Run graph to capture profile.
-  profileEE.run(bindings);
+  profileEE.run(bindings, "main");
 
   // STEP2 - Use the profile to quantize a network.
   LoweredInfoMap loweredMapForQuant;
@@ -833,21 +1161,22 @@ testQuantizationEnd2End(ExecutionEngine &profileEE,
   // Get quantization infos and build new quantized graph.
   PrecisionConfiguration &precConfig = cctxQuant.precisionConfig;
   precConfig.quantMode = QuantizationMode::Quantize;
-  precConfig.quantConfig.infos = quantization::generateNodeQuantizationInfos(
-      bindings, F1, loweredMapForProf, quantization::Schema::Asymmetric,
-      quantizationPrecision);
+  precConfig.quantConfig.infos = quantization::generateNodeProfilingInfos(
+      bindings, mod->getFunctions().front(), loweredMapForProf);
   precConfig.quantConfig.precision = quantizationPrecision;
   precConfig.quantConfig.assertAllNodesQuantized = true;
   precConfig.precisionModeKindSet = keepOriginalPrecisionForNodes;
 
-  SaveNode *result2 = cast<SaveNode>(F2->getNodeByName("save"));
-
-  backendSpecificEE.compile(F2, cctxQuant);
-  backendSpecificEE.run(bindings);
+  backendSpecificEE.compile(cctxQuant);
+  bindingsBackend.allocate(modBackend->getPlaceholders());
+  backendSpecificEE.run(bindingsBackend);
 
   // STEP3 - Compare the results of the original and quantized functions.
-  auto result1Handle = bindings.get(result1->getPlaceholder())->getHandle();
-  auto result2Handle = bindings.get(result2->getPlaceholder())->getHandle();
+  auto result1Handle =
+      bindings.get(bindings.getPlaceholderByName("save"))->getHandle();
+  auto result2Handle =
+      bindingsBackend.get(bindingsBackend.getPlaceholderByName("save"))
+          ->getHandle();
 
   EXPECT_EQ(result1Handle.size(), result2Handle.size());
 
@@ -866,7 +1195,7 @@ TEST_P(Operator, end2endInt8) {
   // explicitly whitelist them here as staying in float, so that the quantizer
   // does not complain.
   KindSet keepOriginalPrecisionForNodes;
-  if (backendSpecificEE.getBackend()->getBackendKind() == BackendKind::OpenCL) {
+  if (backendSpecificEE.getBackendName() == "OpenCL") {
     keepOriginalPrecisionForNodes.insert(Kinded::Kind::SelectNodeKind);
     keepOriginalPrecisionForNodes.insert(Kinded::Kind::CmpLTENodeKind);
     keepOriginalPrecisionForNodes.insert(
@@ -979,15 +1308,16 @@ static Function *createGRUForQuantization(Module *M,
 TEST_P(Operator, end2endGRU) {
   // STEP1 - Generate the first network to record the quantization parameters.
   auto *mod = &profileEE.getModule();
+  auto *modBackend = &backendSpecificEE.getModule();
   PlaceholderBindings bindings;
-  Function *F1 = createGRUForQuantization(mod, bindings, "main");
-  Function *F2 = F1->clone("main2");
-  SaveNode *result1 = cast<SaveNode>(F1->getNodeByName("save"));
+  PlaceholderBindings bindingsBackend;
+  createGRUForQuantization(mod, bindings, "main");
+  createGRUForQuantization(modBackend, bindingsBackend, "main");
 
   LoweredInfoMap loweredMapForProf;
   CompilationContext cctxProf{&bindings, &loweredMapForProf};
   cctxProf.precisionConfig.quantMode = QuantizationMode::Profile;
-  profileEE.compile(F1, cctxProf);
+  profileEE.compile(cctxProf);
 
   // Run graph to capture profile.
   profileEE.run(bindings);
@@ -996,28 +1326,30 @@ TEST_P(Operator, end2endGRU) {
   CompilationContext cctxQuant{&bindings, &loweredMapForQuant};
   cctxQuant.precisionConfig.quantMode = QuantizationMode::Quantize;
   PrecisionConfiguration &precConfig = cctxQuant.precisionConfig;
-  precConfig.quantConfig.infos = quantization::generateNodeQuantizationInfos(
-      bindings, F1, loweredMapForProf);
+  precConfig.quantConfig.infos = quantization::generateNodeProfilingInfos(
+      bindings, mod->getFunctions().front(), loweredMapForProf);
 
   // The OpenCL backend does not support some of the nodes in the test;
   // explicitly whitelist them here as staying in float, so that the quantizer
   // does not complain.
   KindSet doNotQuantizeKinds;
-  if (backendSpecificEE.getBackend()->getBackendKind() == BackendKind::OpenCL) {
+  if (backendSpecificEE.getBackendName() == "OpenCL") {
     precConfig.precisionModeKindSet.insert(Kinded::Kind::TanhNodeKind);
     precConfig.precisionModeKindSet.insert(Kinded::Kind::SigmoidNodeKind);
     precConfig.precisionModeKindSet.insert(Kinded::Kind::GatherNodeKind);
   }
 
   // STEP2 - Use the profile to quantize a network.
-  SaveNode *result2 = cast<SaveNode>(F2->getNodeByName("save"));
 
-  backendSpecificEE.compile(F2, cctxQuant);
-  backendSpecificEE.run(bindings);
+  backendSpecificEE.compile(cctxQuant);
+  backendSpecificEE.run(bindingsBackend);
 
   // STEP3 - Compare the results of the original and quantized functions.
-  auto result1Handle = bindings.get(result1->getPlaceholder())->getHandle();
-  auto result2Handle = bindings.get(result2->getPlaceholder())->getHandle();
+  auto result1Handle =
+      bindings.get(bindings.getPlaceholderByName("save"))->getHandle();
+  auto result2Handle =
+      bindingsBackend.get(bindingsBackend.getPlaceholderByName("save"))
+          ->getHandle();
 
   EXPECT_EQ(result1Handle.size(), result2Handle.size());
 
@@ -1031,7 +1363,7 @@ TEST_P(Operator, end2endGRU) {
 }
 
 TEST(Quantization, rescaleSameType) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   PlaceholderBindings bindings;
   auto &mod = EE.getModule();
   auto *F = mod.createFunction("foo");
@@ -1047,9 +1379,10 @@ TEST(Quantization, rescaleSameType) {
   auto *result = bindings.allocate(save->getPlaceholder());
 
   EXPECT_EQ(F->getNodes().size(), 3);
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 
   EE.run(bindings);
+  F = EE.getModule().getFunctions().front();
   EXPECT_EQ(F->getNodes().size(), 2);
 
   auto RH = result->getHandle();
@@ -1057,7 +1390,7 @@ TEST(Quantization, rescaleSameType) {
 }
 
 TEST(Quantization, optimizeRescaleQuantize) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   PlaceholderBindings bindings;
   auto &mod = EE.getModule();
   auto *F = mod.createFunction("foo");
@@ -1074,10 +1407,11 @@ TEST(Quantization, optimizeRescaleQuantize) {
   auto *result = bindings.allocate(save->getPlaceholder());
 
   EXPECT_EQ(F->getNodes().size(), 4);
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 
   EE.run(bindings);
-  EXPECT_EQ(F->getNodes().size(), 1);
+
+  EXPECT_EQ(EE.getModule().getFunctions().front()->getNodes().size(), 1);
 
   auto RH = result->getHandle();
   EXPECT_NEAR(RH.at({0, 0}), 21.0, 0.001);
@@ -1088,7 +1422,7 @@ TEST(Quantization, optimizeRescaleQuantize) {
 TEST(Quantization, chooseQuantizationAsymmetric) {
   // Map float [0.0; 6.0] to int [-128; 127].
   TensorQuantizationParams asymmetricParams =
-      chooseQuantizationParams(0.0, 6.0, quantization::Schema::Asymmetric);
+      chooseQuantizationParams({0.0, 6.0}, quantization::Schema::Asymmetric);
   // Dequantization formula is scale(X - offset).
   // So
   // 1. scale(-128 - offset) == 0.0
@@ -1100,7 +1434,7 @@ TEST(Quantization, chooseQuantizationAsymmetric) {
 
   // Map float [-3.0; 3.0] to int [-128; 127].
   asymmetricParams =
-      chooseQuantizationParams(-3.0, 3.0, quantization::Schema::Asymmetric);
+      chooseQuantizationParams({-3.0, 3.0}, quantization::Schema::Asymmetric);
   // Dequantization formula is scale(X - offset).
   // So in theory, we should get
   // 1. scale(-128 - offset) == -3.0
@@ -1118,7 +1452,7 @@ TEST(Quantization, chooseQuantizationAsymmetric) {
 
   // Map float [-2.0; 5.0] to int [-128; 127].
   asymmetricParams =
-      chooseQuantizationParams(-2.0, 5.0, quantization::Schema::Asymmetric);
+      chooseQuantizationParams({-2.0, 5.0}, quantization::Schema::Asymmetric);
   // Scale: (5.0 - (-2.0)) / (127 - (-128)) == 7.0 / 255.0
   // Offset from min: scale(-128 - offset) == -2.0
   //                  7.0 / 255.0 * (-128 - offset) == -2.0
@@ -1132,7 +1466,7 @@ TEST(Quantization, chooseQuantizationAsymmetric) {
   // Make sure we extend the range to include 0.0, i.e.,
   // we really map [0.0; 5.0] to int [-128; 127].
   asymmetricParams =
-      chooseQuantizationParams(2.0, 5.0, quantization::Schema::Asymmetric);
+      chooseQuantizationParams({2.0, 5.0}, quantization::Schema::Asymmetric);
   // Scale: (5.0 - (0.0)) / (127 - (-128)) == 5.0 / 255.0
   // Offset from min: scale(-128 - offset) == 0.0
   EXPECT_EQ(asymmetricParams.offset, -128);
@@ -1142,7 +1476,7 @@ TEST(Quantization, chooseQuantizationAsymmetric) {
   // Make sure we extend the range to include 0.0, i.e.,
   // we really map [-8.0; 0.0] to int [-128; 127].
   asymmetricParams =
-      chooseQuantizationParams(-8.0, -2.0, quantization::Schema::Asymmetric);
+      chooseQuantizationParams({-8.0, -2.0}, quantization::Schema::Asymmetric);
   // Scale: (0.0 - (-8.0)) / (127 - (-128)) == 8.0 / 255.0
   // Offset from min: scale(127 - offset) == 0.0
   EXPECT_EQ(asymmetricParams.offset, 127);
@@ -1155,21 +1489,21 @@ TEST(Quantization, chooseQuantizationSymmetric) {
   // Map float [0.0; 6.0] to int [-128; 127].
   // With symmetric mapping, we basically map [-6.0; 6.0]
   TensorQuantizationParams symmetricParams =
-      chooseQuantizationParams(0.0, 6.0, quantization::Schema::Symmetric);
+      chooseQuantizationParams({0.0, 6.0}, quantization::Schema::Symmetric);
   // With symmetric mapping offset should always be zero.
   EXPECT_EQ(symmetricParams.offset, 0);
   EXPECT_NEAR(symmetricParams.scale, 12.0 / 255, 0.001);
 
   // Map float [-3.0; 3.0] to int [-128; 127].
   symmetricParams =
-      chooseQuantizationParams(-3.0, 3.0, quantization::Schema::Symmetric);
+      chooseQuantizationParams({-3.0, 3.0}, quantization::Schema::Symmetric);
   EXPECT_EQ(symmetricParams.offset, 0);
   EXPECT_NEAR(symmetricParams.scale, 6.0 / 255, 0.001);
 
   // Map float [-2.0; 5.0] to int [-128; 127].
   // => [-5.0; 5.0] range for symmetric mode.
   symmetricParams =
-      chooseQuantizationParams(-2.0, 5.0, quantization::Schema::Symmetric);
+      chooseQuantizationParams({-2.0, 5.0}, quantization::Schema::Symmetric);
   EXPECT_EQ(symmetricParams.offset, 0);
   EXPECT_NEAR(symmetricParams.scale, 10.0 / 255, 0.001);
 
@@ -1177,7 +1511,7 @@ TEST(Quantization, chooseQuantizationSymmetric) {
   // Ranges are extended to include 0.
   // => [0.0; 5.0] range for symmetric mode.
   symmetricParams =
-      chooseQuantizationParams(2.0, 5.0, quantization::Schema::Symmetric);
+      chooseQuantizationParams({2.0, 5.0}, quantization::Schema::Symmetric);
   // Scale: (5.0 - (0.0)) / (127 - (-128)) == 5.0 / 255.0
   // Offset from min: scale(-128 - offset) == 0.0
   EXPECT_EQ(symmetricParams.offset, 0);
@@ -1186,7 +1520,7 @@ TEST(Quantization, chooseQuantizationSymmetric) {
   // Map float [-8.0; -2.0] to int [-128; 127].
   // => [-8.0; 8.0] range for symmetric mode.
   symmetricParams =
-      chooseQuantizationParams(-8.0, -2.0, quantization::Schema::Symmetric);
+      chooseQuantizationParams({-8.0, -2.0}, quantization::Schema::Symmetric);
   EXPECT_EQ(symmetricParams.offset, 0);
   EXPECT_NEAR(symmetricParams.scale, 16.0 / 255, 0.001);
 }
@@ -1194,19 +1528,19 @@ TEST(Quantization, chooseQuantizationSymmetric) {
 /// Check quantization symmetry in presence of infinities.
 TEST(Quantization, chooseQuantizationSymmetricInf) {
   auto sym = quantization::Schema::Symmetric;
-  EXPECT_EQ(chooseQuantizationParams(-INFINITY, INFINITY, sym).offset, 0);
-  EXPECT_EQ(chooseQuantizationParams(INFINITY, INFINITY, sym).offset, 0);
-  EXPECT_EQ(chooseQuantizationParams(-INFINITY, -INFINITY, sym).offset, 0);
-  EXPECT_EQ(chooseQuantizationParams(-INFINITY, 1.0f, sym).offset, 0);
-  EXPECT_EQ(chooseQuantizationParams(-INFINITY, -1.0f, sym).offset, 0);
-  EXPECT_EQ(chooseQuantizationParams(-1.0f, INFINITY, sym).offset, 0);
-  EXPECT_EQ(chooseQuantizationParams(1.0f, INFINITY, sym).offset, 0);
+  EXPECT_EQ(chooseQuantizationParams({-INFINITY, INFINITY}, sym).offset, 0);
+  EXPECT_EQ(chooseQuantizationParams({INFINITY, INFINITY}, sym).offset, 0);
+  EXPECT_EQ(chooseQuantizationParams({-INFINITY, -INFINITY}, sym).offset, 0);
+  EXPECT_EQ(chooseQuantizationParams({-INFINITY, 1.0f}, sym).offset, 0);
+  EXPECT_EQ(chooseQuantizationParams({-INFINITY, -1.0f}, sym).offset, 0);
+  EXPECT_EQ(chooseQuantizationParams({-1.0f, INFINITY}, sym).offset, 0);
+  EXPECT_EQ(chooseQuantizationParams({1.0f, INFINITY}, sym).offset, 0);
 }
 
 /// Check that Relu can use our symmetric quantization schema.
 TEST(Quantization, reluCanUseSymmetricSchema) {
   PlaceholderBindings bindings;
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
 
@@ -1214,17 +1548,17 @@ TEST(Quantization, reluCanUseSymmetricSchema) {
       mod.createPlaceholder(ElemKind::FloatTy, {10}, "input", false);
   auto *inputTensor = bindings.allocate(input);
   auto IH = inputTensor->getHandle<float>();
-  for (size_t i = 0; i < 10; i++) {
+  for (dim_t i = 0; i < 10; i++) {
     IH.at({i}) = (i % 2 == 0) ? 5 : -5;
   }
 
   // Create symmetric params that will be used for Relu.
   TensorQuantizationParams reluParams =
-      chooseQuantizationParams(0.0, 10.0, quantization::Schema::Symmetric);
+      chooseQuantizationParams({0.0, 10.0}, quantization::Schema::Symmetric);
   TypeRef reluTy = mod.uniqueType(ElemKind::Int8QTy, {10}, reluParams.scale,
                                   reluParams.offset);
   TensorQuantizationParams inputParams =
-      chooseQuantizationParams(-10.0, 10.0, quantization::Schema::Symmetric);
+      chooseQuantizationParams({-10.0, 10.0}, quantization::Schema::Symmetric);
 
   QuantizeNode *QN =
       F->createQuantize("quant", input,
@@ -1235,12 +1569,12 @@ TEST(Quantization, reluCanUseSymmetricSchema) {
   SaveNode *SN = F->createSave("save", DN);
   auto *res = bindings.allocate(SN->getPlaceholder());
 
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
   EE.run(bindings);
 
   // Verify all negative values were correctly set to zero.
   auto RH = res->getHandle();
-  for (size_t i = 0; i < 10; i++) {
+  for (dim_t i = 0; i < 10; i++) {
     if (i % 2 == 0) {
       EXPECT_NEAR(RH.at({i}), 5, 0.05);
     } else {
@@ -1255,7 +1589,7 @@ TEST(Quantization, chooseQuantizationSymmetricWithUInt8) {
   // Map float [0.0; 6.0] to int [-128; 127].
   // With symmetric with uint8 mapping, we basically map [0.0; 6.0]
   TensorQuantizationParams symmetricParams = chooseQuantizationParams(
-      0.0, 6.0, quantization::Schema::SymmetricWithUnsigned);
+      {0.0, 6.0}, quantization::Schema::SymmetricWithUnsigned);
   // Given this is a purely positive range, we should use uint8,
   // thus int8 - (-128).
   EXPECT_EQ(symmetricParams.offset, -128);
@@ -1263,7 +1597,7 @@ TEST(Quantization, chooseQuantizationSymmetricWithUInt8) {
 
   // Map float [-3.0; 3.0] to int [-128; 127].
   symmetricParams = chooseQuantizationParams(
-      -3.0, 3.0, quantization::Schema::SymmetricWithUnsigned);
+      {-3.0, 3.0}, quantization::Schema::SymmetricWithUnsigned);
   EXPECT_EQ(symmetricParams.offset, 0);
   EXPECT_NEAR(symmetricParams.scale, 6.0 / 255, 0.001);
 
@@ -1271,13 +1605,13 @@ TEST(Quantization, chooseQuantizationSymmetricWithUInt8) {
   // This has negative value, thus we fall back to purely symmetric.
   // => [-5.0; 5.0] range for symmetric mode.
   symmetricParams = chooseQuantizationParams(
-      -2.0, 5.0, quantization::Schema::SymmetricWithUnsigned);
+      {-2.0, 5.0}, quantization::Schema::SymmetricWithUnsigned);
   EXPECT_EQ(symmetricParams.offset, 0);
   EXPECT_NEAR(symmetricParams.scale, 10.0 / 255, 0.001);
 
   // Map float [0; 0] to int [-128; 127].
   symmetricParams = chooseQuantizationParams(
-      0.0, 0.0, quantization::Schema::SymmetricWithUnsigned);
+      {0.0, 0.0}, quantization::Schema::SymmetricWithUnsigned);
   EXPECT_EQ(symmetricParams.offset, 0);
   EXPECT_NEAR(symmetricParams.scale, 0.1, 0.001);
 
@@ -1286,7 +1620,7 @@ TEST(Quantization, chooseQuantizationSymmetricWithUInt8) {
   // However, our quantization schemas always include zero.
   // => [0.0; 5.0] range for uint8 mode.
   symmetricParams = chooseQuantizationParams(
-      2.0, 5.0, quantization::Schema::SymmetricWithUnsigned);
+      {2.0, 5.0}, quantization::Schema::SymmetricWithUnsigned);
   // Scale: (5.0 - (0.0)) / (127 - (-128)) == 5.0 / 255.0
   // Offset from min: scale(-128 - offset) == 0.0
   EXPECT_EQ(symmetricParams.offset, -128);
@@ -1295,16 +1629,31 @@ TEST(Quantization, chooseQuantizationSymmetricWithUInt8) {
   // Map float [-8.0; -2.0] to int [-128; 127].
   // => [-8.0; 8.0] range for symmetric mode.
   symmetricParams = chooseQuantizationParams(
-      -8.0, -2.0, quantization::Schema::SymmetricWithUnsigned);
+      {-8.0, -2.0}, quantization::Schema::SymmetricWithUnsigned);
   EXPECT_EQ(symmetricParams.offset, 0);
   EXPECT_NEAR(symmetricParams.scale, 16.0 / 255, 0.001);
 }
 
+/// Verify the SymmetricWithPower2Scale quantization schema.
+static void chooseQuantParamsPower2Scale(float min, float max, ElemKind qTy) {
+  auto quantParams = quantization::chooseQuantizationParams(
+      {min, max}, quantization::Schema::SymmetricWithPower2Scale, qTy);
+  EXPECT_EQ(quantParams.offset, 0);
+  EXPECT_TRUE(quantization::isFloatPowerOf2(quantParams.scale));
+}
+
+TEST(Quantization, chooseQuantizationSymmetricWithPower2Scale) {
+  chooseQuantParamsPower2Scale(-3.0, 6.0, ElemKind::Int8QTy);
+  chooseQuantParamsPower2Scale(3.0, 6.0, ElemKind::Int16QTy);
+  chooseQuantParamsPower2Scale(-6.0, 0.0, ElemKind::Int32QTy);
+}
+
 /// Check that LRN and Softmax are quantized.
 TEST(Quantization, quantizeSoftmaxAndLRN) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   PlaceholderBindings bindings;
-  EE.setBackend(new MockQuantBackend());
+  std::unique_ptr<Backend> backend(new MockQuantBackend);
+  EE.setBackendName("Interpreter");
 
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
@@ -1319,16 +1668,13 @@ TEST(Quantization, quantizeSoftmaxAndLRN) {
   auto *SN = F->createSave("ret", SM);
 
   quantization::QuantizationConfiguration quantConfig{
-      {{NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-        {0.2f, 0}},
-       {NodeQuantizationInfo::generateNodeOutputName(LRN->getName()),
-        {0.3f, 0}},
-       {NodeQuantizationInfo::generateNodeOutputName(SM->getName()), {0.4f, 0}},
-       {NodeQuantizationInfo::generateNodeOutputName(SN->getName()),
-        {0.4f, 0}}}};
+      {{input->getOutput().generateNodeOutputName(), {0.2f, 2.0f}},
+       {LRN->getResult().generateNodeOutputName(LRN->getName()), {0.3f, 3.0f}},
+       {SM->getResult().generateNodeOutputName(SM->getName()), {0.4f, 4.0f}},
+       {NodeValue::generateNodeOutputName(SN->getName()), {0.4f, 4.0f}}}};
 
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
+  quantization::quantizeFunction(F, quantConfig, *backend);
 
   auto qLRNIt = std::find_if(
       F->getNodes().begin(), F->getNodes().end(), [](const Node &node) -> bool {
@@ -1357,9 +1703,10 @@ TEST(Quantization, quantizeSoftmaxAndLRN) {
 
 /// Check that Select is quantized.
 TEST(Quantization, quantizeSelect) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   PlaceholderBindings bindings;
-  EE.setBackend(new MockQuantBackend());
+  std::unique_ptr<Backend> backend(new MockQuantBackend);
+  EE.setBackendName("Interpreter");
 
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
@@ -1370,18 +1717,25 @@ TEST(Quantization, quantizeSelect) {
   auto *select = F->createSelect("select", cond, LHS, RHS);
   F->createSave("save", select);
 
-  TensorQuantizationParams LHSQP = {0.5f, 0};
-  TensorQuantizationParams RHSQP = {0.3f, 0};
-  TensorQuantizationParams selectQP = {0.4f, 0};
+  TensorProfilingParams LHSPP = {0.0, 1.0};
+  TensorProfilingParams RHSPP = {-1.3, 2.7};
+  TensorProfilingParams selectPP = {-2, 3.1};
 
   quantization::QuantizationConfiguration quantConfig{
-      {{NodeQuantizationInfo::generateNodeOutputName(LHS->getName()), LHSQP},
-       {NodeQuantizationInfo::generateNodeOutputName(RHS->getName()), RHSQP},
-       {NodeQuantizationInfo::generateNodeOutputName(select->getName()),
-        selectQP}}};
+      {{LHS->getOutput().generateNodeOutputName(), LHSPP},
+       {RHS->getOutput().generateNodeOutputName(), RHSPP},
+       {select->getResult().generateNodeOutputName(), selectPP}}};
 
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
+  quantization::quantizeFunction(F, quantConfig, *backend);
+
+  // Get quantization parameters for verification.
+  TensorQuantizationParams LHSQP = chooseQuantizationParams(
+      LHSPP, quantConfig.schema, quantConfig.precision);
+  TensorQuantizationParams RHSQP = chooseQuantizationParams(
+      RHSPP, quantConfig.schema, quantConfig.precision);
+  TensorQuantizationParams selectQP = chooseQuantizationParams(
+      selectPP, quantConfig.schema, quantConfig.precision);
 
   auto it = std::find_if(
       F->getNodes().begin(), F->getNodes().end(),
@@ -1405,9 +1759,10 @@ TEST(Quantization, quantizeSelect) {
 /// Check that AvgPool is quantized, and its input and output have different
 /// scale and offset.
 TEST(Quantization, quantizeAvgPool) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   PlaceholderBindings bindings;
-  EE.setBackend(new MockQuantBackend());
+  std::unique_ptr<Backend> backend(new MockQuantBackend);
+  EE.setBackendName("Interpreter");
 
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
@@ -1418,15 +1773,13 @@ TEST(Quantization, quantizeAvgPool) {
   auto *s = F->createSave("save", pool);
 
   quantization::QuantizationConfiguration quantConfig{{
-      {NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-       {0.2f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(pool->getName()),
-       {0.3f, 1}},
-      {NodeQuantizationInfo::generateNodeOutputName(s->getName()), {0.4f, 0}},
+      {input->getOutput().generateNodeOutputName(), {-2.0f, 2.0f}},
+      {pool->getResult().generateNodeOutputName(), {0.3f, 3.0f}},
+      {NodeValue::generateNodeOutputName(s->getName()), {0.4f, 4.0f}},
   }};
 
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
+  quantization::quantizeFunction(F, quantConfig, *backend);
 
   auto qPool = std::find_if(F->getNodes().begin(), F->getNodes().end(),
                             [](const Node &node) -> bool {
@@ -1445,7 +1798,7 @@ TEST(Quantization, quantizeAvgPool) {
 
 /// Test option to disable quantization of specific node kinds in the graph.
 TEST(Quantization, quantizeGraphPartially) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   PlaceholderBindings bindings;
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
@@ -1461,14 +1814,14 @@ TEST(Quantization, quantizeGraphPartially) {
   auto *result = save->getPlaceholder();
   bindings.allocate(result);
 
-  // Note that we are creating quantization info even for nodes that will not be
+  // Note that we are creating profiling info even for nodes that will not be
   // quantized. This is how we expect quantizeFunction() to behave, as
   // quantization profiling will still get a profile for these nodes.
   quantization::QuantizationConfiguration quantConfig{{
-      {NodeQuantizationInfo::generateNodeOutputName(LHS->getName()), {0.3f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(RHS->getName()), {0.4f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(MMN->getName()), {0.6f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(TN->getName()), {0.5f, 0}},
+      {LHS->getOutput().generateNodeOutputName(), {0.3f, 3.0f}},
+      {RHS->getOutput().generateNodeOutputName(), {0.4f, 4.0f}},
+      {MMN->getResult().generateNodeOutputName(), {0.6f, 6.0f}},
+      {TN->getResult().generateNodeOutputName(), {0.5f, 5.0f}},
   }};
 
   // Do not quantize any tanh nodes.
@@ -1476,12 +1829,18 @@ TEST(Quantization, quantizeGraphPartially) {
   doNotQuantizeKinds.insert(Kinded::Kind::TanhNodeKind);
 
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend(),
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend,
                                  /* loweredMap */ {}, doNotQuantizeKinds);
 
   // Make sure that graph can be compiled and run.
   ::glow::convertPlaceholdersToConstants(F, bindings, {result});
-  EE.compile(CompilationMode::Infer, F);
+
+  CompilationContext cctx;
+  cctx.compMode = CompilationMode::Infer;
+  // Do not perform any compile-time constant folding.
+  cctx.optimizationOpts.enableConstantFolding = false;
+  EE.compile(cctx);
 
   EE.run(bindings);
 
@@ -1522,7 +1881,7 @@ TEST(Quantization, quantizeGraphPartially) {
 /// Test option to disable quantization of specific node kinds in the graph,
 /// where there are multiple of that node kind.
 TEST(Quantization, quantizeGraphPartiallyMultipleNodes) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   PlaceholderBindings bindings;
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
@@ -1539,16 +1898,15 @@ TEST(Quantization, quantizeGraphPartiallyMultipleNodes) {
   auto *result = save->getPlaceholder();
   bindings.allocate(result);
 
-  // Note that we are creating quantization info even for nodes that will not be
+  // Note that we are creating profiling info even for nodes that will not be
   // quantized. This is how we expect quantizeFunction() to behave, as
   // quantization profiling will still get a profile for these nodes.
   quantization::QuantizationConfiguration quantConfig{{
-      {NodeQuantizationInfo::generateNodeOutputName(LHS->getName()), {0.3f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(TNLHS->getName()),
-       {0.4f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(RHS->getName()), {0.4f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(MMN->getName()), {0.6f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(TN->getName()), {0.5f, 0}},
+      {LHS->getOutput().generateNodeOutputName(), {0.3f, 3.0f}},
+      {TNLHS->getResult().generateNodeOutputName(), {0.4f, 4.0f}},
+      {RHS->getOutput().generateNodeOutputName(), {0.4f, 4.0f}},
+      {MMN->getResult().generateNodeOutputName(), {0.6f, 6.0f}},
+      {TN->getResult().generateNodeOutputName(), {0.5f, 5.0f}},
   }};
 
   // Do not quantize any tanh nodes.
@@ -1556,12 +1914,18 @@ TEST(Quantization, quantizeGraphPartiallyMultipleNodes) {
   doNotQuantizeKinds.insert(Kinded::Kind::TanhNodeKind);
 
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend(),
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend,
                                  /* loweredMap */ {}, doNotQuantizeKinds);
 
   // Make sure that graph can be compiled and run.
   ::glow::convertPlaceholdersToConstants(F, bindings, {result});
-  EE.compile(CompilationMode::Infer, F);
+
+  CompilationContext cctx;
+  cctx.compMode = CompilationMode::Infer;
+  // Do not perform any compile-time constant folding.
+  cctx.optimizationOpts.enableConstantFolding = false;
+  EE.compile(cctx);
 
   EE.run(bindings);
 
@@ -1612,7 +1976,7 @@ TEST(Quantization, quantizeGraphPartiallyMultipleNodes) {
 /// Test option to disable quantization of multiple specific node kinds in the
 /// graph.
 TEST(Quantization, quantizeGraphPartiallyMultipleKinds) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   PlaceholderBindings bindings;
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
@@ -1629,15 +1993,15 @@ TEST(Quantization, quantizeGraphPartiallyMultipleKinds) {
   auto *result = save->getPlaceholder();
   bindings.allocate(result);
 
-  // Note that we are creating quantization info even for nodes that will not be
+  // Note that we are creating profiling info even for nodes that will not be
   // quantized. This is how we expect quantizeFunction() to behave, as
   // quantization profiling will still get a profile for these nodes.
   quantization::QuantizationConfiguration quantConfig{{
-      {NodeQuantizationInfo::generateNodeOutputName(LHS->getName()), {0.3f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(RHS->getName()), {0.4f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(MMN->getName()), {0.6f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(CN->getName()), {0.6f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(TN->getName()), {0.5f, 0}},
+      {LHS->getOutput().generateNodeOutputName(), {0.3f, 3.0f}},
+      {RHS->getOutput().generateNodeOutputName(), {0.4f, 4.0f}},
+      {MMN->getResult().generateNodeOutputName(), {0.6f, 6.0f}},
+      {CN->getResult().generateNodeOutputName(), {0.6f, 6.0f}},
+      {TN->getResult().generateNodeOutputName(), {0.5f, 5.0f}},
   }};
 
   // Do not quantize any tanh or add nodes.
@@ -1646,12 +2010,18 @@ TEST(Quantization, quantizeGraphPartiallyMultipleKinds) {
   doNotQuantizeKinds.insert(Kinded::Kind::AddNodeKind);
 
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend(),
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend,
                                  /* loweredMap */ {}, doNotQuantizeKinds);
 
   // Make sure that graph can be compiled and run.
   ::glow::convertPlaceholdersToConstants(F, bindings, {result});
-  EE.compile(CompilationMode::Infer, F);
+
+  CompilationContext cctx;
+  cctx.compMode = CompilationMode::Infer;
+  // Do not perform any compile-time constant folding.
+  cctx.optimizationOpts.enableConstantFolding = false;
+  EE.compile(cctx);
 
   EE.run(bindings);
 
@@ -1702,7 +2072,7 @@ TEST(Quantization, quantizeGraphPartiallyMultipleKinds) {
 /// Check that quantizeFunction directly converts the constants
 /// instead of leaving quantize node around.
 TEST(Quantization, quantizeFunctionConvertConstant) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   PlaceholderBindings bindings;
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
@@ -1717,19 +2087,22 @@ TEST(Quantization, quantizeFunctionConvertConstant) {
   auto *result = save->getPlaceholder();
   bindings.allocate(result);
 
-  // Note that we are creating quantization info even for nodes that will not be
+  // Note that we are creating profiling info even for nodes that will not be
   // quantized. This is how we expect quantizeFunction() to behave, as
   // quantization profiling will still get a profile for these nodes.
   quantization::QuantizationConfiguration quantConfig{{
-      {NodeQuantizationInfo::generateNodeOutputName(LHS->getName()), {0.3f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(RHS->getName()), {0.4f, 0}},
-      {NodeQuantizationInfo::generateNodeOutputName(MMN->getName()), {0.6f, 0}},
+      {LHS->getOutput().generateNodeOutputName(), {0.3f, 3.0f}},
+      {RHS->getOutput().generateNodeOutputName(), {0.4f, 4.0f}},
+      {MMN->getResult().generateNodeOutputName(), {0.6f, 6.0f}},
   }};
 
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend);
 
   optimize(F, CompilationMode::Infer);
+  CompilationContext cctx;
+  convertQuantizedConstants(F, cctx);
 
   {
     // Verify that the output variable is not quantized, and that it has a
@@ -1760,7 +2133,7 @@ TEST(Quantization, quantizeFunctionConvertConstant) {
   }
 
   // Make sure that graph can be compiled and run.
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 
   EE.run(bindings);
 }
@@ -1768,7 +2141,7 @@ TEST(Quantization, quantizeFunctionConvertConstant) {
 /// Check that the slice node doesn't change the quantization parameters between
 /// its input and output.
 TEST(Quantization, quantizeSlice) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   PlaceholderBindings bindings;
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
@@ -1782,14 +2155,17 @@ TEST(Quantization, quantizeSlice) {
   bindings.allocate(result);
 
   quantization::QuantizationConfiguration quantConfig{{
-      {NodeQuantizationInfo::generateNodeOutputName(slice->getName()),
-       {0.2f, -128}},
-      {NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-       {0.4f, 0}},
+      {slice->getResult().generateNodeOutputName(), {0.2f, 2.0f}},
+      {input->getOutput().generateNodeOutputName(), {0.4f, 4.0f}},
   }};
 
+  // Compute quantization parameters for verification.
+  auto sliceInpTQP = chooseQuantizationParams({0.4, 4.0}, quantConfig.schema,
+                                              quantConfig.precision);
+
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend);
 
   optimize(F, CompilationMode::Infer);
 
@@ -1814,8 +2190,8 @@ TEST(Quantization, quantizeSlice) {
     auto *qslice = llvm::dyn_cast<SliceNode>(DN->getInput());
     ASSERT_TRUE(qslice);
     ASSERT_TRUE(qslice->getResult().getType()->isQuantizedType());
-    EXPECT_EQ(qslice->getResult().getType()->getOffset(), 0);
-    EXPECT_EQ(qslice->getResult().getType()->getScale(), 0.4f);
+    EXPECT_EQ(qslice->getResult().getType()->getOffset(), sliceInpTQP.offset);
+    EXPECT_EQ(qslice->getResult().getType()->getScale(), sliceInpTQP.scale);
 
     // Verify that the variable inputs to the matmul are quantized.
     auto *qinput = llvm::dyn_cast<QuantizeNode>(qslice->getInput());
@@ -1828,7 +2204,7 @@ TEST(Quantization, quantizeSlice) {
   }
 
   // Make sure that graph can be compiled and run.
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 
   EE.run(bindings);
 }
@@ -1836,7 +2212,7 @@ TEST(Quantization, quantizeSlice) {
 /// Check that the reshape node doesn't change the quantization parameters
 /// between its input and output.
 TEST(Quantization, quantizeReshape) {
-  ExecutionEngine EE;
+  ExecutionEngine EE{};
   PlaceholderBindings bindings;
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
@@ -1850,14 +2226,17 @@ TEST(Quantization, quantizeReshape) {
   bindings.allocate(result);
 
   quantization::QuantizationConfiguration quantConfig{{
-      {NodeQuantizationInfo::generateNodeOutputName(reshape->getName()),
-       {0.2f, -128}},
-      {NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-       {0.4f, 0}},
+      {reshape->getResult().generateNodeOutputName(), {0.2f, 2.0f}},
+      {input->getOutput().generateNodeOutputName(), {0.4f, 4.0f}},
   }};
 
+  // Compute quantization parameters for verification.
+  auto reshapeInpTQP = chooseQuantizationParams({0.4, 4.0}, quantConfig.schema,
+                                                quantConfig.precision);
+
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend);
 
   optimize(F, CompilationMode::Infer);
 
@@ -1882,8 +2261,9 @@ TEST(Quantization, quantizeReshape) {
     auto *qreshape = llvm::dyn_cast<ReshapeNode>(DN->getInput());
     ASSERT_TRUE(qreshape);
     ASSERT_TRUE(qreshape->getResult().getType()->isQuantizedType());
-    EXPECT_EQ(qreshape->getResult().getType()->getOffset(), 0);
-    EXPECT_EQ(qreshape->getResult().getType()->getScale(), 0.4f);
+    EXPECT_EQ(qreshape->getResult().getType()->getOffset(),
+              reshapeInpTQP.offset);
+    EXPECT_EQ(qreshape->getResult().getType()->getScale(), reshapeInpTQP.scale);
 
     // Verify that the variable inputs to the matmul are quantized.
     auto *qinput = llvm::dyn_cast<QuantizeNode>(qreshape->getInput());
@@ -1896,7 +2276,7 @@ TEST(Quantization, quantizeReshape) {
   }
 
   // Make sure that graph can be compiled and run.
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 
   EE.run(bindings);
 }
@@ -1962,19 +2342,15 @@ static NodeClass *findNodeKindOrReturnNull(Function *F) {
 template <class BackendClass>
 static void testProfileQuantizationOfFC(bool expectLoweredFC,
                                         bool rowwiseQuantizeFC) {
-  ExecutionEngine profileEE(BackendKind::Interpreter);
+  ExecutionEngine profileEE{};
   Function *profileF = profileEE.getModule().createFunction("profile");
   PlaceholderBindings profilebindings;
   FullyConnectedNode *FC =
       createSimpleFCNet(profilebindings, profileEE, *profileF);
-  auto outputNameFC = NodeQuantizationInfo::generateNodeOutputName(
-      FC->getName(), FullyConnectedNode::ResultIdx);
-  auto weightsNameFC = NodeQuantizationInfo::generateNodeOutputName(
-      FC->getWeights().getNode()->getName(), FC->getWeights().getResNo());
-  auto biasNameFC = NodeQuantizationInfo::generateNodeOutputName(
-      FC->getBias().getNode()->getName(), FC->getBias().getResNo());
-  auto inputNameFC = NodeQuantizationInfo::generateNodeOutputName(
-      FC->getInput().getNode()->getName(), FC->getInput().getResNo());
+  auto outputNameFC = FC->getResult().generateNodeOutputName();
+  auto weightsNameFC = FC->getWeights().generateNodeOutputName();
+  auto biasNameFC = FC->getBias().generateNodeOutputName();
+  auto inputNameFC = FC->getInput().generateNodeOutputName();
 
   // Lower everything and keep track of the lowered components source nodes via
   // the loweredMap.
@@ -1990,54 +2366,69 @@ static void testProfileQuantizationOfFC(bool expectLoweredFC,
   ASSERT_FALSE(loweredFC);
   ASSERT_TRUE(loweredMM);
   ASSERT_TRUE(loweredBA);
-  auto outputNameMM = NodeQuantizationInfo::generateNodeOutputName(
-      loweredMM->getName(), MatMulNode::ResultIdx);
-  auto outputNameBA = NodeQuantizationInfo::generateNodeOutputName(
-      loweredBA->getName(), BatchedAddNode::ResultIdx);
+  auto outputNameMM = loweredMM->getResult().generateNodeOutputName();
+  auto outputNameBA = loweredBA->getResult().generateNodeOutputName();
 
-  glow::profileQuantization(profilebindings, profileF);
+  glow::profileQuantization(profilebindings, profileF,
+                            cctx.precisionConfig.profConfig);
 
   // Compile/run to capture profile.
-  profileEE.compile(CompilationMode::Infer, profileF);
+  profileEE.compile(CompilationMode::Infer);
   profileEE.run(profilebindings);
 
-  // Get quantization infos and build new quantized graph, passing in the
+  // Get profiling infos and build new quantized graph, passing in the
   // loweredMapForProf to include the unlowered components in QI.
+  profileF = profileEE.getModule().getFunctions().front();
   quantization::QuantizationConfiguration quantConfig{
-      quantization::generateNodeQuantizationInfos(
-          profilebindings, profileF, loweredMapForProf,
-          quantization::Schema::Asymmetric, ElemKind::Int8QTy)};
+      quantization::generateNodeProfilingInfos(profilebindings, profileF,
+                                               loweredMapForProf)};
 
-  // Verify that we have node quantization infos for the FC and the lowered
+  // Verify that we have node profiling infos for the FC and the lowered
   // components of the FC (MM and BA).
-  NodeQuantizationInfo *FCQI = nullptr, *MMQI = nullptr, *BAQI = nullptr,
-                       *FCWQI = nullptr, *FCBQI = nullptr, *FCIQI = nullptr;
-  for (NodeQuantizationInfo &NQI : quantConfig.infos) {
-    if (NQI.nodeOutputName_ == outputNameFC) {
-      FCQI = &NQI;
-    } else if (NQI.nodeOutputName_ == outputNameMM) {
-      MMQI = &NQI;
-    } else if (NQI.nodeOutputName_ == outputNameBA) {
-      BAQI = &NQI;
-    } else if (NQI.nodeOutputName_ == weightsNameFC) {
-      FCWQI = &NQI;
-    } else if (NQI.nodeOutputName_ == biasNameFC) {
-      FCBQI = &NQI;
-    } else if (NQI.nodeOutputName_ == inputNameFC) {
-      FCIQI = &NQI;
+  NodeProfilingInfo *FCPI = nullptr, *MMPI = nullptr, *BAPI = nullptr,
+                    *FCWPI = nullptr, *FCBPI = nullptr, *FCIPI = nullptr;
+  for (NodeProfilingInfo &NPI : quantConfig.infos) {
+    if (NPI.nodeOutputName_ == outputNameFC) {
+      FCPI = &NPI;
+    } else if (NPI.nodeOutputName_ == outputNameMM) {
+      MMPI = &NPI;
+    } else if (NPI.nodeOutputName_ == outputNameBA) {
+      BAPI = &NPI;
+    } else if (NPI.nodeOutputName_ == weightsNameFC) {
+      FCWPI = &NPI;
+    } else if (NPI.nodeOutputName_ == biasNameFC) {
+      FCBPI = &NPI;
+    } else if (NPI.nodeOutputName_ == inputNameFC) {
+      FCIPI = &NPI;
     }
   }
-  ASSERT_TRUE(FCQI);
-  ASSERT_TRUE(MMQI);
-  ASSERT_TRUE(BAQI);
-  ASSERT_TRUE(FCWQI);
-  ASSERT_TRUE(FCBQI);
-  ASSERT_TRUE(FCIQI);
+  ASSERT_TRUE(FCPI);
+  ASSERT_TRUE(MMPI);
+  ASSERT_TRUE(BAPI);
+  ASSERT_TRUE(FCWPI);
+  ASSERT_TRUE(FCBPI);
+  ASSERT_TRUE(FCIPI);
+
+  // Compute quantization parameters for verification.
+  auto FCTQP = chooseQuantizationParams(
+      FCPI->tensorProfilingParams_, quantConfig.schema, quantConfig.precision);
+  auto MMTQP = chooseQuantizationParams(
+      MMPI->tensorProfilingParams_, quantConfig.schema, quantConfig.precision);
+  auto BATQP = chooseQuantizationParams(
+      BAPI->tensorProfilingParams_, quantConfig.schema, quantConfig.precision);
+  auto FCWTQP = chooseQuantizationParams(
+      FCWPI->tensorProfilingParams_, quantConfig.schema, quantConfig.precision);
+  auto FCBTQP =
+      chooseQuantizationParams(FCBPI->tensorProfilingParams_,
+                               quantConfig.schema, quantConfig.precisionBias);
+  auto FCITQP = chooseQuantizationParams(
+      FCIPI->tensorProfilingParams_, quantConfig.schema, quantConfig.precision);
 
   // Now create the same original function in the backend we're testing.
   ExecutionEngine backendEE;
   BackendClass backend;
-  backendEE.setBackend(&backend, /* ownsBackend */ false);
+  Backend *backendPtr = &backend;
+  // backendEE.setBackend(&backend, /* ownsBackend */ false);
   Function *backendF = backendEE.getModule().createFunction("quantized");
   PlaceholderBindings backendbindings;
   createSimpleFCNet(backendbindings, backendEE, *backendF);
@@ -2045,7 +2436,7 @@ static void testProfileQuantizationOfFC(bool expectLoweredFC,
   // Lower the function given the backend's preferences for lowering.
   LoweredInfoMap loweredMapForQuant;
   CompilationContext cctx2(/* bindings */ nullptr, &loweredMapForQuant);
-  lower(backendF, cctx2, backendEE.getBackend());
+  lower(backendF, cctx2, backendPtr);
 
   // Check that the backend lowered the function as expected.
   auto *floatFC = findNodeKindOrReturnNull<FullyConnectedNode>(backendF);
@@ -2065,7 +2456,7 @@ static void testProfileQuantizationOfFC(bool expectLoweredFC,
   // the quantization infos gathered.
   quantConfig.enableRowwise = rowwiseQuantizeFC;
   quantConfig.assertAllNodesQuantized = true;
-  quantization::quantizeFunction(backendF, quantConfig, *backendEE.getBackend(),
+  quantization::quantizeFunction(backendF, quantConfig, *backendPtr,
                                  loweredMapForQuant);
 
   // Optimize the graph to remove dead code and optimize away unnecessary
@@ -2074,7 +2465,7 @@ static void testProfileQuantizationOfFC(bool expectLoweredFC,
   ::glow::optimize(backendF, CompilationMode::Infer);
 
   // Check that the graph is still structured as expected, and that the
-  // scales/offsets are set as found in QI.
+  // scales/offsets are set as found in TQP.
   auto *quantFC = findNodeKindOrReturnNull<FullyConnectedNode>(backendF);
   auto *quantMM = findNodeKindOrReturnNull<MatMulNode>(backendF);
   auto *quantBA = findNodeKindOrReturnNull<BatchedAddNode>(backendF);
@@ -2087,44 +2478,64 @@ static void testProfileQuantizationOfFC(bool expectLoweredFC,
     EXPECT_FALSE(quantFC);
 
     ASSERT_TRUE(quantRowwiseFC);
-    EXPECT_EQ(quantRowwiseFC->getResult().getType()->getScale(), FCQI->Scale());
-    EXPECT_EQ(quantRowwiseFC->getResult().getType()->getOffset(),
-              FCQI->Offset());
+    EXPECT_EQ(quantRowwiseFC->getResult().getType()->getScale(), FCTQP.scale);
+    EXPECT_EQ(quantRowwiseFC->getResult().getType()->getOffset(), FCTQP.offset);
 
     EXPECT_EQ(quantRowwiseFC->getBias().getElementType(), ElemKind::Int32QTy);
-    EXPECT_EQ(quantRowwiseFC->getBias().getType()->getScale(),
-              FCWQI->Scale() * FCIQI->Scale());
-    EXPECT_EQ(quantRowwiseFC->getBias().getType()->getOffset(), 0);
+    // Bias scale was changed with the product inputScale * weightsScale only
+    // if the product was larger.
+    if (FCWTQP.scale * FCITQP.scale > FCBTQP.scale) {
+      EXPECT_EQ(quantRowwiseFC->getBias().getType()->getScale(),
+                FCWTQP.scale * FCITQP.scale);
+      EXPECT_EQ(quantRowwiseFC->getBias().getType()->getOffset(), 0);
+    } else {
+      EXPECT_EQ(quantRowwiseFC->getBias().getType()->getScale(), FCBTQP.scale);
+      EXPECT_EQ(quantRowwiseFC->getBias().getType()->getOffset(), 0);
+    }
   } else if (expectLoweredFC) {
     ASSERT_FALSE(quantFC);
     ASSERT_FALSE(quantRowwiseFC);
 
     ASSERT_TRUE(quantMM);
-    EXPECT_EQ(quantMM->getResult().getType()->getScale(), MMQI->Scale());
-    EXPECT_EQ(quantMM->getResult().getType()->getOffset(), MMQI->Offset());
+    EXPECT_EQ(quantMM->getResult().getType()->getScale(), MMTQP.scale);
+    EXPECT_EQ(quantMM->getResult().getType()->getOffset(), MMTQP.offset);
 
     ASSERT_TRUE(quantBA);
-    EXPECT_EQ(quantBA->getResult().getType()->getScale(), BAQI->Scale());
-    EXPECT_EQ(quantBA->getResult().getType()->getOffset(), BAQI->Offset());
+    EXPECT_EQ(quantBA->getResult().getType()->getScale(), BATQP.scale);
+    EXPECT_EQ(quantBA->getResult().getType()->getOffset(), BATQP.offset);
 
     EXPECT_EQ(quantBA->getSlice().getElementType(), ElemKind::Int32QTy);
-    EXPECT_EQ(quantBA->getSlice().getType()->getScale(),
-              FCWQI->Scale() * FCIQI->Scale());
-    EXPECT_EQ(quantBA->getSlice().getType()->getOffset(), 0);
+    // Bias scale was changed with the product inputScale * weightsScale only
+    // if the product was larger.
+    if (FCWTQP.scale * FCITQP.scale > FCBTQP.scale) {
+      EXPECT_EQ(quantBA->getSlice().getType()->getScale(),
+                FCWTQP.scale * FCITQP.scale);
+      EXPECT_EQ(quantBA->getSlice().getType()->getOffset(), 0);
+    } else {
+      EXPECT_EQ(quantBA->getSlice().getType()->getScale(), FCBTQP.scale);
+      EXPECT_EQ(quantBA->getSlice().getType()->getOffset(), 0);
+    }
   } else {
     ASSERT_FALSE(quantRowwiseFC);
 
     ASSERT_TRUE(quantFC);
-    EXPECT_EQ(quantFC->getResult().getType()->getScale(), FCQI->Scale());
-    EXPECT_EQ(quantFC->getResult().getType()->getOffset(), FCQI->Offset());
+    EXPECT_EQ(quantFC->getResult().getType()->getScale(), FCTQP.scale);
+    EXPECT_EQ(quantFC->getResult().getType()->getOffset(), FCTQP.offset);
 
     ASSERT_FALSE(quantMM);
     ASSERT_FALSE(quantBA);
 
     EXPECT_EQ(quantFC->getBias().getElementType(), ElemKind::Int32QTy);
-    EXPECT_EQ(quantFC->getBias().getType()->getScale(),
-              FCWQI->Scale() * FCIQI->Scale());
-    EXPECT_EQ(quantFC->getBias().getType()->getOffset(), 0);
+    // Bias scale was changed with the product inputScale * weightsScale only
+    // if the product was larger.
+    if (FCWTQP.scale * FCITQP.scale > FCBTQP.scale) {
+      EXPECT_EQ(quantFC->getBias().getType()->getScale(),
+                FCWTQP.scale * FCITQP.scale);
+      EXPECT_EQ(quantFC->getBias().getType()->getOffset(), 0);
+    } else {
+      EXPECT_EQ(quantFC->getBias().getType()->getScale(), FCBTQP.scale);
+      EXPECT_EQ(quantFC->getBias().getType()->getOffset(), 0);
+    }
   }
 }
 
@@ -2158,7 +2569,8 @@ TEST(Quantization, TestProfileQuantizationOfLoweredFCRowwise) {
 
 /// Check that asserting quantization for the quantizer works as expected.
 TEST(Quantization, CheckAssertQuantization) {
-  ExecutionEngine EE{BackendKind::Interpreter};
+  ExecutionEngine EE{};
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
   auto *input = mod.createPlaceholder(ElemKind::FloatTy, {1, 3}, "input", true);
@@ -2168,10 +2580,8 @@ TEST(Quantization, CheckAssertQuantization) {
   bindings.allocate(save->getPlaceholder());
 
   quantization::QuantizationConfiguration quantConfig{
-      {{NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-        {0.2f, 0}},
-       {NodeQuantizationInfo::generateNodeOutputName(relu->getName()),
-        {0.2f, -128}}}};
+      {{input->getOutput().generateNodeOutputName(), {0.2f, 2.0f}},
+       {relu->getResult().generateNodeOutputName(), {0.2f, 3.0f}}}};
   quantConfig.precision = ElemKind::Int16QTy;
   quantConfig.assertAllNodesQuantized = true;
 
@@ -2179,8 +2589,7 @@ TEST(Quantization, CheckAssertQuantization) {
   // assertAllNodesQuantized true, and the Interpreter backend does not support
   // Int16QTy ReLU.
   Function *QF = F->clone("quant_clone1");
-  EXPECT_DEATH(
-      quantization::quantizeFunction(QF, quantConfig, *EE.getBackend()), "");
+  EXPECT_DEATH(quantization::quantizeFunction(QF, quantConfig, *backend), "");
 
   {
     Function *QF = F->clone("quant_clone2");
@@ -2189,9 +2598,10 @@ TEST(Quantization, CheckAssertQuantization) {
     // This works fine because quantizeFunction() is passed with
     // assertAllNodesQuantized false, and so the ReLU will not be quantized as
     // the Interpreter does not support Int16QTy ReLU.
-    quantization::quantizeFunction(QF, quantConfig, *EE.getBackend());
+    quantization::quantizeFunction(QF, quantConfig, *backend);
 
-    auto *saveNode = llvm::dyn_cast<SaveNode>(QF->getNodeByName("ret"));
+    auto *saveNode =
+        llvm::dyn_cast<SaveNode>(QF->getNodeByName(save->getName()));
     ASSERT_TRUE(saveNode);
     auto *reluNode = llvm::dyn_cast<ReluNode>(saveNode->getInput().getNode());
     ASSERT_TRUE(reluNode);
@@ -2207,10 +2617,11 @@ TEST(Quantization, CheckAssertQuantization) {
     // This works fine because quantizeFunction() is passed with
     // assertAllNodesQuantized true, but we explicitly tell the quantizer to
     // keep ReLU in its original precision.
-    quantization::quantizeFunction(QF, quantConfig, *EE.getBackend(),
+    quantization::quantizeFunction(QF, quantConfig, *backend,
                                    /* loweredMap */ {}, doNotQuantizeKinds);
 
-    auto *saveNode = llvm::dyn_cast<SaveNode>(QF->getNodeByName("ret"));
+    auto *saveNode =
+        llvm::dyn_cast<SaveNode>(QF->getNodeByName(save->getName()));
     ASSERT_TRUE(saveNode);
     auto *reluNode = llvm::dyn_cast<ReluNode>(saveNode->getInput().getNode());
     ASSERT_TRUE(reluNode);
@@ -2221,7 +2632,7 @@ TEST(Quantization, CheckAssertQuantization) {
 /// Check that we can quantize nodes that have some quantized outputs as unused,
 /// e.g. a TopK node where values is unused but indices is.
 TEST(Quantization, QuantizationZeroUsersResult) {
-  ExecutionEngine EE{BackendKind::Interpreter};
+  ExecutionEngine EE{};
   auto &mod = EE.getModule();
   PlaceholderBindings bindings;
   Function *F = mod.createFunction("main");
@@ -2238,57 +2649,53 @@ TEST(Quantization, QuantizationZeroUsersResult) {
   bindings.allocate(SN->getPlaceholder());
 
   quantization::QuantizationConfiguration quantConfig{
-      {{NodeQuantizationInfo::generateNodeOutputName(input->getName()),
-        {0.2f, 0}},
-       {NodeQuantizationInfo::generateNodeOutputName(TK->getName(),
-                                                     TopKNode::ValuesIdx),
-        {0.2f, 0}}}};
+      {{input->getOutput().generateNodeOutputName(), {0.2f, 2.0f}},
+       {TK->getValues().generateNodeOutputName(), {0.2f, 3.0f}}}};
   quantConfig.assertAllNodesQuantized = true;
 
-  quantization::quantizeFunction(F, quantConfig, *EE.getBackend());
+  std::unique_ptr<Backend> backend(createBackend(EE.getBackendName()));
+  quantization::quantizeFunction(F, quantConfig, *backend);
 
-  auto *qSN = llvm::dyn_cast<SaveNode>(F->getNodeByName("save_indices"));
+  auto *qSN = llvm::dyn_cast<SaveNode>(F->getNodeByName(SN->getName()));
   ASSERT_TRUE(qSN);
   auto *qTK = llvm::dyn_cast<TopKNode>(qSN->getInput().getNode());
   ASSERT_TRUE(qTK);
   EXPECT_TRUE(qTK->getValues().getType()->isQuantizedType());
 }
 
-INSTANTIATE_TEST_CASE_P(Interpreter, Quantization,
-                        ::testing::Values(BackendKind::Interpreter));
+GLOW_INSTANTIATE_TEST_SUITE_P(Interpreter, Quantization,
+                              ::testing::Values("Interpreter"));
 
 #ifdef GLOW_WITH_CPU
-INSTANTIATE_TEST_CASE_P(CPU, Quantization, ::testing::Values(BackendKind::CPU));
+GLOW_INSTANTIATE_TEST_SUITE_P(CPU, Quantization, ::testing::Values("CPU"));
 
-INSTANTIATE_TEST_CASE_P(
+GLOW_INSTANTIATE_TEST_SUITE_P(
     InterpAndCPUProfAndQuant, Operator,
-    ::testing::Combine(
-        ::testing::Values(BackendKind::Interpreter, BackendKind::CPU),
-        ::testing::Values(BackendKind::Interpreter, BackendKind::CPU)));
+    ::testing::Combine(::testing::Values("Interpreter", "CPU"),
+                       ::testing::Values("Interpreter", "CPU")));
 
-INSTANTIATE_TEST_CASE_P(
+GLOW_INSTANTIATE_TEST_SUITE_P(
     InterpAndCPUProfAndQuant, InterpAndCPU,
-    ::testing::Combine(
-        ::testing::Values(BackendKind::Interpreter, BackendKind::CPU),
-        ::testing::Values(BackendKind::Interpreter, BackendKind::CPU)));
+    ::testing::Combine(::testing::Values("Interpreter", "CPU"),
+                       ::testing::Values("Interpreter", "CPU")));
 
 #else
-INSTANTIATE_TEST_CASE_P(
+GLOW_INSTANTIATE_TEST_SUITE_P(
     InterpreterProfAndQuant, Operator,
-    ::testing::Combine(::testing::Values(BackendKind::Interpreter),
-                       ::testing::Values(BackendKind::Interpreter)));
+    ::testing::Combine(::testing::Values("Interpreter"),
+                       ::testing::Values("Interpreter")));
 
-INSTANTIATE_TEST_CASE_P(
+GLOW_INSTANTIATE_TEST_SUITE_P(
     Interpreter, InterpAndCPU,
-    ::testing::Combine(::testing::Values(BackendKind::Interpreter),
-                       ::testing::Values(BackendKind::Interpreter)));
+    ::testing::Combine(::testing::Values("Interpreter"),
+                       ::testing::Values("Interpreter")));
 #endif // GLOW_WITH_CPU
 
 #ifdef GLOW_WITH_OPENCL
-INSTANTIATE_TEST_CASE_P(
+GLOW_INSTANTIATE_TEST_SUITE_P(
     InterpProfOpenCLQuant, Operator,
-    ::testing::Combine(::testing::Values(BackendKind::Interpreter),
-                       ::testing::Values(BackendKind::OpenCL)));
+    ::testing::Combine(::testing::Values("Interpreter"),
+                       ::testing::Values("OpenCL")));
 #endif // GLOW_WITH_OPENCL
 
 } // namespace glow

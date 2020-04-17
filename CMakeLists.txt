@@ -8,11 +8,16 @@ enable_testing()
 option(GLOW_WITH_CPU "Build the LLVM-based JIT CPU backend" ON)
 option(GLOW_WITH_LLVMIRCODEGEN "Build the LLVM-based code generation library" ON)
 option(GLOW_WITH_OPENCL "Build the OpenCL backend" OFF)
+option(GLOW_WITH_NNPI "Build the NNPI backend" OFF)
 option(GLOW_WITH_HABANA "Build the Habana backend" OFF)
+option(GLOW_USE_PNG_IF_REQUIRED "Link with libpng if required" ON)
 option(GLOW_BUILD_EXAMPLES "Build the examples" ON)
+option(GLOW_BUILD_PYTORCH_INTEGRATION "Build integration for PyTorch" OFF)
 option(GLOW_BUILD_TESTS "Build the tests" ON)
+option(GLOW_BUILD_ONNXIFI_DYNLIB "Build dynamic library for Onnxifi" OFF)
 option(GLOW_WITH_BUNDLES "Build bundles" OFF)
 option(LINK_PROTOBUF_AS_DLL "Link against protobuf build as dynamic libray." OFF)
+option(TENSOR_DIMS_32_BITS "Set the max bitwidth of the tensor dimension and related indices to 32b instead of 64b." OFF)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CXX_STANDARD_REQUIRED ON)
@@ -52,6 +57,11 @@ include(GlowExternalBackends)
 include(SanitizerSupport)
 include(CoverageSupport)
 include(DoxygenSupport)
+include(FindBackends)
+if(GLOW_BUILD_ONNXIFI_DYNLIB)
+  include(Gflags)
+endif()
+
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules/CMakeGraphVizOptions.cmake
                ${CMAKE_CURRENT_BINARY_DIR}/CMakeGraphVizOptions.cmake COPYONLY)
 
@@ -75,9 +85,27 @@ include_directories(${GLOW_SOURCE_DIR})
 file(GLOB_RECURSE header_files include/*.h tools/*.h lib/*.h)
 add_custom_target(CollectHeaders SOURCES ${header_files})
 
-find_package(PNG)
-if(PNG_FOUND)
-  add_definitions(-DWITH_PNG)
+find_package(Git)
+# Get the commit's short SHA1
+execute_process(COMMAND
+  "${GIT_EXECUTABLE}" log -1 --pretty=format:%h
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  OUTPUT_VARIABLE GIT_SHA1
+  ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+add_definitions("-DGIT_SHA1=\"${GIT_SHA1}\"")
+# Get the date of the commit
+execute_process(COMMAND
+  "${GIT_EXECUTABLE}" log -1 --pretty=format:%ad --date=short
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  OUTPUT_VARIABLE GIT_DATE
+  ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+add_definitions("-DGIT_DATE=\"${GIT_DATE}\"")
+
+if(GLOW_USE_PNG_IF_REQUIRED)
+  find_package(PNG)
+  if(PNG_FOUND)
+    add_definitions(-DWITH_PNG)
+  endif()
 endif()
 
 if(GLOW_WITH_LLVMIRCODEGEN)
@@ -96,6 +124,10 @@ if (GLOW_WITH_OPENCL)
   find_package(OpenCL REQUIRED)
 endif ()
 
+if(GLOW_WITH_NNPI)
+  add_definitions(-DGLOW_WITH_NNPI=1)
+endif()
+
 if (GLOW_WITH_HABANA)
   add_definitions(-DGLOW_WITH_HABANA=1)
 
@@ -113,6 +145,14 @@ if (GLOW_WITH_HABANA)
     "${SYNAPSE_LIB}"
     "${TPCSIM_SHARED_LIB}"
     "${HL_THUNK_LIB}")
+endif ()
+
+if (TENSOR_DIMS_32_BITS)
+  add_definitions(-DDIM_T_32)
+  set(LLVMCPURuntimeExtraFlags "-DDIM_T_32")
+  message(STATUS "Using 32b tensor dimensions.")
+else()
+  message(STATUS "Using 64b tensor dimensions.")
 endif ()
 
 # Top level setup for external backends
@@ -152,12 +192,61 @@ if(NOT EXISTS "${GLOW_THIRDPARTY_DIR}/fp16")
 else()
   include_directories(${GLOW_THIRDPARTY_DIR}/fp16/include)
 endif()
+if (MSVC)
+    find_package(folly CONFIG REQUIRED)
+    find_library(JEMALLOC_LIB jemalloc)
+    add_library(folly_jemalloc INTERFACE)
+    target_link_libraries(folly_jemalloc INTERFACE Folly::folly Folly::folly_deps Folly::follybenchmark Folly::folly_test_util ${JEMALLOC_LIB})
+elseif(NOT EXISTS "${GLOW_THIRDPARTY_DIR}/folly/folly")
+  message(FATAL_ERROR "No folly git submodule. Run: git submodule update --init --recursive")
+else()
+  # Apple-specific definitions for folly.
+  if(APPLE)
+    set(FOLLY_HAVE_WEAK_SYMBOLS ON CACHE BOOL "Compiler supports weak symbols")
+    set(OPENSSL_ROOT_DIR /usr/local/opt/openssl)
+    find_package(OpenSSL REQUIRED)
+  endif()
+
+  # Remove Glow-specific CMAKE_CXX_FLAGS to build folly.
+  set(SAVE_CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  if (CONFIG_HAVE_KERNEL_TIMESPEC)
+    set(CMAKE_CXX_FLAGS "-DCONFIG_HAVE_KERNEL_TIMESPEC")
+  else()
+    set(CMAKE_CXX_FLAGS "")
+  endif()
+  set(SAVE_CMAKE_CXX_STANDARD "${CMAKE_CXX_STANDARD}")
+  unset(CMAKE_CXX_STANDARD)
+  set(CXX_STD "c++14" CACHE STRING "Force c++14 for folly")
+  set(COMPILER_HAS_F_ALIGNED_NEW OFF CACHE BOOL "turn off -faligned_new for folly")
+  add_subdirectory("${GLOW_THIRDPARTY_DIR}/folly" EXCLUDE_FROM_ALL)
+  target_include_directories(folly PUBLIC "${OPENSSL_INCLUDE_DIR}")
+  set(CMAKE_CXX_FLAGS "${SAVE_CMAKE_CXX_FLAGS}")
+  set(CMAKE_CXX_STANDARD "${SAVE_CMAKE_CXX_STANDARD}")
+  find_library(JEMALLOC_LIB jemalloc)
+  add_library(folly_jemalloc INTERFACE)
+  target_link_libraries(folly_jemalloc INTERFACE folly ${JEMALLOC_LIB})
+endif()
+
+add_library(Miniz
+  ${GLOW_THIRDPARTY_DIR}/miniz-2.0.8/miniz.c)
+target_include_directories(Miniz PUBLIC ${GLOW_THIRDPARTY_DIR}/miniz-2.0.8)
 
 add_subdirectory(lib)
 add_subdirectory(tools)
 
 if (GLOW_BUILD_EXAMPLES)
   add_subdirectory(examples)
+endif()
+
+if (GLOW_BUILD_PYTORCH_INTEGRATION)
+  if(NOT EXISTS "${GLOW_THIRDPARTY_DIR}/pybind11")
+    message(FATAL_ERROR "No pybind11 git submodule. Run: git submodule update --init --recursive")
+  else()
+    add_subdirectory(${GLOW_THIRDPARTY_DIR}/pybind11)
+  endif()
+
+  add_subdirectory(torch_glow/src)
+  add_subdirectory(torch_glow/tests/unittests)
 endif()
 
 if (GLOW_WITH_BUNDLES AND NOT GLOW_WITH_CPU)
@@ -173,12 +262,16 @@ if (GLOW_BUILD_TESTS)
   # Fetch the dependencies for all the tests.
   get_property(GLOW_TEST_DEPENDS GLOBAL PROPERTY GLOW_TEST_DEPENDS)
 
-  # All tests except expensive tests
-  add_custom_target(check COMMAND ${CMAKE_CTEST_COMMAND} -LE EXPENSIVE
+  # All tests except expensive tests and stress tests.
+  add_custom_target(check COMMAND ${CMAKE_CTEST_COMMAND} -LE EXPENSIVE\\|STRESS
                       DEPENDS ${GLOW_TEST_DEPENDS} USES_TERMINAL)
 
-  # All tests including expensive tests
-  add_custom_target(check_expensive COMMAND ${CMAKE_CTEST_COMMAND}
+  # All tests including expensive tests but not stress tests.
+  add_custom_target(check_expensive COMMAND ${CMAKE_CTEST_COMMAND} -LE STRESS
+                      DEPENDS ${GLOW_TEST_DEPENDS} USES_TERMINAL)
+
+  # All tests including expensive and stress tests.
+  add_custom_target(check_expensive_stress COMMAND ${CMAKE_CTEST_COMMAND}
                       DEPENDS ${GLOW_TEST_DEPENDS} USES_TERMINAL)
 endif()
 

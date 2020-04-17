@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -118,18 +118,17 @@ TEST(IR, basicUseList) {
   // ...
 }
 
-TEST(IR, allInstrs) {
+static IRFunction *createTestIRFunction(Module &mod) {
   using MK = WeightVar::MutabilityKind;
 
-  Module mod;
   Function *F = mod.createFunction("main");
-  IRFunction M(F);
+  IRFunction *M = new IRFunction(F);
   auto T1 = mod.uniqueType(ElemKind::FloatTy, {1, 24, 24, 3});
   auto T2 = mod.uniqueType(ElemKind::FloatTy, {64});
   auto T4 = mod.uniqueType(ElemKind::Int64ITy, {1, 1});
 
   {
-    IRBuilder builder(&M);
+    IRBuilder builder(M);
 
     auto *I0 = builder.createWeightVar(T1, "I0");
     auto *I1 = builder.createWeightVar(T1, "I1");
@@ -143,7 +142,7 @@ TEST(IR, allInstrs) {
     auto *ComputationInfo =
         builder.createWeightVar(ElemKind::FloatTy, {2}, "ComputationInfo");
 
-    auto *XY = builder.createWeightVar(ElemKind::Int64ITy, {1, 12, 12, 3, 2});
+    auto *argmax = builder.createWeightVar(ElemKind::Int64ITy, {1, 12, 12, 3});
     auto *B0 = builder.createWeightVar(T2, "B0");
     auto *B1 =
         builder.createWeightVar(ElemKind::FloatTy, {32}, "B1", MK::Mutable);
@@ -156,12 +155,13 @@ TEST(IR, allInstrs) {
     F0->setName("filter");
     F1->setName("FC_filter");
     E0->setName("expected");
-    XY->setName("srcXY");
+    argmax->setName("argmax");
 
     builder.createCopyInst("", I1, I0);
     builder.createConvolutionInst("", I3, I1, F0, B0, {7, 7}, {2, 2},
-                                  {3, 3, 3, 3}, 1, 1);
-    builder.createMaxPoolInst("", I4, I0, {7, 7}, {2, 2}, {3, 3, 3, 3});
+                                  {3, 3, 3, 3}, 1, 1, NHWC,
+                                  FusedActivation::NONE);
+    builder.createMaxPoolInst("", I4, I0, {7, 7}, {2, 2}, {3, 3, 3, 3}, NHWC);
     builder.createSigmoidInst("", I1, I0);
     builder.createTanhInst("", I1, I0);
     builder.createSoftMaxInst("", I1, I0);
@@ -172,7 +172,23 @@ TEST(IR, allInstrs) {
     builder.createDebugPrintInst("", I0);
     builder.createQuantizationProfileInst("", I0, B0, ComputationInfo);
   }
-  M.verify();
+  return M;
+}
+
+TEST(IR, allInstrs) {
+  Module mod;
+  std::unique_ptr<IRFunction> M(createTestIRFunction(mod));
+  M->verify();
+}
+
+/// Check the IR Functions cloning functionality.
+TEST(IR, cloning) {
+  Module mod;
+  std::unique_ptr<IRFunction> M(createTestIRFunction(mod));
+  std::unique_ptr<IRFunction> clonedM(M->clone(M->getName()));
+  auto dumpedM = M->toString();
+  auto dumpedClonedM = clonedM->toString();
+  EXPECT_EQ(dumpedM, dumpedClonedM);
 }
 
 TEST(IR, casting) {
@@ -186,7 +202,7 @@ TEST(IR, casting) {
     auto *res = bb.createAllocActivationInst("sigmoid.res", input->getType());
     auto *sig = bb.createSigmoidInst("sigmoid", res, input);
     auto *pool =
-        bb.createAvgPoolOp(sig->getDest(), {7, 7}, {2, 2}, {3, 3, 3, 3});
+        bb.createAvgPoolOp(sig->getDest(), {7, 7}, {2, 2}, {3, 3, 3, 3}, NHWC);
 
     EXPECT_EQ(isa<AvgPoolInst>(pool), true);
     EXPECT_EQ(isa<AvgPoolInst>(input), false);
@@ -292,16 +308,16 @@ TEST(IR, InstUniqueNames) {
     it = nameSet.insert(V2->getName());
     EXPECT_TRUE(it.second);
 
-    MaxPoolWithXYInst *MP1 =
-        builder.createMaxPoolWithXYOp(name, V1, {2, 2}, {1, 1}, {0, 2, 1, 3});
+    MaxPoolWithArgmaxInst *MP1 = builder.createMaxPoolWithArgmaxOp(
+        name, V1, {2, 2}, {1, 1}, {0, 2, 1, 3}, NHWC, ElemKind::Int64ITy);
     it = nameSet.insert(MP1->getName());
     EXPECT_TRUE(it.second);
 
-    // IRBuilder::createMaxPoolWithXYOp() creates alloc activation insts
+    // IRBuilder::createMaxPoolWithArgmaxOp() creates alloc activation insts
     // internally, so we dealloc them here to keep the instruction list
     // well-formed.
     DeallocActivationInst *DAI1 =
-        builder.createDeallocActivationInst(name, MP1->getSrcXY());
+        builder.createDeallocActivationInst(name, MP1->getArgmax());
     it = nameSet.insert(DAI1->getName());
     EXPECT_TRUE(it.second);
 
@@ -312,7 +328,7 @@ TEST(IR, InstUniqueNames) {
 
     // IRBuilder::createTopKOp() creates alloc activation insts internally, so
     // we dealloc them here to keep the instruction list well-formed.
-    TopKInst *TK = builder.createTopKOp(name, V2, 2);
+    TopKInst *TK = builder.createTopKOp(name, V2, 2, ElemKind::Int64ITy);
     it = nameSet.insert(TK->getName());
     EXPECT_TRUE(it.second);
 
@@ -332,5 +348,24 @@ TEST(IR, InstUniqueNames) {
     EXPECT_TRUE(it.second);
 
     M.verify();
+  }
+}
+
+TEST(IR, getOperandName) {
+  Module mod;
+  Function *F = mod.createFunction("main");
+  IRFunction M(F);
+  {
+    IRBuilder bb(&M);
+
+    auto *input = bb.createWeightVar(ElemKind::FloatTy, {1, 224, 224, 3});
+    auto *res = bb.createAllocActivationInst("sigmoid.res", input->getType());
+    auto *sig = bb.createSigmoidInst("sigmoid", res, input);
+    auto *pool =
+        bb.createAvgPoolOp(sig->getDest(), {7, 7}, {2, 2}, {3, 3, 3, 3}, NHWC);
+
+    EXPECT_EQ(pool->getNumOperands(), 2);
+    EXPECT_EQ(pool->getOperandName(0), "Dest");
+    EXPECT_EQ(pool->getOperandName(1), "Src");
   }
 }

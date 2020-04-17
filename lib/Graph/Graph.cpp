@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 #include "glow/Graph/Graph.h"
+#include "glow/Backend/Backend.h"
 #include "glow/Graph/Nodes.h"
 #include "glow/Graph/PlaceholderBindings.h"
+#include "glow/Graph/TensorLayout.h"
 #include "glow/Graph/VerifierHelper.h"
 #include "glow/Quantization/Base/Base.h"
 #include "glow/Support/Support.h"
@@ -28,6 +30,9 @@
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 
+#ifdef WIN32
+#include <corecrt_math_defines.h>
+#endif
 #include <fstream>
 #include <unordered_set>
 
@@ -35,6 +40,111 @@ using namespace glow;
 using llvm::cast;
 using llvm::dyn_cast;
 using llvm::isa;
+
+namespace {
+/// A helper function to log the deletion of constant/placeholder \p s of a
+/// module into the log context of given functions \p functions.
+/// Note: The reason we don't log the deletion of constants in the function that
+/// ueses or creates it, is that constants/placeholders do not have a function
+/// parent (we can't utilize its user's function also because its users might be
+/// removed) such that it's best to log the constants/placeholders in a Module
+/// level log context and copy over to its all functions.
+void logStorageDeletion(std::list<Function *> functions, Storage *s) {
+  for (auto *F : functions) {
+    F->getLogContext()->logNodeDeletion(*s);
+  }
+  if (functions.size() > 0) {
+    auto *F = *(functions.begin());
+    F->getLogContext()->logNodeDeletion(*s, /* logIntoModule */ true);
+  }
+}
+
+/// A helper function to log the creation of constant/placeholder \p s of a
+/// module into the log context of given functions \p functions.
+/// Same note as for logStorageDeletion().
+void logStorageCreation(std::list<Function *> functions, Storage *s) {
+  for (auto *F : functions) {
+    F->getLogContext()->logNodeCreation(*s);
+  }
+  if (functions.size() > 0) {
+    auto *F = *(functions.begin());
+    F->getLogContext()->logNodeCreation(*s, /* logIntoModule */ true);
+  }
+}
+} // namespace
+
+/// Merge shape \p shape into \p mergeShape, following multidirectional
+/// broadcasting rules.
+static void mergeMultidirectionalBroadcastHelper(std::vector<dim_t> &mergeShape,
+                                                 llvm::ArrayRef<dim_t> shape) {
+  size_t shift = mergeShape.size() - shape.size();
+  for (size_t i = 0, e = shape.size(); i < e; i++) {
+    if (shape[i] == 1) {
+      // Just leave mergeShape[i] as it is.
+      continue;
+    }
+
+    assert(
+        ((shape[i] == mergeShape[shift + i]) || (mergeShape[shift + i] == 1)) &&
+        "Incompatible dimension for the broadcast");
+    mergeShape[shift + i] = shape[i];
+  }
+}
+
+/// Utility function which computes the resulting shape in case of
+/// multidirectional broadcasting.
+static std::vector<dim_t>
+computeMultidirectionalBroadcastHelper(llvm::ArrayRef<dim_t> shape0,
+                                       llvm::ArrayRef<dim_t> shape1) {
+  size_t numDims0 = shape0.size();
+  size_t numDims1 = shape1.size();
+  size_t newNumDims = std::max(numDims0, numDims1);
+  std::vector<dim_t> reshapeDims(newNumDims, 1);
+
+  mergeMultidirectionalBroadcastHelper(reshapeDims, shape0);
+  mergeMultidirectionalBroadcastHelper(reshapeDims, shape1);
+
+  return reshapeDims;
+}
+
+std::vector<NodeValue>
+Function::broadcastInputs(int axis, const llvm::ArrayRef<NodeValue> inputs) {
+  dim_t numInputs = inputs.size();
+
+  if (axis > -1) {
+    assert(
+        numInputs == 2 &&
+        "If axis is specified, not -1, unidirectional broadcast will be used, "
+        "input size must be 2.");
+    return {inputs[0],
+            createBroadcast("broadcast_" + inputs[1].getNode()->getName().str(),
+                            inputs[1], inputs[0].dims(), axis)};
+  }
+
+  assert(numInputs >= 2 && "Invalid input passed in to commonCreateBroadcast.");
+
+  std::vector<dim_t> targetDim = computeMultidirectionalBroadcastHelper(
+      inputs[0].dims(), inputs[1].dims());
+
+  for (size_t i = 2; i < numInputs; ++i) {
+    targetDim =
+        computeMultidirectionalBroadcastHelper(targetDim, inputs[i].dims());
+  }
+
+  std::vector<NodeValue> out(numInputs);
+  for (size_t i = 0; i < numInputs; ++i) {
+    NodeValue n = inputs[i];
+    auto dims = n.dims();
+    if (dims != llvm::ArrayRef<dim_t>(targetDim)) {
+      unsigned axis = targetDim.size() - dims.size();
+      out[i] = createBroadcast("broadcast_" + n.getNode()->getName().str(), n,
+                               targetDim, axis);
+    } else {
+      out[i] = inputs[i];
+    }
+  }
+  return out;
+}
 
 bool Module::hasFunction(llvm::StringRef name) { return getFunction(name); }
 
@@ -62,10 +172,9 @@ void Module::strip() {
 }
 
 void Module::clear() {
-  eraseFunctions();
-
   for (auto it = constants_.begin(), e = constants_.end(); it != e; it++) {
     Constant *v = *it;
+    logStorageDeletion(functions_, v);
     delete v;
   }
 
@@ -74,8 +183,11 @@ void Module::clear() {
   for (auto it = placeholders_.begin(), e = placeholders_.end(); it != e;
        it++) {
     Placeholder *p = *it;
+    logStorageDeletion(functions_, p);
     delete p;
   }
+
+  eraseFunctions();
 
   placeholders_.clear();
 }
@@ -85,6 +197,25 @@ bool Module::verify() const {
   bool isValid = true;
   for (auto *F : functions_) {
     isValid &= F->verify();
+  }
+  // Check that all types used by constants or placeholders belong to the
+  // module.
+  auto &types = getTypes();
+  for (const auto *PH : getPlaceholders()) {
+    bool foundType =
+        std::find(types.begin(), types.end(), *PH->getType()) != types.end();
+    isValid &=
+        expectCompareTrue("Every type used by placeholders should be part of "
+                          "the graph",
+                          foundType, true, PH);
+  }
+  for (const auto *C : getConstants()) {
+    bool foundType =
+        std::find(types.begin(), types.end(), *C->getType()) != types.end();
+    isValid &=
+        expectCompareTrue("Every type used by constants should be part of "
+                          "the graph",
+                          foundType, true, C);
   }
   return isValid;
 }
@@ -107,14 +238,23 @@ std::string Module::toString() const {
   return os.str();
 }
 
+/// Creates a std::set copy of \p unsorted, sorted based on name of each
+/// element, and \returns it.
+template <class T>
+static std::set<T *, SortNamed> getNamedSorted(const std::list<T *> &unsorted) {
+  return std::set<T *, SortNamed>(unsorted.begin(), unsorted.end());
+}
+
 void Module::dump(llvm::raw_ostream &os) const {
   os << "Module structure:\n";
-  for (auto v : getConstants()) {
-    os << v->getDebugDesc() << "\n";
+  for (auto *C : getNamedSorted(constants_)) {
+    os << C->getDebugDesc() << "\n";
   }
-
-  for (auto f : functions_) {
-    os << "Function:" << f->getName() << "\n";
+  for (auto *P : getNamedSorted(placeholders_)) {
+    os << P->getDebugDesc() << "\n";
+  }
+  for (auto *F : getNamedSorted(functions_)) {
+    os << "Function : " << F->getName() << "\n";
   }
 }
 
@@ -164,14 +304,19 @@ protected:
     os << "}";
   }
 
-  void dumpNode(Node *N) {
+  void dumpNode(Node *N, bool uniqueNames) {
     if (!N) {
       return;
     }
     std::ostringstream os;
     // Print a node descriptor that looks like this:
-    // vNNNN [ shape = "record" label = "{...}" ];
-    os << uniqueVertexName(N) << "[\n";
+    if (uniqueNames) {
+      // vNNNN [ shape = "record" label = "{...}" ];
+      os << uniqueVertexName(N) << "[\n";
+    } else {
+      // <name> [ shape = "record" label = "{...}" ];
+      os << N->getName().str() << "[\n";
+    }
     os << "\tlabel = \"";
     dumpLabel(N, os);
     os << "\"\n";
@@ -214,6 +359,8 @@ protected:
 
 public:
   void dumpAll(std::ostream &os) {
+    CHECK(os) << "Failed to create file for to dump Graph";
+
     os << "digraph DAG {\n\trankdir=TB;\n";
 
     // Dump vertices:
@@ -267,7 +414,7 @@ class ModuleDottyPrinter : public AbstractDottyPrinter {
 public:
   void visitModule(Module *M) {
     for (auto N : M->getConstants()) {
-      dumpNode(N);
+      dumpNode(N, true);
     }
 
     for (auto F : M->getFunctions()) {
@@ -327,20 +474,28 @@ Function::~Function() {
     auto cur = it++;
     eraseNode(&*cur);
   }
-  logCtx_.dumpLog(getName());
 }
 
-TypeRef Module::uniqueType(ElemKind elemTy, llvm::ArrayRef<size_t> dims) {
+TypeRef Module::uniqueType(ElemKind elemTy, llvm::ArrayRef<dim_t> dims) {
   return uniqueType(Type(elemTy, dims));
 }
 
-TypeRef Module::uniqueType(ElemKind elemTy, llvm::ArrayRef<size_t> dims,
+TypeRef Module::uniqueType(ElemKind elemTy, llvm::ArrayRef<dim_t> dims,
                            float scale, int32_t offset) {
   return uniqueType(Type(elemTy, dims, scale, offset));
 }
 
-TypeRef Module::uniqueTypeWithNewShape(TypeRef T, llvm::ArrayRef<size_t> dims) {
+TypeRef Module::uniqueTypeWithNewShape(TypeRef T, llvm::ArrayRef<dim_t> dims) {
   return uniqueType(Type::newShape(*T, dims));
+}
+
+TypeRef Module::uniqueTypeWithNewShape(TypeRef T, llvm::ArrayRef<dim_t> dims,
+                                       llvm::ArrayRef<dim_t> alignments) {
+  return uniqueType(Type::newShape(*T, dims, alignments));
+}
+
+TypeRef Module::uniqueTypeWithNewShape(TypeRef T, TypeRef shapeType) {
+  return uniqueType(Type::newShape(*T, shapeType));
 }
 
 TypeRef Module::uniqueType(const Type &T) {
@@ -357,7 +512,7 @@ TypeRef Module::getVoidTy() { return uniqueType(Type()); }
 
 /// \returns a ShapeVector of rank axes.size() less than the input \p dims,
 /// where the provided \p axes dimensions are removed from the shape.
-static ShapeVector getNewShapeWithoutAxes(llvm::ArrayRef<size_t> dims,
+static ShapeVector getNewShapeWithoutAxes(llvm::ArrayRef<dim_t> dims,
                                           llvm::ArrayRef<unsigned_t> axes) {
   assert(axes.size() <= dims.size() &&
          "Cannot remove more dimensions than exist.");
@@ -380,88 +535,111 @@ static ShapeVector getNewShapeWithoutAxes(llvm::ArrayRef<size_t> dims,
 //===----------------------------------------------------------------------===//
 
 Placeholder *Module::createPlaceholder(TypeRef T, llvm::StringRef name,
-                                       bool isTrainable) {
+                                       bool isTrainable,
+                                       const std::string &layout) {
   auto FT = uniqueType(*T);
-  return addPlaceholder(new Placeholder(name, FT, isTrainable));
+  auto *ph = new Placeholder(name, FT, isTrainable, layout);
+  ph->setName(uniqueName(ph->getName(), usedNodeNames_, usedStorageNames_));
+  placeholders_.push_back(ph);
+  logStorageCreation(functions_, ph);
+  return ph;
 }
 
-Placeholder *Module::createPlaceholder(ElemKind T, llvm::ArrayRef<size_t> dims,
-                                       llvm::StringRef name, bool isTrainable) {
+Placeholder *Module::createPlaceholder(ElemKind T, llvm::ArrayRef<dim_t> dims,
+                                       llvm::StringRef name, bool isTrainable,
+                                       const std::string &layout) {
   auto FT = uniqueType(T, dims);
-  return createPlaceholder(FT, name, isTrainable);
+  return createPlaceholder(FT, name, isTrainable, layout);
 }
 
-Placeholder *Module::createPlaceholder(ElemKind T, llvm::ArrayRef<size_t> dims,
+Placeholder *Module::createPlaceholder(ElemKind T, llvm::ArrayRef<dim_t> dims,
                                        float scale, int32_t offset,
-                                       llvm::StringRef name, bool isTrainable) {
+                                       llvm::StringRef name, bool isTrainable,
+                                       const std::string &layout) {
   auto FT = uniqueType(T, dims, scale, offset);
-  return createPlaceholder(FT, name, isTrainable);
+  return createPlaceholder(FT, name, isTrainable, layout);
 }
 
-Constant *Module::createConstant(TypeRef T, llvm::StringRef name) {
+Constant *Module::createConstant(TypeRef T, llvm::StringRef name,
+                                 const std::string &layout) {
   auto FT = uniqueType(*T);
-  return addConstant(new Constant(name, FT));
+  return addConstant(new Constant(name, FT, layout));
 }
 
-Constant *Module::createConstant(ElemKind T, llvm::ArrayRef<size_t> dims,
-                                 llvm::StringRef name) {
+Constant *Module::createConstant(ElemKind T, llvm::ArrayRef<dim_t> dims,
+                                 llvm::StringRef name,
+                                 const std::string &layout) {
   auto FT = uniqueType(T, dims);
-  return createConstant(FT, name);
+  return createConstant(FT, name, layout);
 }
 
-Constant *Module::createConstant(ElemKind T, llvm::ArrayRef<size_t> dims,
+Constant *Module::createConstant(ElemKind T, llvm::ArrayRef<dim_t> dims,
                                  float scale, int32_t offset,
-                                 llvm::StringRef name) {
+                                 llvm::StringRef name,
+                                 const std::string &layout) {
   auto FT = uniqueType(T, dims, scale, offset);
-  return createConstant(FT, name);
+  return createConstant(FT, name, layout);
 }
 
-Constant *Module::createConstant(llvm::StringRef name, const Tensor &tensor) {
-  auto *V = createConstant(&tensor.getType(), name);
+Constant *Module::createConstant(llvm::StringRef name, const Tensor &tensor,
+                                 const std::string &layout) {
+  auto *V = createConstant(&tensor.getType(), name, layout);
   V->assign(&tensor);
   return V;
 }
 
-Constant *Module::createConstant(llvm::StringRef name, Tensor &&tensor) {
-  return addConstant(new Constant(name, std::move(tensor)));
+Constant *Module::createConstant(llvm::StringRef name, Tensor &&tensor,
+                                 const std::string &layout) {
+  return addConstant(new Constant(name, std::move(tensor), layout));
+}
+
+std::string Module::getPrefix(llvm::StringRef name) {
+  std::string prefix = name;
+  size_t delim = name.rfind("__");
+  if (delim != std::string::npos &&
+      std::all_of(name.begin() + (delim + 2), name.end(),
+                  [](unsigned char c) { return ::isdigit(c); })) {
+    prefix = prefix.substr(0, delim);
+  }
+  return prefix;
 }
 
 llvm::StringRef Module::uniqueName(llvm::StringRef name,
-                                   llvm::StringSet<> &stringTable) {
+                                   const llvm::StringSet<> &stringTable,
+                                   llvm::StringSet<> &updateTable) {
   std::string legalName = legalizeName(name);
-
-  auto it = stringTable.insert(legalName);
-  if (it.second) {
-    // This name is already unique!
-    return it.first->first();
-  }
-
-  for (unsigned i = 1; i < 10000; i++) {
-    auto suffix = std::to_string(i);
-
-    auto it = stringTable.insert(legalName + suffix);
+  if (stringTable.find(legalName) == stringTable.end()) {
+    auto it = updateTable.insert(legalName);
     if (it.second) {
-      // Found a unique name!
       return it.first->first();
     }
   }
 
+  std::string prefix = Module::getPrefix(legalName);
+  for (unsigned i = 1; i < 10000; i++) {
+    auto suffix = std::to_string(i);
+    std::string fullName = prefix + "__" + suffix;
+    if (stringTable.find(fullName) != stringTable.end()) {
+      continue;
+    }
+
+    auto it = updateTable.insert(fullName);
+    if (it.second) {
+      return it.first->first();
+    }
+  }
   llvm_unreachable("Unable to find a unique a name.");
 }
 
 Constant *Module::addConstant(Constant *V) {
-  V->setName(uniqueName(V->getName(), uniqueVariableNames_));
-  // Replace the Constant's output type with the equivalent unique type for this
-  // Module to maintain the invariant that each type in the Module is unique.
+  V->setName(uniqueName(V->getName(), usedNodeNames_, usedStorageNames_));
+  // Replace the Constant's output type with the equivalent unique type for
+  // this Module to maintain the invariant that each type in the Module is
+  // unique.
   V->setType(Constant::ResultIndices::OutputIdx, uniqueType(*V->getType()));
   constants_.push_back(V);
+  logStorageCreation(functions_, V);
   return V;
-}
-
-Placeholder *Module::addPlaceholder(Placeholder *ph) {
-  ph->setName(uniqueName(ph->getName(), uniqueVariableNames_));
-  placeholders_.push_back(ph);
-  return ph;
 }
 
 /// Check if the 'pads' array has the right size.
@@ -491,17 +669,45 @@ static void checkKernelSize(ShapeNHWC idim, llvm::ArrayRef<unsigned_t> kernels,
 }
 
 /// Check the kernel size for 3D Conv/Pooling ops.
-static void check3DKernelSize(ShapeNHWDC idim,
+static void check3DKernelSize(ShapeNTHWC idim,
                               llvm::ArrayRef<unsigned_t> kernels,
                               llvm::ArrayRef<unsigned_t> pads) {
-  PaddingTLNBRF pdim(pads);
+  PaddingNFTBLR pdim(pads);
   (void)pdim;
-  ShapeHWD kdim(kernels);
+  ShapeTHW kdim(kernels);
   (void)kdim;
   assert((idim.w + pdim.left + pdim.right) >= kdim.width &&
          (idim.h + pdim.top + pdim.bottom) >= kdim.height &&
-         (idim.d + pdim.near + pdim.far) >= kdim.depth &&
+         (idim.t + pdim.near + pdim.far) >= kdim.temporal_frames &&
          "Kernel size is too large");
+}
+
+/// Check that the dimensions that are passed in when the ConvTranspose is
+/// constructed are correct.
+static void assertConvTransposeDims(NodeValue input, NodeValue filter,
+                                    NodeValue bias,
+                                    llvm::ArrayRef<unsigned_t> kernels,
+                                    llvm::ArrayRef<unsigned_t> strides,
+                                    llvm::ArrayRef<unsigned_t> pads,
+                                    unsigned_t group) {
+  ShapeNHWC idim = ShapeNHWC(input.dims());
+  (void)idim;
+  ShapeHW kdim(kernels);
+  (void)kdim;
+  assert(idim.c % group == 0 && "channels number must be divisible by groups");
+
+  // NOTE: here the N in NHWC is abnormal because it is the number of filters
+  // (and therefore the number of output channels of the conv) and not the
+  // batch size. The rest of the dimensions are representative of the input
+  // dimensions to the convolution.
+  ShapeNHWC filterDims(filter.dims());
+  (void)filterDims;
+
+  assert(filterDims.n % group == 0 && filterDims.h == kdim.height &&
+         filterDims.w == kdim.width && filterDims.c == idim.c / group &&
+         "Invalid filter dims");
+
+  assert(bias.getType()->size() == filterDims.n && "Invalid bias size");
 }
 
 /// Check that the dimensions that are passed in when the convolution is
@@ -537,50 +743,69 @@ static void assertConv3DDims(NodeValue input, NodeValue filter, NodeValue bias,
                              llvm::ArrayRef<unsigned_t> strides,
                              llvm::ArrayRef<unsigned_t> pads,
                              unsigned_t group) {
-
-  ShapeNHWDC idim(input.dims());
-  ShapeHWD kdim(kernels);
+  ShapeNTHWC idim(input.dims());
+  ShapeTHW kdim(kernels);
   (void)kdim;
   check3DKernelSize(idim, kernels, pads);
   assert(idim.c % group == 0 && "channels number must be divisible by groups");
 
-  // NOTE: here the N in NHWDC is abnormal because it is the number of filters
+  // NOTE: here the N in NTHWC is abnormal because it is the number of filters
   // (and therefore the number of output channels of the 3d conv) and not the
   // batch size. The rest of the dimensions are representative of the input
   // dimensions to the convolution.
-  ShapeNHWDC filterDims(filter.dims());
+  ShapeNTHWC filterDims(filter.dims());
   (void)filterDims;
 
   assert(filterDims.n % group == 0 && filterDims.h == kdim.height &&
-         filterDims.w == kdim.width && filterDims.d == kdim.depth &&
+         filterDims.w == kdim.width && filterDims.t == kdim.temporal_frames &&
          filterDims.c == idim.c / group && "Invalid filter dims");
 
   assert(bias.getType()->size() == filterDims.n && "Invalid bias size");
 }
 
-ConvolutionNode *Function::createConv(llvm::StringRef name, NodeValue input,
-                                      NodeValue filter, NodeValue bias,
-                                      TypeRef outTy,
-                                      llvm::ArrayRef<unsigned_t> kernels,
-                                      llvm::ArrayRef<unsigned_t> strides,
-                                      llvm::ArrayRef<unsigned_t> pads,
-                                      unsigned_t group, unsigned_t dilation) {
+ConvolutionNode *Function::createConv(
+    llvm::StringRef name, NodeValue input, NodeValue filter, NodeValue bias,
+    TypeRef outTy, llvm::ArrayRef<unsigned_t> kernels,
+    llvm::ArrayRef<unsigned_t> strides, llvm::ArrayRef<unsigned_t> pads,
+    unsigned_t group, unsigned_t dilation, ConvolutionLayout layout) {
   assertConvDims(input, filter, bias, kernels, strides, pads, group);
   auto OT = getParent()->uniqueType(*outTy);
+
+  // If the input is quantized but the bias is not then auto-quantize the
+  // bias.
+  if (input.getType()->isQuantizedType()) {
+    auto biasType = bias.getElementType();
+    if (biasType == ElemKind::Int32QTy || biasType == ElemKind::Int8QTy) {
+      // Nothing to do
+    } else if (biasType == ElemKind::FloatTy) {
+      auto biasTy = getParent()->uniqueType(
+          glow::ElemKind::Int32QTy, bias.dims(),
+          input.getType()->getScale() * filter.getType()->getScale(),
+          /* offset */ 0);
+      bias = createQuantize("quantized_bias", bias, biasTy);
+    } else {
+      LOG(DFATAL)
+          << "Unsupported element type for bias of quantized convolution: "
+          << Type::getElementName(biasType).str();
+    }
+  }
+
   return addNode(new ConvolutionNode(name, OT, input, filter, bias, kernels,
-                                     strides, pads, group, dilation));
+                                     strides, pads, group, dilation, layout,
+                                     FusedActivation::NONE));
 }
 
 ConvolutionNode *Function::createConv(llvm::StringRef name, NodeValue input,
                                       NodeValue filter, NodeValue bias,
                                       TypeRef outTy, unsigned_t kernel,
                                       unsigned_t stride, unsigned_t pad,
-                                      unsigned_t group, unsigned_t dilation) {
+                                      unsigned_t group, unsigned_t dilation,
+                                      ConvolutionLayout layout) {
   llvm::SmallVector<unsigned_t, 4> pads = {pad, pad, pad, pad};
   llvm::SmallVector<unsigned_t, 2> strides = {stride, stride};
   llvm::SmallVector<unsigned_t, 2> kernels = {kernel, kernel};
   return createConv(name, input, filter, bias, outTy, kernels, strides, pads,
-                    group, dilation);
+                    group, dilation, layout);
 }
 
 Convolution3DNode *Function::createConv3D(llvm::StringRef name, NodeValue input,
@@ -608,10 +833,34 @@ Convolution3DNode *Function::createConv3D(llvm::StringRef name, NodeValue input,
                       group);
 }
 
+ConvTransposeNode *Function::createConvTranspose(
+    llvm::StringRef name, NodeValue input, NodeValue filter, NodeValue bias,
+    TypeRef outTy, llvm::ArrayRef<unsigned_t> kernels,
+    llvm::ArrayRef<unsigned_t> strides, llvm::ArrayRef<unsigned_t> pads,
+    unsigned_t group, unsigned_t dilation) {
+  assertConvTransposeDims(input, filter, bias, kernels, strides, pads, group);
+  auto OT = getParent()->uniqueType(*outTy);
+  return addNode(new ConvTransposeNode(name, OT, input, filter, bias, kernels,
+                                       strides, pads, group, dilation));
+}
+
+ConvTransposeNode *Function::createConvTranspose(
+    llvm::StringRef name, NodeValue input, NodeValue filter, NodeValue bias,
+    TypeRef outTy, unsigned_t kernel, unsigned_t stride, unsigned_t pad,
+    unsigned_t group, unsigned_t dilation) {
+  llvm::SmallVector<unsigned_t, 4> pads = {pad, pad, pad, pad};
+  llvm::SmallVector<unsigned_t, 2> strides = {stride, stride};
+  llvm::SmallVector<unsigned_t, 2> kernels = {kernel, kernel};
+  return createConvTranspose(name, input, filter, bias, outTy, kernels, strides,
+                             pads, group, dilation);
+}
+
 MaxPoolNode *Function::createMaxPool(llvm::StringRef name, NodeValue input,
                                      llvm::ArrayRef<unsigned_t> kernels,
                                      llvm::ArrayRef<unsigned_t> strides,
-                                     llvm::ArrayRef<unsigned_t> pads) {
+                                     llvm::ArrayRef<unsigned_t> pads,
+                                     ElemKind elemTyAMT,
+                                     ConvolutionLayout layout) {
   ShapeNHWC idim = ShapeNHWC(input.dims());
   checkKernelSize(idim, kernels, pads);
 
@@ -619,23 +868,28 @@ MaxPoolNode *Function::createMaxPool(llvm::StringRef name, NodeValue input,
       calculateConvPoolOutputDims(idim.h, idim.w, kernels, strides, pads);
   auto OT = getParent()->uniqueTypeWithNewShape(
       input.getType(), {idim.n, outSz.first, outSz.second, idim.c});
+  auto AMT = getParent()->uniqueType(
+      elemTyAMT, {idim.n, outSz.first, outSz.second, idim.c});
 
-  return addNode(new MaxPoolNode(name, OT, input, kernels, strides, pads));
+  return addNode(
+      new MaxPoolNode(name, OT, AMT, input, kernels, strides, pads, layout));
 }
 
 MaxPoolNode *Function::createMaxPool(llvm::StringRef name, NodeValue input,
                                      unsigned_t kernel, unsigned_t stride,
-                                     unsigned_t pad) {
+                                     unsigned_t pad, ElemKind elemTyAMT,
+                                     ConvolutionLayout layout) {
   llvm::SmallVector<unsigned_t, 4> pads = {pad, pad, pad, pad};
   llvm::SmallVector<unsigned_t, 2> strides = {stride, stride};
   llvm::SmallVector<unsigned_t, 2> kernels = {kernel, kernel};
-  return createMaxPool(name, input, kernels, strides, pads);
+  return createMaxPool(name, input, kernels, strides, pads, elemTyAMT, layout);
 }
 
 AvgPoolNode *Function::createAvgPool(llvm::StringRef name, NodeValue input,
                                      llvm::ArrayRef<unsigned_t> kernels,
                                      llvm::ArrayRef<unsigned_t> strides,
-                                     llvm::ArrayRef<unsigned_t> pads) {
+                                     llvm::ArrayRef<unsigned_t> pads,
+                                     ConvolutionLayout layout) {
   ShapeNHWC idim = ShapeNHWC(input.dims());
   checkKernelSize(idim, kernels, pads);
 
@@ -644,28 +898,37 @@ AvgPoolNode *Function::createAvgPool(llvm::StringRef name, NodeValue input,
   auto OT = getParent()->uniqueTypeWithNewShape(
       input.getType(), {idim.n, outSz.first, outSz.second, idim.c});
 
-  return addNode(new AvgPoolNode(name, OT, input, kernels, strides, pads));
+  return addNode(
+      new AvgPoolNode(name, OT, input, kernels, strides, pads, layout));
 }
 
 AvgPoolNode *Function::createAvgPool(llvm::StringRef name, NodeValue input,
                                      TypeRef outTy,
                                      llvm::ArrayRef<unsigned_t> kernels,
                                      llvm::ArrayRef<unsigned_t> strides,
-                                     llvm::ArrayRef<unsigned_t> pads) {
+                                     llvm::ArrayRef<unsigned_t> pads,
+                                     ConvolutionLayout layout) {
   ShapeNHWC idim = ShapeNHWC(input.dims());
   ShapeHW kdim(kernels);
   (void)kdim;
   checkKernelSize(idim, kernels, pads);
-  return addNode(new AvgPoolNode(name, outTy, input, kernels, strides, pads));
+  return addNode(
+      new AvgPoolNode(name, outTy, input, kernels, strides, pads, layout));
 }
 
 AvgPoolNode *Function::createAvgPool(llvm::StringRef name, NodeValue input,
                                      unsigned_t kernel, unsigned_t stride,
-                                     unsigned_t pad) {
+                                     unsigned_t pad, ConvolutionLayout layout) {
   llvm::SmallVector<unsigned_t, 4> pads = {pad, pad, pad, pad};
   llvm::SmallVector<unsigned_t, 2> strides = {stride, stride};
   llvm::SmallVector<unsigned_t, 2> kernels = {kernel, kernel};
-  return createAvgPool(name, input, kernels, strides, pads);
+  return createAvgPool(name, input, kernels, strides, pads, layout);
+}
+
+AdaptiveAvgPoolNode *Function::createAdaptiveAvgPool(llvm::StringRef name,
+                                                     NodeValue input,
+                                                     TypeRef outTy) {
+  return addNode(new AdaptiveAvgPoolNode(name, outTy, input));
 }
 
 FullyConnectedNode *Function::createFullyConnected(llvm::StringRef name,
@@ -675,6 +938,17 @@ FullyConnectedNode *Function::createFullyConnected(llvm::StringRef name,
   TypeRef T = input.getType();
   TypeRef OT = getParent()->uniqueTypeWithNewShape(
       T, {input.dims()[0], B->getType()->dims()[0]});
+
+  return createFullyConnected(name, input, W, B, OT, axis);
+}
+
+FullyConnectedNode *Function::createFullyConnected(llvm::StringRef name,
+                                                   NodeValue input, NodeValue W,
+                                                   NodeValue B,
+                                                   unsigned_t axis) {
+  TypeRef T = input.getType();
+  TypeRef OT =
+      getParent()->uniqueTypeWithNewShape(T, {input.dims()[0], B.dims()[0]});
 
   return createFullyConnected(name, input, W, B, OT, axis);
 }
@@ -698,6 +972,16 @@ FullyConnectedNode *Function::createFullyConnected(llvm::StringRef name,
 RowwiseQuantizedFullyConnectedNode *
 Function::createRowwiseQuantizedFullyConnected(llvm::StringRef name,
                                                NodeValue input, Constant *W,
+                                               Constant *scales,
+                                               Constant *offsets, NodeValue B,
+                                               TypeRef outTy) {
+  return addNode(new RowwiseQuantizedFullyConnectedNode(name, outTy, input, W,
+                                                        scales, offsets, B));
+}
+
+RowwiseQuantizedFullyConnectedNode *
+Function::createRowwiseQuantizedFullyConnected(llvm::StringRef name,
+                                               NodeValue input, Constant *W,
                                                NodeValue B, TypeRef outTy,
                                                quantization::Schema schema,
                                                bool transposeWeight) {
@@ -705,9 +989,9 @@ Function::createRowwiseQuantizedFullyConnected(llvm::StringRef name,
   // The quantized data is in qWeights, the scale of each row is in scales,
   // and the offset of each row is in offsets.
   Constant *weights = llvm::cast<Constant>(W);
-  size_t numRows =
+  dim_t numRows =
       transposeWeight ? W->getType()->dims()[1] : W->getType()->dims()[0];
-  size_t numCols =
+  dim_t numCols =
       transposeWeight ? W->getType()->dims()[0] : W->getType()->dims()[1];
 
   // So far, if we want to create a storage with Int8QTy/Int16QTy,
@@ -725,16 +1009,16 @@ Function::createRowwiseQuantizedFullyConnected(llvm::StringRef name,
   if (transposeWeight) {
     // This happens when the RowwiseQuantizedFullyConnected node is converted
     // from a quantized FullyConnected node in Glow's quantization procedure.
-    // Since in FC, the weights is stored as transposed (i.e. I * W + B), but in
-    // RowwiseQuantizedFullyConnected, the weights is stored as it is (i.e. I *
-    // W(T) + B).
+    // Since in FC, the weights is stored as transposed (i.e. I * W + B), but
+    // in RowwiseQuantizedFullyConnected, the weights is stored as it is (i.e.
+    // I * W(T) + B).
     weights->getPayloadMutable().transpose(&wt, {1, 0});
   } else {
     wt.assign(&(weights->getPayload()));
   }
 
   // Note: Using int32_t offset here as that is what RWQ-FC expects.
-  quantization::tensorRowwiseQuantization<int32_t>(
+  quantization::tensorRowwiseQuantization<float, int32_t, int8_t>(
       wt, qWeights->getPayloadMutable(), scales->getPayloadMutable(),
       offsets->getPayloadMutable(), schema);
 
@@ -749,6 +1033,41 @@ ReluNode *Function::createRELU(llvm::StringRef name, NodeValue input,
 
 ReluNode *Function::createRELU(llvm::StringRef name, NodeValue input) {
   return addNode(new ReluNode(name, input.getType(), input));
+}
+
+Node *Function::createGELU(llvm::StringRef name, NodeValue input) {
+  auto outTy = input.getType();
+
+  Node *alphaSplat =
+      createSplat(name.str() + ".alpha", outTy, M_2_SQRTPI * M_SQRT1_2);
+  Node *splat = createSplat(name.str() + ".splat", outTy, 0.044715);
+  Node *splatHalf = createSplat(name.str() + ".splatHalf", outTy, 0.5);
+  Node *splat1 = createSplat(name.str() + ".splat3", outTy, 1.0);
+  Node *splat3 = createSplat(name.str() + ".splat3", outTy, 3.0);
+
+  // pow(x, 3)
+  Node *pow = createPow(name.str() + ".pow", input, splat3);
+
+  // pow(x, 3) * 0.044715
+  Node *mul = createMul(name.str() + ".mul", pow, splat);
+
+  // x + pow(x, 3) * 0.044715
+  Node *add = createAdd(name.str() + ".add", input, mul);
+
+  // (x * pow(x, 3) * 0.044715) * alpha
+  Node *mul2 = createMul(name.str() + ".mul2", add, alphaSplat);
+
+  // tanh((x * pow(x, 3) * 0.044715) * alpha)
+  Node *tanh = createTanh(name.str() + ".tanh", mul2);
+
+  // tanh((x * pow(x, 3) * 0.044715) * alpha) + 1
+  Node *add2 = createAdd(name.str() + ".add2", tanh, splat1);
+
+  // (tanh((x * pow(x, 3) * 0.044715) * alpha) + 1) * 0.5
+  Node *mul3 = createMul(name.str() + ".mul3", splatHalf, add2);
+
+  // (tanh((x * pow(x, 3) * 0.044715) * alpha) + 1) * 0.5 * x
+  return createMul(name.str() + ".mul4", mul3, input);
 }
 
 PReluNode *Function::createPRELU(llvm::StringRef name, NodeValue input,
@@ -806,35 +1125,69 @@ Function::createSigmoidCrossEntropyWithLogits(llvm::StringRef name,
                                               NodeValue logits,
                                               NodeValue targets) {
   assert(logits.dims().size() > 1);
-  std::vector<size_t> outDims(logits.dims().begin(), logits.dims().end() - 1);
+  std::vector<dim_t> outDims(logits.dims().begin(), logits.dims().end() - 1);
   auto ty = getParent()->uniqueTypeWithNewShape(logits.getType(), outDims);
   return addNode(
       new SigmoidCrossEntropyWithLogitsNode(name, ty, logits, targets));
 }
 
 ReshapeNode *Function::createReshape(llvm::StringRef name, NodeValue input,
-                                     llvm::ArrayRef<size_t> shape) {
+                                     llvm::ArrayRef<dim_t> shape,
+                                     llvm::StringRef layout) {
   auto TR = getParent()->uniqueTypeWithNewShape(input.getType(), shape);
-  assert(TR->size() == input.getType()->size() &&
-         "Reshape to a different size");
-  return addNode(new ReshapeNode(name, TR, input, shape.vec()));
+  DCHECK_EQ(TR->size(), input.getType()->size())
+      << "Reshape to a different size";
+  return addNode(new ReshapeNode(name, TR, input, shape.vec(), layout));
 }
 
 TransposeNode *Function::createTranspose(llvm::StringRef name, NodeValue input,
-                                         llvm::ArrayRef<unsigned_t> shuffle) {
+                                         llvm::ArrayRef<unsigned_t> shuffle,
+                                         const std::string &layout) {
   ShapeVector shape;
   auto dims = input.dims();
   for (size_t i = 0; i < dims.size(); i++) {
     shape.push_back(dims[shuffle[i]]);
   }
 
+  // If the layout is known, check that it matches the shuffle:
+  auto compareShuffle = [&](const std::vector<unsigned_t> targetShuffle) {
+    auto shuffleVec = shuffle.vec();
+    return targetShuffle.size() == dims.size() &&
+           std::equal(shuffleVec.begin(), shuffleVec.end(),
+                      targetShuffle.begin());
+  };
+
+  auto currLayout = layout;
+  if (currLayout == ANY_LAYOUT) {
+    // If layout got a default value, change it based on shuffle:
+    // TODO: remove the shuffle and replace it with layout.
+    if (compareShuffle(NCHW2NHWC) || compareShuffle(HWCN2NHWC)) {
+      currLayout = "NHWC";
+    } else if (compareShuffle(NCTHW2NTHWC)) {
+      currLayout = "NTHWC";
+    } else if (compareShuffle(NHWC2NCHW)) {
+      currLayout = "NCHW";
+    } else if (compareShuffle(NTHWC2NCTHW)) {
+      currLayout = "NCTHW";
+    } else if (compareShuffle(NHWC2HWNC)) {
+      currLayout = "HWNC";
+    } else if (compareShuffle(CNHW2NHWC)) {
+      currLayout = "NHWC";
+    }
+  }
+
   auto NT = getParent()->uniqueTypeWithNewShape(input.getType(), shape);
-  return addNode(new TransposeNode(name, NT, input, shuffle.vec()));
+  return addNode(new TransposeNode(name, NT, input, shuffle.vec(), currLayout));
+}
+
+FlipNode *Function::createFlip(llvm::StringRef name, NodeValue input,
+                               unsigned_t axis) {
+  auto OT = getParent()->uniqueType(*input.getType());
+  return addNode(new FlipNode(name, OT, input, axis));
 }
 
 Node *Function::createBroadcast(llvm::StringRef name, NodeValue input,
-                                llvm::ArrayRef<size_t> newShape,
-                                unsigned_t axis) {
+                                UnsignedArrayRef newShape, unsigned_t axis) {
   const auto &origDims = input.dims();
 
   assert(axis + origDims.size() <= newShape.size() &&
@@ -845,8 +1198,8 @@ Node *Function::createBroadcast(llvm::StringRef name, NodeValue input,
   // new shape (no action taken) or == 1 (broadcast in that direction). Else
   // the original shape had no dimensions here (after considering axis), so
   // add the new dimension and broadcast in that direction.
-  size_t reshapeDims[max_tensor_dimensions];
-  for (size_t i = 0; i < newShape.size(); i++) {
+  dim_t reshapeDims[max_tensor_dimensions];
+  for (dim_t i = 0; i < newShape.size(); i++) {
     if (i >= axis && i < origDims.size() + axis) {
       const int origIdx = i - axis;
       if (origDims[origIdx] == newShape[i]) {
@@ -869,7 +1222,7 @@ Node *Function::createBroadcast(llvm::StringRef name, NodeValue input,
   // with 1s in place of to-be-broadcasted dimensions.
   Node *currNode =
       createReshape(name.str() + ".reshape", input,
-                    llvm::ArrayRef<size_t>(reshapeDims, newShape.size()));
+                    llvm::ArrayRef<dim_t>(reshapeDims, newShape.size()));
 
   // Create a Tile (which is really a Concat) in each direction that needs to
   // be broadcasted.
@@ -971,14 +1324,14 @@ TileNode *Function::createTile(llvm::StringRef name, NodeValue input,
 
 InsertTensorNode *Function::createInsertTensor(llvm::StringRef name,
                                                NodeValue big, NodeValue small,
-                                               llvm::ArrayRef<size_t> start,
+                                               llvm::ArrayRef<dim_t> start,
                                                unsigned_t count,
                                                unsigned_t axis) {
   return addNode(new InsertTensorNode(name, big, small, start, count, axis));
 }
 
 SliceNode *Function::createSlice(llvm::StringRef name, NodeValue input,
-                                 llvm::ArrayRef<size_t> start, TypeRef outTy) {
+                                 llvm::ArrayRef<dim_t> start, TypeRef outTy) {
   assert(input.dims().size() == start.size() &&
          "Start and input dims should match");
   assert(outTy->dims().size() == start.size() &&
@@ -994,18 +1347,17 @@ SliceNode *Function::createSlice(llvm::StringRef name, NodeValue input,
 }
 
 SliceNode *Function::createSlice(llvm::StringRef name, NodeValue input,
-                                 llvm::ArrayRef<size_t> begin,
-                                 llvm::ArrayRef<size_t> end) {
-
-  std::vector<size_t> beginV, shape;
+                                 llvm::ArrayRef<dim_t> begin,
+                                 llvm::ArrayRef<dim_t> end) {
+  std::vector<dim_t> beginV, shape;
   auto dims = input.dims();
   assert(begin.size() == end.size() && "Begin and End dimensions should match");
   assert(begin.size() == dims.size() &&
          "Begin and Input dimensions should match");
   for (unsigned i = 0; i < dims.size(); i++) {
-    size_t beginI = begin[i];
-    size_t endI = end[i];
-    size_t dimI = dims[i];
+    dim_t beginI = begin[i];
+    dim_t endI = end[i];
+    dim_t dimI = dims[i];
     (void)dimI;
     assert(beginI >= 0 && "Illegal Begin indices");
     assert(endI > 0 && "Illegal End indices");
@@ -1027,7 +1379,7 @@ Node *Function::createChannelShuffle(llvm::StringRef name, NodeValue input,
 }
 
 ReshapeNode *Function::createSqueeze(llvm::StringRef name, NodeValue input,
-                                     llvm::ArrayRef<size_t> axes) {
+                                     llvm::ArrayRef<dim_t> axes) {
   assert(!axes.empty() && "Parameter `axes` must be provided.");
 
   ShapeVector shapeAxes(axes.begin(), axes.end());
@@ -1057,7 +1409,7 @@ ReshapeNode *Function::createSqueeze(llvm::StringRef name, NodeValue input,
 }
 
 ReshapeNode *Function::createExpandDims(llvm::StringRef name, NodeValue input,
-                                        llvm::ArrayRef<size_t> axes) {
+                                        llvm::ArrayRef<dim_t> axes) {
   assert(!axes.empty() && "Parameter `axes` must be provided.");
 
   // Dimensions provided in axes are for the output tensor, so we sort them
@@ -1103,7 +1455,7 @@ ReshapeNode *Function::createFlatten(llvm::StringRef name, NodeValue input,
 
 void Function::createSplit(llvm::StringRef name, NodeValue input,
                            unsigned_t outputNum, unsigned_t axis,
-                           llvm::ArrayRef<size_t> split,
+                           llvm::ArrayRef<dim_t> split,
                            std::vector<SliceNode *> &outputs) {
   auto inDims = input.dims();
   if (split.empty()) {
@@ -1132,11 +1484,26 @@ void Function::createSplit(llvm::StringRef name, NodeValue input,
 }
 
 BatchNormalizationNode *Function::createBatchNormalization(
-    llvm::StringRef name, NodeValue input, NodeValue beta, NodeValue gamma,
+    llvm::StringRef name, NodeValue input, NodeValue beta, NodeValue scale,
     NodeValue mean, NodeValue var, unsigned_t channelIdx, float epsilon,
     float momentum) {
-  return addNode(new BatchNormalizationNode(name, input, gamma, beta, mean, var,
+  return addNode(new BatchNormalizationNode(name, input, scale, beta, mean, var,
                                             channelIdx, epsilon, momentum));
+}
+
+LayerNormalizationNode *Function::createLayerNormalization(llvm::StringRef name,
+                                                           NodeValue input,
+                                                           NodeValue scale,
+                                                           NodeValue bias,
+                                                           float epsilon) {
+  return addNode(new LayerNormalizationNode(name, input, scale, bias, epsilon));
+}
+
+BucketizeNode *Function::createBucketizeNode(llvm::StringRef name,
+                                             NodeValue input,
+                                             llvm::ArrayRef<float> boundaries) {
+  auto OT = getParent()->uniqueType(ElemKind::Int32ITy, input.dims());
+  return addNode(new BucketizeNode(name, OT, input, boundaries));
 }
 
 LocalResponseNormalizationNode *Function::createLocalResponseNormalization(
@@ -1161,7 +1528,8 @@ ModuloNode *Function::createModulo(llvm::StringRef name, NodeValue input,
   }                                                                            \
   NODE_NAME_##Node *Function::create##NODE_NAME_(                              \
       llvm::StringRef name, TypeRef T, NodeValue LHS, NodeValue RHS) {         \
-    assert(LHS.dims() == RHS.dims() && "Invalid operand shapes");              \
+    DCHECK(LHS.dims() == RHS.dims())                                           \
+        << "Invalid operand shapes " << LHS.dims() << " vs " << RHS.dims();    \
     TypeRef OT = getParent()->uniqueType(*T);                                  \
     return addNode(new NODE_NAME_##Node(name, OT, LHS, RHS));                  \
   }
@@ -1180,6 +1548,13 @@ CmpLTENode *Function::createCmpLTE(llvm::StringRef name, NodeValue LHS,
   assert(LHS.dims() == RHS.dims() && "Invalid operand shapes");
   TypeRef OT = getParent()->uniqueType(ElemKind::BoolTy, LHS.dims());
   return addNode(new CmpLTENode(name, OT, LHS, RHS));
+}
+
+CmpLTNode *Function::createCmpLT(llvm::StringRef name, NodeValue LHS,
+                                 NodeValue RHS) {
+  assert(LHS.dims() == RHS.dims() && "Invalid operand shapes");
+  TypeRef OT = getParent()->uniqueType(ElemKind::BoolTy, LHS.dims());
+  return addNode(new CmpLTNode(name, OT, LHS, RHS));
 }
 
 CmpEQNode *Function::createCmpEQ(llvm::StringRef name, NodeValue LHS,
@@ -1207,6 +1582,10 @@ PowNode *Function::createPow(llvm::StringRef name, NodeValue base, float exp) {
 LogNode *Function::createLog(llvm::StringRef name, NodeValue input,
                              TypeRef outTy) {
   return addNode(new LogNode(name, outTy ? outTy : input.getType(), input));
+}
+
+ExpNode *Function::createExp(llvm::StringRef name, NodeValue input) {
+  return addNode(new ExpNode(name, input.getType(), input));
 }
 
 Node *Function::createLogit(llvm::StringRef name, NodeValue input, float eps) {
@@ -1285,23 +1664,24 @@ BatchMatMulNode *Function::createBatchMatMul(llvm::StringRef name,
   assert((numDimsRHS == 2 || numDimsRHS == 3) &&
          "RHS must be 2 or 3 dimensional.");
 
-  // If necessary, expand the RHS input to be 3D by adding initial leading dim.
+  // If necessary, expand the RHS input to be 3D by adding initial leading
+  // dim.
   if (numDimsRHS == 2) {
     RHS = createExpandDims(name.str() + ".reshapeRHS", RHS, {0});
   }
   // If necessary, Tile the RHS input so it matches the numBatches of LHS.
-  if (RHS.dims()[0] == 1) {
+  if (RHS.dims()[0] == 1 && LHS.dims()[0] != 1) {
     RHS = createTile(name.str() + ".tileRHS", RHS, LHS.dims()[0], /*axis */ 0);
   }
 
   // LHS = {numBatches, N, M}
   // RHS = {numBatches, M, P}
   // Result = {numBatches, N, P}
-  const size_t numBatches = LHS.dims()[0];
-  const size_t N = LHS.dims()[1];
-  const size_t M = LHS.dims()[2];
+  const dim_t numBatches = LHS.dims()[0];
+  const dim_t N = LHS.dims()[1];
+  const dim_t M = LHS.dims()[2];
   (void)M;
-  const size_t P = RHS.dims()[2];
+  const dim_t P = RHS.dims()[2];
   assert((RHS.dims()[0] == numBatches) && "Batch sizes are invalid.");
   assert((RHS.dims()[1] == M) && "Batch matmul dimensions are invalid.");
 
@@ -1314,7 +1694,6 @@ BatchedReduceAddNode *
 Function::createBatchedReduceAdd(llvm::StringRef name, TypeRef outTy,
                                  NodeValue batch,
                                  llvm::ArrayRef<unsigned_t> axes) {
-
   assert(axes.size() == 1 && "Only supporting single reduction for now.");
   auto axis = axes[0];
 
@@ -1348,11 +1727,19 @@ Function::createBatchedReduceMean(llvm::StringRef name, TypeRef outTy,
 BatchedReduceMeanNode *
 Function::createBatchedReduceMean(llvm::StringRef name, NodeValue batch,
                                   llvm::ArrayRef<unsigned_t> axes) {
-
   // Create new shape with specified dimensions either reduced or removed.
   auto outDims = getNewShapeWithoutAxes(batch.dims(), axes);
   auto OT = getParent()->uniqueType(batch.getType()->getElementType(), outDims);
   return createBatchedReduceMean(name, OT, batch, axes);
+}
+
+BatchedReduceMinNode *
+Function::createBatchedReduceMin(llvm::StringRef name, NodeValue batch,
+                                 llvm::ArrayRef<unsigned_t> axes) {
+  // Create new shape with specified dimensions either reduced or removed.
+  auto outDims = getNewShapeWithoutAxes(batch.dims(), axes);
+  auto OT = getParent()->uniqueType(batch.getType()->getElementType(), outDims);
+  return addNode(new BatchedReduceMinNode(name, OT, batch, axes));
 }
 
 BatchedAddNode *Function::createBatchedAdd(llvm::StringRef name,
@@ -1366,6 +1753,12 @@ BatchedAddNode *Function::createBatchedAdd(llvm::StringRef name, TypeRef outTy,
       new BatchedAddNode(name, getParent()->uniqueType(*outTy), batch, sample));
 }
 
+CumSumNode *Function::createCumSum(llvm::StringRef name, NodeValue input,
+                                   bool exclusive, bool reverse) {
+  return addNode(
+      new CumSumNode(name, input.getType(), input, exclusive, reverse));
+}
+
 LengthsSumNode *Function::createLengthsSum(llvm::StringRef name, NodeValue data,
                                            NodeValue lengths) {
   ShapeVector outDims(data.dims().begin(), data.dims().end());
@@ -1374,55 +1767,61 @@ LengthsSumNode *Function::createLengthsSum(llvm::StringRef name, NodeValue data,
   return addNode(new LengthsSumNode(name, outTy, data, lengths));
 }
 
-SparseLengthsWeightedSumNode *
+SparseLengthsSumNode *
 Function::createSparseLengthsSum(llvm::StringRef name, NodeValue data,
-                                 NodeValue indices, NodeValue lengths) {
-  auto ty =
-      getParent()->uniqueTypeWithNewShape(data.getType(), {indices.dims()[0]});
-  auto ones = createSplat(name.str() + ".ones", ty, 1.0);
-  return createSparseLengthsWeightedSum(name, data, ones, indices, lengths);
-}
-
-SparseLengthsWeightedSumNode *
-Function::createSparseLengthsWeightedSum(llvm::StringRef name, NodeValue data,
-                                         NodeValue weights, NodeValue indices,
-                                         NodeValue lengths) {
+                                 NodeValue indices, NodeValue lengths,
+                                 LengthsMode lengthsMode, float avgLength) {
   auto inDims = data.dims();
   ShapeVector outDims(inDims.begin(), inDims.end());
   outDims[0] = lengths.dims()[0];
   auto outTy = getParent()->uniqueTypeWithNewShape(data.getType(), outDims);
-  return addNode(new SparseLengthsWeightedSumNode(name, outTy, data, weights,
-                                                  indices, lengths));
+  return addNode(new SparseLengthsSumNode(name, outTy, data, indices, lengths,
+                                          lengthsMode, avgLength));
 }
 
-SparseLengthsWeightedSumNode *
-Function::createSparseLengthsWeightedSum(llvm::StringRef name, TypeRef outTy,
-                                         NodeValue data, NodeValue weights,
-                                         NodeValue indices, NodeValue lengths) {
-  return addNode(new SparseLengthsWeightedSumNode(name, outTy, data, weights,
-                                                  indices, lengths));
+SparseLengthsWeightedSumNode *Function::createSparseLengthsWeightedSum(
+    llvm::StringRef name, NodeValue data, NodeValue weights, NodeValue indices,
+    NodeValue lengths, LengthsMode lengthsMode, float avgLength) {
+  auto inDims = data.dims();
+  ShapeVector outDims(inDims.begin(), inDims.end());
+  outDims[0] = lengths.dims()[0];
+  auto outTy = getParent()->uniqueTypeWithNewShape(data.getType(), outDims);
+  return addNode(new SparseLengthsWeightedSumNode(
+      name, outTy, data, weights, indices, lengths, lengthsMode, avgLength));
+}
+
+SparseLengthsWeightedSumNode *Function::createSparseLengthsWeightedSum(
+    llvm::StringRef name, TypeRef outTy, NodeValue data, NodeValue weights,
+    NodeValue indices, NodeValue lengths, LengthsMode lengthsMode,
+    float avgLength) {
+  return addNode(new SparseLengthsWeightedSumNode(
+      name, outTy, data, weights, indices, lengths, lengthsMode, avgLength));
 }
 
 RowwiseQuantizedSparseLengthsWeightedSumNode *
 Function::createRowwiseQuantizedSparseLengthsWeightedSum(
-    llvm::StringRef name, Constant *data, Constant *scales, Constant *offsets,
-    NodeValue weights, NodeValue indices, NodeValue lengths) {
+    llvm::StringRef name, Storage *data, Constant *scales, Constant *offsets,
+    NodeValue weights, NodeValue indices, NodeValue lengths, ElemKind precision,
+    bool useFP16Accumulation, LengthsMode lengthsMode, float avgLength) {
   auto inDims = data->dims();
   ShapeVector outDims(inDims.begin(), inDims.end());
   outDims[0] = lengths.dims()[0];
-  auto outTy = getParent()->uniqueType(ElemKind::FloatTy, outDims);
+  auto outTy = getParent()->uniqueType(precision, outDims);
   return addNode(new RowwiseQuantizedSparseLengthsWeightedSumNode(
-      name, outTy, data, scales, offsets, weights, indices, lengths));
+      name, outTy, data, scales, offsets, weights, indices, lengths,
+      useFP16Accumulation, lengthsMode, avgLength));
 }
 
 RowwiseQuantizedSparseLengthsWeightedSumNode *
 Function::createRowwiseQuantizedSparseLengthsSum(
-    llvm::StringRef name, Constant *data, Constant *scales, Constant *offsets,
-    NodeValue indices, NodeValue lengths) {
-  auto ty = getParent()->uniqueType(ElemKind::FloatTy, {indices.dims()[0]});
+    llvm::StringRef name, Storage *data, Constant *scales, Constant *offsets,
+    NodeValue indices, NodeValue lengths, ElemKind precision,
+    bool useFP16Accumulation, LengthsMode lengthsMode, float avgLength) {
+  auto ty = getParent()->uniqueType(precision, {indices.dims()[0]});
   auto ones = createSplat(name.str() + ".ones", ty, 1.0);
   return createRowwiseQuantizedSparseLengthsWeightedSum(
-      name, data, scales, offsets, ones, indices, lengths);
+      name, data, scales, offsets, ones, indices, lengths, precision,
+      useFP16Accumulation, lengthsMode, avgLength);
 }
 
 /// Helper to create a RowwiseQuantizedSparseLengthsWeightedSumNode in the
@@ -1433,83 +1832,122 @@ Function::createRowwiseQuantizedSparseLengthsSum(
 static RowwiseQuantizedSparseLengthsWeightedSumNode *
 quantizeDataAndCreateRowwiseQuantizedSparseLengthsWeightedSum(
     Function *F, llvm::StringRef name, Tensor &data, NodeValue weights,
-    NodeValue indices, NodeValue lengths, quantization::Schema schema) {
+    NodeValue indices, NodeValue lengths, quantization::Schema schema,
+    ElemKind precision, bool useFP16Accumulation, LengthsMode lengthsMode,
+    float avgLength) {
   auto inDims = data.dims();
 
   // Note: In rwqData, we are using a quantized type, however the scale/offset
   // are set to dummy values 0.0/0. This is because the actually used
   // scale/offset come from dataScales and dataOffsets.
-  Constant *rwqData =
-      F->getParent()->createConstant(ElemKind::Int8QTy, inDims, 0.0, 0, "data");
-  Constant *dataScales = F->getParent()->createConstant(
-      ElemKind::FloatTy, {inDims[0]}, "dataScales");
-  Constant *dataOffsets = F->getParent()->createConstant(
-      ElemKind::FloatTy, {inDims[0]}, "dataOffsets");
+  Constant *rwqData = F->getParent()->createConstant(ElemKind::UInt8QTy, inDims,
+                                                     0.0, 0, "data");
+  Constant *dataScales =
+      F->getParent()->createConstant(precision, {inDims[0]}, "dataScales");
+  Constant *dataOffsets =
+      F->getParent()->createConstant(precision, {inDims[0]}, "dataOffsets");
 
-  // Note: Using float offset here as that is what RWQ-SLWS expects.
-  quantization::tensorRowwiseQuantization<float>(
-      data, rwqData->getPayloadMutable(), dataScales->getPayloadMutable(),
-      dataOffsets->getPayloadMutable(), schema);
+  // Note: Using floating point offset here as that is what RWQ-SLWS expects.
+  switch (precision) {
+  case ElemKind::FloatTy:
+    quantization::tensorRowwiseQuantization<float, float, uint8_t>(
+        data, rwqData->getPayloadMutable(), dataScales->getPayloadMutable(),
+        dataOffsets->getPayloadMutable(), schema);
+    break;
+  case ElemKind::Float16Ty:
+    quantization::tensorRowwiseQuantization<float16_t, float16_t, uint8_t>(
+        data, rwqData->getPayloadMutable(), dataScales->getPayloadMutable(),
+        dataOffsets->getPayloadMutable(), schema);
+    break;
+  default:
+    LOG(FATAL) << "Unsupported precision for RWQ-SLWS.";
+  }
   return F->createRowwiseQuantizedSparseLengthsWeightedSum(
-      name, rwqData, dataScales, dataOffsets, weights, indices, lengths);
+      name, rwqData, dataScales, dataOffsets, weights, indices, lengths,
+      precision, useFP16Accumulation, lengthsMode, avgLength);
 }
 
 RowwiseQuantizedSparseLengthsWeightedSumNode *
 Function::createRowwiseQuantizedSparseLengthsWeightedSum(
     llvm::StringRef name, Tensor &data, NodeValue weights, NodeValue indices,
-    NodeValue lengths, quantization::Schema schema) {
+    NodeValue lengths, quantization::Schema schema, ElemKind precision,
+    bool useFP16Accumulation, LengthsMode lengthsMode, float avgLength) {
   return quantizeDataAndCreateRowwiseQuantizedSparseLengthsWeightedSum(
-      this, name, data, weights, indices, lengths, schema);
+      this, name, data, weights, indices, lengths, schema, precision,
+      useFP16Accumulation, lengthsMode, avgLength);
 }
 
 RowwiseQuantizedSparseLengthsWeightedSumNode *
-Function::createRowwiseQuantizedSparseLengthsSum(llvm::StringRef name,
-                                                 Tensor &data,
-                                                 NodeValue indices,
-                                                 NodeValue lengths,
-                                                 quantization::Schema schema) {
-  auto ty = getParent()->uniqueType(ElemKind::FloatTy, {indices.dims()[0]});
+Function::createRowwiseQuantizedSparseLengthsSum(
+    llvm::StringRef name, Tensor &data, NodeValue indices, NodeValue lengths,
+    quantization::Schema schema, ElemKind precision, bool useFP16Accumulation,
+    LengthsMode lengthsMode, float avgLength) {
+  auto ty = getParent()->uniqueType(precision, {indices.dims()[0]});
   auto ones = createSplat(name.str() + ".ones", ty, 1.0);
   return quantizeDataAndCreateRowwiseQuantizedSparseLengthsWeightedSum(
-      this, name, data, ones, indices, lengths, schema);
+      this, name, data, ones, indices, lengths, schema, precision,
+      useFP16Accumulation, lengthsMode, avgLength);
+}
+
+/// Helper used to get specific output type required for
+/// createRowwiseQuantizedSparseLengthsSum,
+/// createRowwiseQuantizedSparseLengthsWeightedSum, and
+/// EmbeddingBagByteRowwiseOffsets. Function \p F is used to get the specific
+/// type, using inputs \p data and \p segmentsDim to compute output dimensions.
+static TypeRef
+getOutputTypeOfFusedRowwiseQuantizedSLS(Function *F, NodeValue data,
+                                        llvm::ArrayRef<dim_t> segmentsDim) {
+  ShapeVector outDims(data.dims().begin(), data.dims().end());
+  outDims[0] = segmentsDim[0];
+  // The output column count is the same as the input column count, but
+  // without the extra bytes for the fused scale/offset, as the output is not
+  // fused.
+  CHECK(isFusedQuantizedElemKind(data.getElementType()))
+      << "Must use a fused ElemKind for data.";
+  outDims[1] -= 2 * ((data.getElementType() == ElemKind::UInt8FusedQTy)
+                         ? sizeof(float)
+                         : sizeof(float16_t));
+  // If using 4-bit quantization, then the input data has packed two 4-bit
+  // elements into one byte, so we need to double the outDims.
+  if (data.getElementType() == ElemKind::UInt4FusedFP16QTy) {
+    outDims[1] *= 2;
+  }
+  const ElemKind outputK = (data.getElementType() == ElemKind::UInt8FusedQTy)
+                               ? ElemKind::FloatTy
+                               : ElemKind::Float16Ty;
+  return F->getParent()->uniqueType(outputK, outDims);
 }
 
 FusedRowwiseQuantizedSparseLengthsWeightedSumNode *
 Function::createFusedRowwiseQuantizedSparseLengthsWeightedSum(
-    llvm::StringRef name, Constant *data, NodeValue weights, NodeValue indices,
-    NodeValue lengths) {
-  auto inDims = data->dims();
-  ShapeVector outDims(inDims.begin(), inDims.end());
-  outDims[0] = lengths.dims()[0];
-  // The output column count is the same as the input column count, but without
-  // the extra 8 bytes for the fused scale/offset, as the output is not
-  // UInt8FusedQTy.
-  outDims[1] -= 8;
-  auto outTy = getParent()->uniqueType(ElemKind::FloatTy, outDims);
+    llvm::StringRef name, NodeValue data, NodeValue weights, NodeValue indices,
+    NodeValue lengths, bool useFP16Accumulation, LengthsMode lengthsMode,
+    float avgLength) {
+  auto outTy =
+      getOutputTypeOfFusedRowwiseQuantizedSLS(this, data, lengths.dims());
   return addNode(new FusedRowwiseQuantizedSparseLengthsWeightedSumNode(
-      name, outTy, data, weights, indices, lengths));
+      name, outTy, data, weights, indices, lengths, useFP16Accumulation,
+      lengthsMode, avgLength));
 }
 
-FusedRowwiseQuantizedSparseLengthsWeightedSumNode *
-Function::createFusedRowwiseQuantizedSparseLengthsSum(llvm::StringRef name,
-                                                      Constant *data,
-                                                      NodeValue indices,
-                                                      NodeValue lengths) {
-  auto ty = getParent()->uniqueType(ElemKind::FloatTy, {indices.dims()[0]});
-  auto ones = createSplat(name.str() + ".ones", ty, 1.0);
-  return createFusedRowwiseQuantizedSparseLengthsWeightedSum(name, data, ones,
-                                                             indices, lengths);
+FusedRowwiseQuantizedSparseLengthsSumNode *
+Function::createFusedRowwiseQuantizedSparseLengthsSum(
+    llvm::StringRef name, Storage *data, NodeValue indices, NodeValue lengths,
+    bool useFP16Accumulation, LengthsMode lengthsMode, float avgLength) {
+  auto outTy =
+      getOutputTypeOfFusedRowwiseQuantizedSLS(this, data, lengths.dims());
+  return addNode(new FusedRowwiseQuantizedSparseLengthsSumNode(
+      name, outTy, data, indices, lengths, useFP16Accumulation, lengthsMode,
+      avgLength));
 }
 
-/// Helper to create a RowwiseQuantizedSparseLengthsWeightedSumNode in the
-/// Function \p F with \p name, using \ data, \p weights, \p indices, and \p
-/// lengths as inputs. The provided float data in \p Tensor is rowwise
-/// quantized, creating Constants for the rowwise quantized data as well as
-/// Scales and Offsets, in the Module containing \p F.
-static FusedRowwiseQuantizedSparseLengthsWeightedSumNode *
-quantizeDataAndCreateFusedRowwiseQuantizedSparseLengthsWeightedSum(
-    Function *F, llvm::StringRef name, Tensor &data, NodeValue weights,
-    NodeValue indices, NodeValue lengths) {
+/// Helper to get quantized data required for
+/// RowwiseQuantizedSparseLengthsWeightedSumNode and
+/// RowwiseQuantizedSparseLengthsSumNode. Function \p F uses float Tensor \p
+/// data to create a rowwise qunatized Constant \p rwqData, which contains fused
+/// scales and offsets.
+static Constant *quantizeDataForFusedRowwiseQuantizedSparseLengthsWeightedSum(
+    Function *F, Tensor &data, ElemKind precision) {
   // For fused rowwise quantization, we must have a two-dimensional input. If
   // passed in a single dimensional data Tensor then add an extra dimension.
   const auto fDims = flattenCdr(data.dims());
@@ -1520,32 +1958,108 @@ quantizeDataAndCreateFusedRowwiseQuantizedSparseLengthsWeightedSum(
   // scale/offset are fused inline with each row. Also, we expand the second
   // dimension to include space for the scale/offset, each 4 bytes
   // (float/int32_t).
-  Constant *rwqData = F->getParent()->createConstant(
-      ElemKind::UInt8FusedQTy, {fDims.first, fDims.second + 8}, 0.0, 0, "data");
-
-  quantization::tensorFusedRowwiseQuantization(fData,
-                                               rwqData->getPayloadMutable());
-  return F->createFusedRowwiseQuantizedSparseLengthsWeightedSum(
-      name, rwqData, weights, indices, lengths);
+  switch (precision) {
+  case ElemKind::UInt8FusedQTy: {
+    Constant *rwqData = F->getParent()->createConstant(
+        precision, {fDims.first, fDims.second + 2 * (dim_t)sizeof(float)}, 0.0,
+        0, "data");
+    quantization::tensorFusedRowwiseQuantization<float>(
+        fData, rwqData->getPayloadMutable());
+    return rwqData;
+  }
+  case ElemKind::UInt8FusedFP16QTy: {
+    Constant *rwqData = F->getParent()->createConstant(
+        precision, {fDims.first, fDims.second + 2 * (dim_t)sizeof(float16_t)},
+        0.0, 0, "data");
+    quantization::tensorFusedRowwiseQuantization<float16_t>(
+        fData, rwqData->getPayloadMutable());
+    return rwqData;
+  }
+  case ElemKind::UInt4FusedFP16QTy: {
+    // We pack 4-bit values into bytes, so given the input size in float we
+    // divide by two and take the ceiling to make sure we have enough space for
+    // all elements.
+    const dim_t outerDim =
+        std::ceil(((float)fDims.second) / 2) + 2 * sizeof(float16_t);
+    Constant *rwqData = F->getParent()->createConstant(
+        precision, {fDims.first, outerDim}, 0.0, 0, "data");
+    quantization::tensorFusedRowwiseQuantization<float16_t>(
+        fData, rwqData->getPayloadMutable());
+    return rwqData;
+  }
+  default:
+    llvm_unreachable("Invalid type for FusedRowwiswQuantization.");
+  }
 }
 
 FusedRowwiseQuantizedSparseLengthsWeightedSumNode *
 Function::createFusedRowwiseQuantizedSparseLengthsWeightedSum(
     llvm::StringRef name, Tensor &data, NodeValue weights, NodeValue indices,
-    NodeValue lengths) {
-  return quantizeDataAndCreateFusedRowwiseQuantizedSparseLengthsWeightedSum(
-      this, name, data, weights, indices, lengths);
+    NodeValue lengths, ElemKind fusedElemKind, bool useFP16Accumulation,
+    LengthsMode lengthsMode, float avgLength) {
+  Constant *rwqData =
+      quantizeDataForFusedRowwiseQuantizedSparseLengthsWeightedSum(
+          this, data, fusedElemKind);
+  return createFusedRowwiseQuantizedSparseLengthsWeightedSum(
+      name, rwqData, weights, indices, lengths, useFP16Accumulation,
+      lengthsMode, avgLength);
 }
 
-FusedRowwiseQuantizedSparseLengthsWeightedSumNode *
-Function::createFusedRowwiseQuantizedSparseLengthsSum(llvm::StringRef name,
-                                                      Tensor &data,
-                                                      NodeValue indices,
-                                                      NodeValue lengths) {
-  auto ty = getParent()->uniqueType(ElemKind::FloatTy, {indices.dims()[0]});
-  auto ones = createSplat(name.str() + ".ones", ty, 1.0);
-  return quantizeDataAndCreateFusedRowwiseQuantizedSparseLengthsWeightedSum(
-      this, name, data, ones, indices, lengths);
+FusedRowwiseQuantizedSparseLengthsSumNode *
+Function::createFusedRowwiseQuantizedSparseLengthsSum(
+    llvm::StringRef name, Tensor &data, NodeValue indices, NodeValue lengths,
+    ElemKind fusedElemKind, bool useFP16Accumulation, LengthsMode lengthsMode,
+    float avgLength) {
+  Constant *rwqData =
+      quantizeDataForFusedRowwiseQuantizedSparseLengthsWeightedSum(
+          this, data, fusedElemKind);
+  return this->createFusedRowwiseQuantizedSparseLengthsSum(
+      name, rwqData, indices, lengths, useFP16Accumulation, lengthsMode,
+      avgLength);
+}
+
+EmbeddingBagNode *
+Function::createEmbeddingBag(llvm::StringRef name, NodeValue data,
+                             NodeValue weights, NodeValue indices,
+                             NodeValue offsets, bool hasEndOffset,
+                             LengthsMode lengthsMode, float avgLength) {
+  auto inDims = data.dims();
+  ShapeVector outDims(inDims.begin(), inDims.end());
+  outDims[0] = hasEndOffset ? offsets.dims()[0] - 1 : offsets.dims()[0];
+  auto outTy = getParent()->uniqueTypeWithNewShape(data.getType(), outDims);
+  return addNode(new EmbeddingBagNode(name, outTy, data, weights, indices,
+                                      offsets, hasEndOffset, lengthsMode,
+                                      avgLength));
+}
+
+EmbeddingBagByteRowwiseOffsetsNode *
+Function::createEmbeddingBagByteRowwiseOffsets(
+    llvm::StringRef name, Tensor &data, NodeValue weights, NodeValue indices,
+    NodeValue offsets, ElemKind fusedElemKind, bool useFP16Accumulation,
+    bool hasEndOffset, LengthsMode lengthsMode, float avgLength) {
+  Constant *rwqData =
+      quantizeDataForFusedRowwiseQuantizedSparseLengthsWeightedSum(
+          this, data, fusedElemKind);
+  return createEmbeddingBagByteRowwiseOffsets(
+      name, rwqData, weights, indices, offsets, useFP16Accumulation,
+      hasEndOffset, lengthsMode, avgLength);
+}
+
+EmbeddingBagByteRowwiseOffsetsNode *
+Function::createEmbeddingBagByteRowwiseOffsets(
+    llvm::StringRef name, NodeValue data, NodeValue weights, NodeValue indices,
+    NodeValue offsets, bool useFP16Accumulation, bool hasEndOffset,
+    LengthsMode lengthsMode, float avgLength) {
+  std::vector<dim_t> segmentDims(offsets.dims().begin(), offsets.dims().end());
+  // If hasEndOffset the last offset is just for marking the end of the last
+  // segment.
+  if (hasEndOffset) {
+    segmentDims[0] -= 1;
+  }
+  auto outTy = getOutputTypeOfFusedRowwiseQuantizedSLS(this, data, segmentDims);
+  return addNode(new EmbeddingBagByteRowwiseOffsetsNode(
+      name, outTy, data, weights, indices, offsets, useFP16Accumulation,
+      hasEndOffset, lengthsMode, avgLength));
 }
 
 LengthsToRangesNode *Function::createLengthsToRanges(llvm::StringRef name,
@@ -1577,10 +2091,10 @@ SparseToDenseNode *Function::createSparseToDense(llvm::StringRef name,
 
 SparseToDenseMaskNode *Function::createSparseToDenseMask(
     llvm::StringRef name, NodeValue indices, NodeValue values,
-    NodeValue defaultValue, NodeValue lengths, llvm::ArrayRef<int64_t> mask) {
+    NodeValue defaultValue, NodeValue lengths, llvm::ArrayRef<dim_t> mask) {
   auto lengthsDims = lengths.dims();
   auto valueDims = defaultValue.dims();
-  ShapeVector outDims = {mask.size()};
+  ShapeVector outDims = {(dim_t)mask.size()};
   // If lengths is 0-dimensional tensor, then there is no batch dimension.
   if (lengthsDims.size() > 0) {
     outDims.insert(outDims.begin(), lengthsDims[0]);
@@ -1593,23 +2107,22 @@ SparseToDenseMaskNode *Function::createSparseToDenseMask(
 
 SaveNode *Function::createSave(llvm::StringRef name, NodeValue input) {
   auto *dest = getParent()->createPlaceholder(input.getType(), name, false);
-
-  return addNode(new SaveNode(name, input, dest));
+  return createSave(name, input, dest);
 }
 
 SaveNode *Function::createSave(llvm::StringRef name, NodeValue input,
-                               Placeholder *output) {
-  return addNode(new SaveNode(name, input, output));
+                               Placeholder *output, bool skipSuffix) {
+  return addNode(new SaveNode(skipSuffix ? name.str() : (name + "_save").str(),
+                              input, output));
 }
 
 QuantizationProfileNode *
 Function::createQuantizationProfile(PlaceholderBindings &bindings,
-                                    llvm::StringRef name, NodeValue input) {
-  // TODO: this size is going to be refined. Just a placeholder now.
-  const size_t numberOfBuckets = 2000U;
+                                    llvm::StringRef name, NodeValue input,
+                                    dim_t numHistogramBins) {
   auto *histogram = getParent()->createPlaceholder(
-      ElemKind::FloatTy, {numberOfBuckets}, "histogram_" + name.str(), false);
-  bindings.allocate(histogram);
+      ElemKind::FloatTy, {numHistogramBins}, "histogram_" + name.str(), false);
+  bindings.allocate(histogram)->zero();
   // Intermediate data used for histogram calculations.
   // Min tensor value seen so far is kept on the first position.
   // Max tensor value seen so far is kept on the second position.
@@ -1631,7 +2144,7 @@ Function::createIntLookupTable(llvm::StringRef name, NodeValue input,
                                llvm::ArrayRef<int8_t> initValues,
                                TypeRef outTy) {
   auto *mapping = getParent()->createConstant(
-      ElemKind::Int8QTy, {initValues.size()}, outTy->getScale(),
+      ElemKind::Int8QTy, {(dim_t)initValues.size()}, outTy->getScale(),
       outTy->getOffset(), "mapping");
   mapping->getHandle<int8_t>() = initValues;
 
@@ -1697,7 +2210,7 @@ IntLookupTableNode *Function::createIntSigmoid(llvm::StringRef name,
 }
 
 TopKNode *Function::createTopK(llvm::StringRef name, NodeValue input,
-                               unsigned_t k) {
+                               unsigned_t k, ElemKind outIndicesTyKind) {
   auto inDims = input.dims();
   assert(inDims.size() > 0);
   assert(k <= inDims.back());
@@ -1705,13 +2218,31 @@ TopKNode *Function::createTopK(llvm::StringRef name, NodeValue input,
   outDims.back() = k;
   auto OT = getParent()->uniqueTypeWithNewShape(input.getType(), outDims);
   return addNode(new TopKNode(
-      name, OT, getParent()->uniqueType(ElemKind::Int64ITy, outDims), input,
-      k));
+      name, OT, getParent()->uniqueType(outIndicesTyKind, outDims), input, k));
+}
+
+TopKNode *Function::createTopK(llvm::StringRef name, NodeValue input,
+                               unsigned_t k) {
+  return createTopK(name, input, k, ElemKind::Int64ITy);
+}
+
+ArgMaxNode *Function::createArgMax(llvm::StringRef name, NodeValue input,
+                                   unsigned_t axis, bool keepDims) {
+  auto inDims = input.dims();
+  ShapeVector newDims;
+  for (size_t i = 0, e = inDims.size(); i < e; i++) {
+    if (i == axis && !keepDims) {
+      continue;
+    } else {
+      newDims.push_back(i == axis ? 1 : inDims[i]);
+    }
+  }
+  auto TR = getParent()->uniqueType(ElemKind::Int64ITy, newDims);
+  return addNode(new ArgMaxNode(name, TR, input, axis, keepDims));
 }
 
 GatherNode *Function::createGather(llvm::StringRef name, NodeValue data,
                                    NodeValue indices, unsigned_t batchDims) {
-
   auto dDims = data.dims();
   auto iDims = indices.dims();
   assert(dDims.size() > batchDims);
@@ -1737,11 +2268,11 @@ GatherRangesNode *Function::createGatherRanges(llvm::StringRef name,
       ranges));
 }
 
-ScatterAssignNode *Function::createScatterAssign(llvm::StringRef name,
-                                                 NodeValue data,
-                                                 NodeValue indices,
-                                                 NodeValue slices) {
-  return addNode(new ScatterAssignNode(name, data, indices, slices));
+ScatterDataNode *Function::createScatterData(llvm::StringRef name,
+                                             NodeValue data, NodeValue indices,
+                                             NodeValue slices,
+                                             bool cumulative) {
+  return addNode(new ScatterDataNode(name, data, indices, slices, cumulative));
 }
 
 BatchOneHotNode *Function::createBatchOneHot(llvm::StringRef name,
@@ -1761,11 +2292,32 @@ SpaceToDepthNode *Function::createSpaceToDepth(llvm::StringRef name,
   assert(inputDim.size() == 4 && "Dimension size of 4 is expected.");
   assert((inputDim[1] % blockSize == 0 && inputDim[2] % blockSize == 0) &&
          "Height and Width needs to be multiple of blockSize.");
-  std::vector<size_t> newDim = {inputDim[0], inputDim[1] / blockSize,
-                                inputDim[2] / blockSize,
-                                inputDim[3] * blockSize * blockSize};
+  std::vector<dim_t> newDim = {inputDim[0], inputDim[1] / blockSize,
+                               inputDim[2] / blockSize,
+                               inputDim[3] * blockSize * blockSize};
   auto outTy = getParent()->uniqueTypeWithNewShape(input.getType(), newDim);
   return addNode(new SpaceToDepthNode(name, outTy, input, blockSize));
+}
+
+ResizeNearestNode *Function::createResizeNearest(llvm::StringRef name,
+                                                 NodeValue input,
+                                                 llvm::ArrayRef<float> scale) {
+  auto inputDim = input.dims();
+  DCHECK_EQ(inputDim.size(), scale.size())
+      << "Input Dimension size: " << inputDim.size()
+      << " Scale size: " << scale.size() << " should be same.";
+
+  std::vector<dim_t> newDim;
+
+  for (size_t i = 0; i < scale.size(); i++) {
+    auto newD = dim_t(std::floor(inputDim[i] * scale[i]));
+    DCHECK_GT(newD, 0) << "Scaled dim is " << newD
+                       << ", Scaled value needs to be larger than 0.";
+    newDim.push_back(newD);
+  }
+
+  auto outTy = getParent()->uniqueTypeWithNewShape(input.getType(), newDim);
+  return addNode(new ResizeNearestNode(name, outTy, input, scale));
 }
 
 QuantizeNode *Function::createQuantize(llvm::StringRef name, NodeValue input,
@@ -1859,68 +2411,24 @@ Node *Function::createBatchBoxCox(llvm::StringRef name, NodeValue data,
   assert((data.dims()[1] == lambda1.dims()[0]) &&
          "data, lambda1 and lambda2 must have the same number of rows");
 
-  // Broadcast lambda1 and lambda2 so that they are both the same size as the
-  // data.
-  auto *BL1 = createBroadcast(name.str() + ".broadcast", lambda1, data.dims(),
-                              /*axis=*/1);
-  auto *BL2 = createBroadcast(name.str() + ".broadcast", lambda2, data.dims(),
-                              /*axis=*/1);
-
-  // Broadcast is usually implemented via a Tile node returned from
-  // createBroadcast(). However, if the Broadcast was a noop then there is a
-  // Reshape instead of a Tile returned. Thus, get the index here to use based
-  // on the returned kinds from createBroadcast() above.
-  assert((llvm::isa<TileNode>(BL1) || llvm::isa<ReshapeNode>(BL1)) &&
-         "Broadcast is assumed to be either implemented via Tile or Reshape.");
-  TypeRef typeBL1 = llvm::isa<TileNode>(BL1)
-                        ? BL1->getType(TileNode::ResultIdx)
-                        : BL1->getType(ReshapeNode::ResultIdx);
-
-  // Add a small epsilon to lambda1 so that we can avoid dividing by zero
-  // later. It doesn't matter that this is technically incorrect because the
-  // final Select will discard the results of this computation.
-  auto *eps = createSplat(name.str() + ".eps", typeBL1, epsilon);
-  auto *EBL1 = createAdd(name.str() + ".lambda1eps", BL1, eps);
-
-  // Compute data + BL2, which is needed regardless of whether
-  // lambda1 is 0 or not.
-  auto *AN = createAdd(name.str() + ".add", data, BL2);
-
-  // Take the max of data + BL2 and 1e-6 to void exponentiating or taking the
-  // logarithm of too small a number.
-  auto *minArg =
-      createSplat(name.str() + ".logpowmin", AN->getResult().getType(), 1e-6);
-  auto *MN = createMax(name.str() + ".max", AN, minArg);
-
-  // Compute the Box-Cox transform for the lambda1 == 0 case:
-  //    y = ln(max(x + lambda2, 1e-6))
-
-  auto *LN = createLog(name.str() + ".log", MN);
-
-  // Compute the Box-Cox transform for the lambda1 != 0 case:
-  //    y = (max(x + lambda2, 1e-6)^lambda1 - 1)/lambda1
-  auto *PN = createPow(name.str() + ".pow", MN, BL1);
-  auto *ones =
-      createSplat(name.str() + ".ones", PN->getResult().getType(), 1.0f);
-  auto *SN = createSub(name.str() + ".sub", PN, ones);
-  // Divide by EBL1, not BL1 to avoid a divide-by-zero exception.
-  auto *DN = createDiv(name.str() + ".div", SN, EBL1);
-
-  // Compute predicates for selecting between the two cases above.
-  auto *zeroes = createSplat(name.str() + ".zeroes", typeBL1, 0.0f);
-  auto *predicate = createCmpEQ(name.str() + ".cmpeq", BL1, zeroes);
-
-  // Create Select to pick between the two Box-Cox cases.
-  return createSelect(name.str() + ".select", predicate, LN, DN);
+  return addNode(new BatchBoxCoxNode(name, data, lambda1, lambda2, epsilon));
 }
 
-Node *Function::createClip(llvm::StringRef name, NodeValue input, float min,
-                           float max) {
-  auto *minSplat = createSplat(name.str() + ".minSplat", input.getType(), min);
-  auto *minClipped = createMax(name.str() + ".minClip", input, minSplat);
-  auto *maxSplat = createSplat(name.str() + ".maxSplat", input.getType(), max);
-  auto result = createMin(name.str(), minClipped, maxSplat);
-  return result;
+ClipNode *Function::createClip(llvm::StringRef name, NodeValue input,
+                               TypeRef outTy, float min, float max) {
+  return addNode(new ClipNode(name, outTy, input, min, max));
+}
+
+ClipNode *Function::createClip(llvm::StringRef name, NodeValue input, float min,
+                               float max) {
+  return addNode(new ClipNode(name, input.getType(), input, min, max));
+}
+
+ClipNode *Function::createClipMinMaxFP16(llvm::StringRef name,
+                                         NodeValue input) {
+  constexpr float float16Min = -65504.0f;
+  constexpr float float16Max = 65504.0f;
+  return createClip(name, input, float16Min, float16Max);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1931,20 +2439,18 @@ BatchNormalizationNode *Function::createBatchNormalization(
     PlaceholderBindings &bindings, llvm::StringRef name, NodeValue input,
     unsigned_t channelIdx, float epsilon, float momentum) {
   // Figure out how many channels are in the tensor.
-  size_t channels = input.dims()[channelIdx];
+  dim_t channels = input.dims()[channelIdx];
 
   ElemKind inputTy = input.getType()->getElementType();
 
   // Allocate the learnable parameters beta and gamma.
   auto *beta =
       getParent()->createPlaceholder(inputTy, {channels}, "beta", true);
-  bindings.allocate(beta)->init(glow::Tensor::InitKind::Zero, 0, getPRNG());
+  bindings.allocate(beta)->init(Tensor::InitKind::Broadcast, 0.1, getPRNG());
 
-  auto *gamma =
-      getParent()->createPlaceholder(inputTy, {channels}, "gamma", true);
-
-  bindings.allocate(gamma)->init(glow::Tensor::InitKind::Broadcast, 1.0,
-                                 getPRNG());
+  auto *scale =
+      getParent()->createPlaceholder(inputTy, {channels}, "scale", true);
+  bindings.allocate(scale)->init(Tensor::InitKind::Broadcast, 0.001, getPRNG());
 
   auto *mean =
       getParent()->createPlaceholder(inputTy, {channels}, "mean", false);
@@ -1952,19 +2458,18 @@ BatchNormalizationNode *Function::createBatchNormalization(
 
   auto *variance =
       getParent()->createPlaceholder(inputTy, {channels}, "variance", false);
-  bindings.allocate(variance)->zero();
+  bindings.allocate(variance)->init(Tensor::InitKind::Broadcast, 1.0,
+                                    getPRNG());
 
-  return createBatchNormalization(name, input, beta, gamma, mean, variance,
+  return createBatchNormalization(name, input, beta, scale, mean, variance,
                                   channelIdx, epsilon, momentum);
 }
 
-ConvolutionNode *Function::createConv(PlaceholderBindings &bindings,
-                                      llvm::StringRef name, NodeValue input,
-                                      size_t outChannels,
-                                      llvm::ArrayRef<unsigned_t> kernels,
-                                      llvm::ArrayRef<unsigned_t> strides,
-                                      llvm::ArrayRef<unsigned_t> pads,
-                                      unsigned_t group, unsigned_t dilation) {
+ConvolutionNode *Function::createConv(
+    PlaceholderBindings &bindings, llvm::StringRef name, NodeValue input,
+    dim_t outChannels, llvm::ArrayRef<unsigned_t> kernels,
+    llvm::ArrayRef<unsigned_t> strides, llvm::ArrayRef<unsigned_t> pads,
+    unsigned_t group, unsigned_t dilation, ConvolutionLayout layout) {
   ShapeNHWC idim = ShapeNHWC(input.dims());
   ShapeHW kdim(kernels);
   PaddingTLBR pdim(pads);
@@ -1981,11 +2486,11 @@ ConvolutionNode *Function::createConv(PlaceholderBindings &bindings,
   auto outSz = calculateConvPoolOutputDims(idim.h, idim.w, kernels, strides,
                                            pads, dilation);
 
-  std::array<size_t, 4> outDims = {
+  std::array<dim_t, 4> outDims = {
       {idim.n, outSz.first, outSz.second, outChannels}};
 
   // Allocate the Filter and Bias tensors.
-  std::array<size_t, 4> filterDim = {
+  std::array<dim_t, 4> filterDim = {
       {outChannels, kdim.height, kdim.width, idim.c / group}};
   size_t fanIn = kdim.height * kdim.width * idim.c;
   ElemKind inputTy = input.getType()->getElementType();
@@ -2004,47 +2509,49 @@ ConvolutionNode *Function::createConv(PlaceholderBindings &bindings,
   auto OT = getParent()->uniqueType(inputTy, outDims);
 
   return addNode(new ConvolutionNode(name, OT, input, filter, bias, kernels,
-                                     strides, pads, group, dilation));
+                                     strides, pads, group, dilation, layout,
+                                     FusedActivation::NONE));
 }
 
 ConvolutionNode *Function::createConv(PlaceholderBindings &bindings,
                                       llvm::StringRef name, NodeValue input,
-                                      size_t outChannels, unsigned_t kernel,
+                                      dim_t outChannels, unsigned_t kernel,
                                       unsigned_t stride, unsigned_t pad,
-                                      unsigned_t group, unsigned_t dilation) {
+                                      unsigned_t group, unsigned_t dilation,
+                                      ConvolutionLayout layout) {
   llvm::SmallVector<unsigned_t, 4> pads = {pad, pad, pad, pad};
   llvm::SmallVector<unsigned_t, 2> strides = {stride, stride};
   llvm::SmallVector<unsigned_t, 2> kernels = {kernel, kernel};
   return createConv(bindings, name, input, outChannels, kernels, strides, pads,
-                    group, dilation);
+                    group, dilation, layout);
 }
 
 Convolution3DNode *Function::createConv3D(PlaceholderBindings &bindings,
                                           llvm::StringRef name, NodeValue input,
-                                          size_t outChannels,
+                                          dim_t outChannels,
                                           llvm::ArrayRef<unsigned_t> kernels,
                                           llvm::ArrayRef<unsigned_t> strides,
                                           llvm::ArrayRef<unsigned_t> pads,
                                           unsigned_t group) {
-  ShapeNHWDC idim(input.dims());
-  ShapeHWD kdim(kernels);
+  ShapeNTHWC idim(input.dims());
+  ShapeTHW kdim(kernels);
 
   assert(group > 0 && "group should be larger than 0");
   assert(idim.c % group == 0 && "channels number must be divisible by groups");
   assert(outChannels % group == 0 && "outChannels must be divisible by groups");
 
   // Calculate the size and allocate the output buffer.
-  auto outSz = calculate3DConvPoolOutputDims(idim.h, idim.w, idim.d, kernels,
+  auto outSz = calculate3DConvPoolOutputDims(idim.t, idim.h, idim.w, kernels,
                                              strides, pads);
 
-  std::array<size_t, 5> outDims = {
-      {idim.n, outSz.height, outSz.width, outSz.depth, outChannels}};
+  std::array<dim_t, 5> outDims = {
+      {idim.n, outSz.temporal_frames, outSz.height, outSz.width, outChannels}};
 
   // Allocate the Filter and Bias tensors.
-  std::array<size_t, 5> filterDim = {
-      {outChannels, kdim.height, kdim.width, kdim.depth, idim.c / group}};
+  std::array<dim_t, 5> filterDim = {{outChannels, kdim.temporal_frames,
+                                     kdim.height, kdim.width, idim.c / group}};
 
-  size_t fanIn = kdim.height * kdim.width * kdim.depth * idim.c;
+  dim_t fanIn = kdim.temporal_frames * kdim.height * kdim.width * idim.c;
   ElemKind inputTy = input.getType()->getElementType();
   assert((inputTy == ElemKind::FloatTy || inputTy == ElemKind::Float16Ty) &&
          "Convolution3D on non-floating point type?");
@@ -2079,15 +2586,132 @@ Convolution3DNode *Function::createConv3D(PlaceholderBindings &bindings,
 }
 
 ChannelwiseQuantizedConvolutionNode *Function::createChannelwiseQuantizedConv(
-    llvm::StringRef name, NodeValue input, Constant *filter, Constant *bias,
-    Constant *scales, Constant *offsets, TypeRef outTy,
+    llvm::StringRef name, NodeValue input, NodeValue filter, NodeValue bias,
+    NodeValue scales, NodeValue offsets, TypeRef outTy,
     llvm::ArrayRef<unsigned_t> kernels, llvm::ArrayRef<unsigned_t> strides,
     llvm::ArrayRef<unsigned_t> pads, unsigned_t group) {
   assertConvDims(input, filter, bias, kernels, strides, pads, group);
   auto OT = getParent()->uniqueType(*outTy);
+  auto biasElemKind = bias.getElementType();
+
+  if (biasElemKind != ElemKind::Int32QTy && biasElemKind != ElemKind::FloatTy) {
+    LOG(DFATAL)
+        << "Unsupported element type for ChannelwiseQuantizedConvolution bias: "
+        << Type::getElementName(biasElemKind).str();
+  }
+
+  DCHECK(dyn_cast<Constant>(bias.getNode()))
+      << "bias input to ChannelwiseQuantizedConvolutionNode must be a Constant";
+
+  DCHECK(dyn_cast<Constant>(filter.getNode()))
+      << "filter input to ChannelwiseQuantizedConvolutionNode must be a "
+         "Constant";
+
+  DCHECK(dyn_cast<Constant>(scales.getNode()))
+      << "scales input to ChannelwiseQuantizedConvolutionNode must a Constant "
+         "in order to quantize the bias";
+
+  DCHECK(dyn_cast<Constant>(offsets.getNode()))
+      << "offsets input to ChannelwiseQuantizedConvolutionNode must be a"
+         "Constant";
+
   return addNode(new ChannelwiseQuantizedConvolutionNode(
       name, OT, input, filter, bias, scales, offsets, kernels, strides, pads,
-      group, /*Groupwise*/ true));
+      group));
+}
+
+ChannelwiseQuantizedConvolutionNode *Function::createChannelwiseQuantizedConv3D(
+    llvm::StringRef name, NodeValue input, NodeValue filter, NodeValue bias,
+    NodeValue scales, NodeValue offsets, TypeRef outTy,
+    llvm::ArrayRef<unsigned_t> kernels, llvm::ArrayRef<unsigned_t> strides,
+    llvm::ArrayRef<unsigned_t> pads, unsigned_t group) {
+  assertConv3DDims(input, filter, bias, kernels, strides, pads, group);
+  auto OT = getParent()->uniqueType(*outTy);
+  auto biasElemKind = bias.getElementType();
+
+  if (biasElemKind != ElemKind::Int32QTy && biasElemKind != ElemKind::FloatTy) {
+    LOG(DFATAL)
+        << "Unsupported element type for ChannelwiseQuantizedConvolution bias: "
+        << Type::getElementName(biasElemKind).str();
+  }
+
+  DCHECK(dyn_cast<Constant>(bias.getNode()))
+      << "bias input to ChannelwiseQuantizedConvolutionNode must be a Constant";
+
+  DCHECK(dyn_cast<Constant>(filter.getNode()))
+      << "filter input to ChannelwiseQuantizedConvolutionNode must be a "
+         "Constant";
+
+  DCHECK(dyn_cast<Constant>(scales.getNode()))
+      << "scales input to ChannelwiseQuantizedConvolutionNode must a Constant "
+         "in order to quantize the bias";
+
+  DCHECK(dyn_cast<Constant>(offsets.getNode()))
+      << "offsets input to ChannelwiseQuantizedConvolutionNode must be a"
+         "Constant";
+
+  return addNode(new ChannelwiseQuantizedConvolutionNode(
+      name, OT, input, filter, bias, scales, offsets, kernels, strides, pads,
+      group));
+}
+
+ConvTransposeNode *Function::createConvTranspose(
+    PlaceholderBindings &bindings, llvm::StringRef name, NodeValue input,
+    dim_t outChannels, llvm::ArrayRef<unsigned_t> kernels,
+    llvm::ArrayRef<unsigned_t> strides, llvm::ArrayRef<unsigned_t> pads,
+    unsigned_t group, unsigned_t dilation) {
+  ShapeNHWC idim = ShapeNHWC(input.dims());
+  ShapeHW kdim(kernels);
+  PaddingTLBR pdim(pads);
+  (void)pdim;
+  assert((idim.w + pdim.left + pdim.right) >= kdim.width &&
+         (idim.h + pdim.top + pdim.bottom) >= kdim.height &&
+         "buffer too small for selected stride");
+
+  assert(group > 0 && "group should be larger than 0");
+  assert(idim.c % group == 0 && "channels number must be divisible by groups");
+  assert(outChannels % group == 0 && "outChannels must be divisible by groups");
+
+  // Calculate the size and allocate the output buffer.
+  auto outSz = calculateConvTransposeOutputDims(idim.h, idim.w, kernels,
+                                                strides, pads, dilation);
+
+  std::array<dim_t, 4> outDims = {
+      {idim.n, outSz.first, outSz.second, outChannels}};
+
+  // Allocate the Filter and Bias tensors.
+  std::array<dim_t, 4> filterDim = {
+      {outChannels, kdim.height, kdim.width, idim.c / group}};
+  size_t fanIn = kdim.height * kdim.width * idim.c;
+  ElemKind inputTy = input.getType()->getElementType();
+  assert((inputTy == ElemKind::FloatTy || inputTy == ElemKind::Float16Ty) &&
+         "Convolution on non-floating point type?");
+  auto *filter =
+      getParent()->createPlaceholder(inputTy, filterDim, "filter", true);
+
+  auto *bias =
+      getParent()->createPlaceholder(inputTy, {outChannels}, "bias", true);
+  bindings.allocate(bias)->init(glow::Tensor::InitKind::Broadcast, 0.1,
+                                getPRNG());
+
+  bindings.allocate(filter)->init(glow::Tensor::InitKind::Xavier, fanIn,
+                                  getPRNG());
+
+  auto OT = getParent()->uniqueType(inputTy, outDims);
+
+  return addNode(new ConvTransposeNode(name, OT, input, filter, bias, kernels,
+                                       strides, pads, group, dilation));
+}
+
+ConvTransposeNode *Function::createConvTranspose(
+    PlaceholderBindings &bindings, llvm::StringRef name, NodeValue input,
+    dim_t outChannels, unsigned_t kernel, unsigned_t stride, unsigned_t pad,
+    unsigned_t group, unsigned_t dilation) {
+  llvm::SmallVector<unsigned_t, 4> pads = {pad, pad, pad, pad};
+  llvm::SmallVector<unsigned_t, 2> strides = {stride, stride};
+  llvm::SmallVector<unsigned_t, 2> kernels = {kernel, kernel};
+  return createConvTranspose(bindings, name, input, outChannels, kernels,
+                             strides, pads, group, dilation);
 }
 
 ConvertToNode *Function::createConvertTo(llvm::StringRef name, NodeValue input,
@@ -2095,10 +2719,16 @@ ConvertToNode *Function::createConvertTo(llvm::StringRef name, NodeValue input,
   return addNode(new ConvertToNode(name, outTy, input));
 }
 
+ConvertToNode *Function::createConvertTo(llvm::StringRef name, NodeValue input,
+                                         ElemKind k) {
+  auto OT = getParent()->uniqueType(k, input.dims());
+  return addNode(new ConvertToNode(name, OT, input));
+}
+
 FullyConnectedNode *
 Function::createFullyConnected(PlaceholderBindings &bindings,
                                llvm::StringRef name, NodeValue input,
-                               size_t outDepth, unsigned_t axis) {
+                               dim_t outDepth, unsigned_t axis) {
   const ElemKind k = input.getType()->getElementType();
 
   // FC always uses 2D input; flatten if necessary.
@@ -2135,6 +2765,18 @@ Node *Function::createDotProduct(llvm::StringRef name, NodeValue X,
 
   // Create and return BatchedReduceAdd node.
   return createBatchedReduceAdd(name.str() + ".bra", MN, 1);
+}
+
+BatchedPairwiseDotProductNode *
+Function::createBatchedPairwiseDotProduct(llvm::StringRef name,
+                                          llvm::ArrayRef<NodeValue> inputs) {
+  assert(!inputs.empty());
+  dim_t batchCount = inputs[0].getType()->dims()[0];
+  dim_t numPairs = inputs.size() * (inputs.size() - 1) / 2;
+  auto *outTy = getParent()->uniqueTypeWithNewShape(inputs[0].getType(),
+                                                    {batchCount, numPairs});
+
+  return addNode(new BatchedPairwiseDotProductNode(name, outTy, inputs));
 }
 
 Node *Function::createElementwiseLinear(llvm::StringRef name, NodeValue X,
@@ -2564,11 +3206,1189 @@ void Function::createLSTM(PlaceholderBindings &bindings,
   }
 };
 
+void Function::createOnnxRNN(llvm::StringRef namePrefix, NodeValue X,
+                             NodeValue W, NodeValue R, NodeValue B,
+                             NodeValue initial_h, NodeValue &Y, NodeValue &Y_h,
+                             unsigned hiddenSize, RnnDirection direction,
+                             std::vector<RnnActivation> &activations) {
+
+#define RNN_X_SLICE_RANGE(idx)                                                 \
+  {idx + 0, 0, 0}, { idx + 1, batchSize, inputSize }
+#define RNN_W_SLICE_RANGE(idx0, idx1)                                          \
+  {idx0, idx1 * hiddenSize, 0}, { idx0 + 1, (idx1 + 1) * hiddenSize, inputSize }
+#define RNN_R_SLICE_RANGE(idx0, idx1)                                          \
+  {idx0, idx1 * hiddenSize, 0}, {                                              \
+    idx0 + 1, (idx1 + 1) * hiddenSize, hiddenSize                              \
+  }
+#define RNN_B_SLICE_RANGE(idx0, idx1)                                          \
+  {idx0, idx1 * hiddenSize}, { idx0 + 1, (idx1 + 1) * hiddenSize }
+#define RNN_H_SLICE_RANGE(idx)                                                 \
+  {idx + 0, 0, 0}, { idx + 1, batchSize, hiddenSize }
+#define RNN_CREATE_FC(name, LHS, RHS, BIAS)                                    \
+  BIAS ? (Node *)createFullyConnected(name, LHS, RHS, BIAS)                    \
+       : (Node *)createMatMul(name, LHS, RHS)
+
+  // Operator name.
+  const std::string &opName = namePrefix.str();
+
+  // Get all size parameters.
+  dim_t numDirections = (direction == RnnDirection::Bidirectional) ? 2 : 1;
+  assert(X.dims().size() == 3 &&
+         "ONNX RNN input 'X' should have 3 dimensions!");
+  dim_t seqLength = X.dims()[0];
+  dim_t batchSize = X.dims()[1];
+  dim_t inputSize = X.dims()[2];
+
+  // Validate W size.
+  assert(W.dims().size() == 3 &&
+         "ONNX RNN input 'W' should have 3 dimensions!");
+  assert(W.dims()[0] == numDirections && W.dims()[1] == hiddenSize &&
+         W.dims()[2] == inputSize && "ONNX RNN 'W' tensor size invalid!");
+
+  // Validate R size.
+  assert(R.dims().size() == 3 &&
+         "ONNX RNN input 'R' should have 3 dimensions!");
+  assert(R.dims()[0] == numDirections && R.dims()[1] == hiddenSize &&
+         R.dims()[2] == hiddenSize && "ONNX RNN 'R' tensor size invalid!");
+
+  // Validate B size.
+  if (B.getNode()) {
+    assert(B.dims().size() == 2 &&
+           "ONNX RNN input 'B' should have 2 dimensions!");
+    assert(B.dims()[0] == numDirections && B.dims()[1] == 2 * hiddenSize &&
+           "ONNX RNN 'B' tensor size invalid!");
+  }
+
+  // Validate initial_h size.
+  assert(initial_h.getNode() &&
+         "ONNX RNN input 'initial_h' is mandatory. Null provided!");
+  assert(initial_h.dims().size() == 3 &&
+         "ONNX RNN input 'initial_h' should have 2 dimensions!");
+  assert(initial_h.dims()[0] == numDirections &&
+         initial_h.dims()[1] == batchSize &&
+         initial_h.dims()[2] == hiddenSize &&
+         "ONNX RNN 'initial_h' tensor size invalid!");
+
+  // Validate number of activations.
+  assert(activations.size() == numDirections * 1 &&
+         "ONNX RNN activations vector invalid!");
+
+  // Create X slices.
+  std::vector<Node *> Xslices;
+  for (dim_t t = 0; t < seqLength; t++) {
+    auto XsliceName = opName + ".X" + std::to_string(t) + ".slice";
+    Node *Xt = createSlice(XsliceName, X, RNN_X_SLICE_RANGE(t));
+    auto XreshapeName = opName + ".X" + std::to_string(t) + ".reshape";
+    Xt = createReshape(XreshapeName, Xt, {batchSize, inputSize});
+    Xslices.push_back(Xt);
+  }
+
+  // Lambda to load forward/backward RNN cell.
+  auto loadRNNCell = [&](bool forward, std::vector<NodeValue> &Yslices,
+                         NodeValue &Hslice) {
+    // Name prefix.
+    std::string dirLabel = forward ? ".fw" : ".bw";
+    std::string prefix = opName + ((numDirections > 1) ? dirLabel : "");
+
+    // Slice index used for creating weights slices.
+    dim_t sliceIdx0 = 0;
+    if (direction == RnnDirection::Bidirectional) {
+      sliceIdx0 = forward ? 0 : 1;
+    }
+
+    // Activations.
+    size_t activationOffset = sliceIdx0 * 1;
+    auto activationF = activations[activationOffset + 0];
+
+    // Create W slice (Required).
+    NodeValue Wi =
+        createSlice(prefix + ".Wi.", W, RNN_W_SLICE_RANGE(sliceIdx0, 0));
+    Wi = createReshape(prefix + ".Wi.reshape", Wi, {hiddenSize, inputSize});
+    Wi = createTranspose(prefix + ".Wi.transp", Wi, {1, 0});
+
+    // Create R slice (Required).
+    NodeValue Ri =
+        createSlice(prefix + ".Ri.", R, RNN_R_SLICE_RANGE(sliceIdx0, 0));
+    Ri = createReshape(prefix + ".Ri.reshape", Ri, {hiddenSize, hiddenSize});
+    Ri = createTranspose(prefix + ".Ri.transp", Ri, {1, 0});
+
+    // Create B slices (optional).
+    NodeValue bWi = nullptr;
+    NodeValue bRi = nullptr;
+
+    if (B) {
+
+      bWi = createSlice(prefix + ".bWi.", B, RNN_B_SLICE_RANGE(sliceIdx0, 0));
+      bRi = createSlice(prefix + ".bRi.", B, RNN_B_SLICE_RANGE(sliceIdx0, 1));
+
+      bWi = createReshape(prefix + ".bWi.reshape", bWi, {hiddenSize});
+      bRi = createReshape(prefix + ".bRi.reshape", bRi, {hiddenSize});
+    }
+
+    // Create H slice for this direction.
+    Node *Hinit = createSlice(prefix + ".H.slice", initial_h,
+                              RNN_H_SLICE_RANGE(sliceIdx0));
+    Hinit =
+        createReshape(prefix + ".H.reshape", Hinit, {batchSize, hiddenSize});
+
+    // Initialize.
+    Node *Ht = Hinit;
+
+    // Unroll RNN cell for all time steps.
+    for (size_t t = 0; t < seqLength; t++) {
+
+      // Input for current time step.
+      // For the reverse RNN cell the inputs are provided in reverse order.
+      Node *Xt = forward ? Xslices[t] : Xslices[seqLength - 1 - t];
+
+      // Hidden state update: Ht = f(Xt * Wi + bWi + Ht-1 * Ri + bRi).
+      Ht = createAdd(prefix + ".H.add",
+                     RNN_CREATE_FC(prefix + ".H.fc1", Xt, Wi, bWi),
+                     RNN_CREATE_FC(prefix + ".H.fc2", Ht, Ri, bRi));
+      Ht = activationF(prefix + ".H.act", Ht);
+
+      // Output.
+      Yslices.push_back(Ht);
+    }
+
+    // Updated states nodes.
+    Hslice = Ht;
+  }; // End of local lambda "loadRNNCell".
+
+  bool forwardEnabled = ((direction == RnnDirection::Forward) ||
+                         (direction == RnnDirection::Bidirectional));
+  bool backwardEnabled = ((direction == RnnDirection::Reverse) ||
+                          (direction == RnnDirection::Bidirectional));
+
+  std::vector<NodeValue> YSlices;
+  std::vector<NodeValue> Hslices;
+
+  // Load forward RNN.
+  std::vector<NodeValue> forwardYslices;
+  if (forwardEnabled) {
+    NodeValue forwardHslice;
+    loadRNNCell(/* forward */ true, forwardYslices, forwardHslice);
+    Hslices.push_back(forwardHslice);
+  }
+
+  // Load backward RNN.
+  std::vector<NodeValue> backwardYslices;
+  if (backwardEnabled) {
+    NodeValue backwardHslice;
+    loadRNNCell(/* forward */ false, backwardYslices, backwardHslice);
+    Hslices.push_back(backwardHslice);
+  }
+
+  // Gather Y slices.
+  for (size_t t = 0; t < seqLength; t++) {
+    if (forwardEnabled) {
+      YSlices.push_back(forwardYslices[t]);
+    }
+    if (backwardEnabled) {
+      YSlices.push_back(backwardYslices[seqLength - 1 - t]);
+    }
+  }
+
+  // Concatenate Y slices.
+  // Y size is [seqLength, numDirections, batchSize, hiddenSize].
+  Y = createReshape(opName + ".Y.reshape",
+                    createConcat(opName + ".Y.concat", YSlices, 0),
+                    {seqLength, numDirections, batchSize, hiddenSize});
+
+  // Concatenate Y_h slices.
+  // Y_h size is [numDirections, batchSize, hiddenSize].
+  Y_h = createReshape(opName + ".Y_h.reshape",
+                      createConcat(opName + ".Y_h.concat", Hslices, 0),
+                      {numDirections, batchSize, hiddenSize});
+
+#undef RNN_X_SLICE_RANGE
+#undef RNN_W_SLICE_RANGE
+#undef RNN_R_SLICE_RANGE
+#undef RNN_B_SLICE_RANGE
+#undef RNN_H_SLICE_RANGE
+#undef RNN_CREATE_FC
+}
+
+void Function::createOnnxGRU(llvm::StringRef namePrefix, NodeValue X,
+                             NodeValue W, NodeValue R, NodeValue B,
+                             NodeValue initial_h, NodeValue &Y, NodeValue &Y_h,
+                             unsigned hiddenSize, RnnDirection direction,
+                             std::vector<RnnActivation> &activations,
+                             bool linearBeforeReset) {
+
+#define GRU_X_SLICE_RANGE(idx)                                                 \
+  {idx + 0, 0, 0}, { idx + 1, batchSize, inputSize }
+#define GRU_W_SLICE_RANGE(idx0, idx1)                                          \
+  {idx0, idx1 * hiddenSize, 0}, { idx0 + 1, (idx1 + 1) * hiddenSize, inputSize }
+#define GRU_R_SLICE_RANGE(idx0, idx1)                                          \
+  {idx0, idx1 * hiddenSize, 0}, {                                              \
+    idx0 + 1, (idx1 + 1) * hiddenSize, hiddenSize                              \
+  }
+#define GRU_B_SLICE_RANGE(idx0, idx1)                                          \
+  {idx0, idx1 * hiddenSize}, { idx0 + 1, (idx1 + 1) * hiddenSize }
+#define GRU_H_SLICE_RANGE(idx)                                                 \
+  {idx + 0, 0, 0}, { idx + 1, batchSize, hiddenSize }
+#define GRU_CREATE_FC(name, LHS, RHS, BIAS)                                    \
+  BIAS ? (Node *)createFullyConnected(name, LHS, RHS, BIAS)                    \
+       : (Node *)createMatMul(name, LHS, RHS)
+
+  // Operator name.
+  const std::string &opName = namePrefix.str();
+
+  // Get all size parameters.
+  dim_t numDirections = (direction == RnnDirection::Bidirectional) ? 2 : 1;
+  assert(X.dims().size() == 3 &&
+         "ONNX GRU input 'X' should have 3 dimensions!");
+  dim_t seqLength = X.dims()[0];
+  dim_t batchSize = X.dims()[1];
+  dim_t inputSize = X.dims()[2];
+
+  // Validate W size.
+  assert(W.dims().size() == 3 &&
+         "ONNX GRU input 'W' should have 3 dimensions!");
+  assert(W.dims()[0] == numDirections && W.dims()[1] == 3 * hiddenSize &&
+         W.dims()[2] == inputSize && "ONNX GRU 'W' tensor size invalid!");
+
+  // Validate R size.
+  assert(R.dims().size() == 3 &&
+         "ONNX GRU input 'R' should have 3 dimensions!");
+  assert(R.dims()[0] == numDirections && R.dims()[1] == 3 * hiddenSize &&
+         R.dims()[2] == hiddenSize && "ONNX GRU 'R' tensor size invalid!");
+
+  // Validate B size.
+  if (B.getNode()) {
+    assert(B.dims().size() == 2 &&
+           "ONNX GRU input 'B' should have 2 dimensions!");
+    assert(B.dims()[0] == numDirections && B.dims()[1] == 6 * hiddenSize &&
+           "ONNX GRU 'B' tensor size invalid!");
+  }
+
+  // Validate initial_h size.
+  assert(initial_h.getNode() &&
+         "ONNX GRU input 'initial_h' is mandatory. Null provided!");
+  assert(initial_h.dims().size() == 3 &&
+         "ONNX GRU input 'initial_h' should have 2 dimensions!");
+  assert(initial_h.dims()[0] == numDirections &&
+         initial_h.dims()[1] == batchSize &&
+         initial_h.dims()[2] == hiddenSize &&
+         "ONNX GRU 'initial_h' tensor size invalid!");
+
+  // Validate number of activations.
+  assert(activations.size() == numDirections * 2 &&
+         "ONNX GRU activations vector invalid!");
+
+  // Create X slices.
+  std::vector<Node *> Xslices;
+  for (dim_t t = 0; t < seqLength; t++) {
+    auto XsliceName = opName + ".X" + std::to_string(t) + ".slice";
+    Node *Xt = createSlice(XsliceName, X, GRU_X_SLICE_RANGE(t));
+    auto XreshapeName = opName + ".X" + std::to_string(t) + ".reshape";
+    Xt = createReshape(XreshapeName, Xt, {batchSize, inputSize});
+    Xslices.push_back(Xt);
+  }
+
+  // Lambda to load forward/backward GRU cell.
+  auto loadGRUCell = [&](bool forward, std::vector<NodeValue> &Yslices,
+                         NodeValue &Hslice) {
+    // Name prefix.
+    std::string dirLabel = forward ? ".fw" : ".bw";
+    std::string prefix = opName + ((numDirections > 1) ? dirLabel : "");
+
+    // Slice index used for creating weights slices.
+    dim_t sliceIdx0 = 0;
+    if (direction == RnnDirection::Bidirectional) {
+      sliceIdx0 = forward ? 0 : 1;
+    }
+
+    // Activations.
+    size_t activationOffset = sliceIdx0 * 2;
+    auto activationF = activations[activationOffset + 0];
+    auto activationG = activations[activationOffset + 1];
+
+    // Create W slices (Required).
+    NodeValue Wz =
+        createSlice(prefix + ".Wz.", W, GRU_W_SLICE_RANGE(sliceIdx0, 0));
+    NodeValue Wr =
+        createSlice(prefix + ".Wr.", W, GRU_W_SLICE_RANGE(sliceIdx0, 1));
+    NodeValue Wh =
+        createSlice(prefix + ".Wh.", W, GRU_W_SLICE_RANGE(sliceIdx0, 2));
+
+    Wz = createReshape(prefix + ".Wz.reshape", Wz, {hiddenSize, inputSize});
+    Wr = createReshape(prefix + ".Wr.reshape", Wr, {hiddenSize, inputSize});
+    Wh = createReshape(prefix + ".Wh.reshape", Wh, {hiddenSize, inputSize});
+
+    Wz = createTranspose(prefix + ".Wz.transp", Wz, {1, 0});
+    Wr = createTranspose(prefix + ".Wr.transp", Wr, {1, 0});
+    Wh = createTranspose(prefix + ".Wh.transp", Wh, {1, 0});
+
+    // Create R slices (Required).
+    NodeValue Rz =
+        createSlice(prefix + ".Rz.", R, GRU_R_SLICE_RANGE(sliceIdx0, 0));
+    NodeValue Rr =
+        createSlice(prefix + ".Rr.", R, GRU_R_SLICE_RANGE(sliceIdx0, 1));
+    NodeValue Rh =
+        createSlice(prefix + ".Rh.", R, GRU_R_SLICE_RANGE(sliceIdx0, 2));
+
+    Rz = createReshape(prefix + ".Rz.reshape", Rz, {hiddenSize, hiddenSize});
+    Rr = createReshape(prefix + ".Rr.reshape", Rr, {hiddenSize, hiddenSize});
+    Rh = createReshape(prefix + ".Rh.reshape", Rh, {hiddenSize, hiddenSize});
+
+    Rz = createTranspose(prefix + ".Rz.transp", Rz, {1, 0});
+    Rr = createTranspose(prefix + ".Rr.transp", Rr, {1, 0});
+    Rh = createTranspose(prefix + ".Rh.transp", Rh, {1, 0});
+
+    // Create B slices (optional).
+    NodeValue bWz = nullptr;
+    NodeValue bWr = nullptr;
+    NodeValue bWh = nullptr;
+    NodeValue bRz = nullptr;
+    NodeValue bRr = nullptr;
+    NodeValue bRh = nullptr;
+
+    if (B) {
+
+      bWz = createSlice(prefix + ".bWz.", B, GRU_B_SLICE_RANGE(sliceIdx0, 0));
+      bWr = createSlice(prefix + ".bWr.", B, GRU_B_SLICE_RANGE(sliceIdx0, 1));
+      bWh = createSlice(prefix + ".bWh.", B, GRU_B_SLICE_RANGE(sliceIdx0, 2));
+      bRz = createSlice(prefix + ".bRz.", B, GRU_B_SLICE_RANGE(sliceIdx0, 3));
+      bRr = createSlice(prefix + ".bRr.", B, GRU_B_SLICE_RANGE(sliceIdx0, 4));
+      bRh = createSlice(prefix + ".bRh.", B, GRU_B_SLICE_RANGE(sliceIdx0, 5));
+
+      bWz = createReshape(prefix + ".bWz.reshape", bWz, {hiddenSize});
+      bWr = createReshape(prefix + ".bWr.reshape", bWr, {hiddenSize});
+      bWh = createReshape(prefix + ".bWh.reshape", bWh, {hiddenSize});
+      bRz = createReshape(prefix + ".bRz.reshape", bRz, {hiddenSize});
+      bRr = createReshape(prefix + ".bRr.reshape", bRr, {hiddenSize});
+      bRh = createReshape(prefix + ".bRh.reshape", bRh, {hiddenSize});
+    }
+
+    // Create H slice for this direction.
+    Node *Hinit = createSlice(prefix + ".H.slice", initial_h,
+                              GRU_H_SLICE_RANGE(sliceIdx0));
+    Hinit =
+        createReshape(prefix + ".H.reshape", Hinit, {batchSize, hiddenSize});
+
+    // Initialize.
+    Node *Ht = Hinit;
+
+    // Unroll GRU cell for all time steps.
+    for (size_t t = 0; t < seqLength; t++) {
+
+      // Input for current time step.
+      // For the reverse GRU cell the inputs are provided in reverse order.
+      Node *Xt = forward ? Xslices[t] : Xslices[seqLength - 1 - t];
+
+      // Update gate: zt = f(Xt * Wz + bWz + Ht-1 * Rz + bRz).
+      Node *zt = createAdd(prefix + ".Z.add1",
+                           GRU_CREATE_FC(prefix + ".Z.fc1", Xt, Wz, bWz),
+                           GRU_CREATE_FC(prefix + ".Z.fc2", Ht, Rz, bRz));
+      zt = activationF(prefix + ".Z.act", zt);
+
+      // Reset gate: rt = f(Xt * Wr + bWr + Ht-1 * Rr + bRr).
+      Node *rt = createAdd(prefix + ".R.add1",
+                           GRU_CREATE_FC(prefix + ".R.fc1", Xt, Wr, bWr),
+                           GRU_CREATE_FC(prefix + ".R.fc2", Ht, Rr, bRr));
+      rt = activationF(prefix + ".R.act", rt);
+
+      // Hidden gate:
+      // For linearBeforeReset = true:
+      //   htild = g(Xt * Wh + bWh + rt . (Ht-1 * Rh + bRh)).
+      // For linearBeforeReset = false:
+      //   htild = g(Xt * Wh + bWh + (rt . Ht-1) * Rh + bRh).
+      Node *htild;
+      if (linearBeforeReset) {
+        htild = createAdd(
+            prefix + ".Htild.add",
+            GRU_CREATE_FC(prefix + ".Htild.fc1", Xt, Wh, bWh),
+            createMul(prefix + ".Htild.reset", rt,
+                      GRU_CREATE_FC(prefix + ".Htild.fc2", Ht, Rh, bRh)));
+      } else {
+        htild = createAdd(
+            prefix + ".Htild.add",
+            GRU_CREATE_FC(prefix + ".Htild.fc1", Xt, Wh, bWh),
+            GRU_CREATE_FC(prefix + ".Htild.fc2",
+                          createMul(prefix + ".Htild.reset", rt, Ht), Rh, bRh));
+      }
+      htild = activationG(prefix + ".Htild.act", htild);
+
+      // Hidden state update:
+      // Ht = (1 - zt) . htild + zt . Ht-1 = htild - zt . htild + zt . Ht-1.
+      Ht = createAdd(prefix + ".H.add",
+                     createSub(prefix + ".H.sub", htild,
+                               createMul(prefix + ".H.mult1", zt, htild)),
+                     createMul(prefix + ".H.mult2", zt, Ht));
+
+      // Output.
+      Yslices.push_back(Ht);
+    }
+
+    // Updated states nodes.
+    Hslice = Ht;
+  }; // End of local lambda "loadGRUCell".
+
+  bool forwardEnabled = ((direction == RnnDirection::Forward) ||
+                         (direction == RnnDirection::Bidirectional));
+  bool backwardEnabled = ((direction == RnnDirection::Reverse) ||
+                          (direction == RnnDirection::Bidirectional));
+
+  std::vector<NodeValue> YSlices;
+  std::vector<NodeValue> Hslices;
+
+  // Load forward GRU.
+  std::vector<NodeValue> forwardYslices;
+  if (forwardEnabled) {
+    NodeValue forwardHslice;
+    loadGRUCell(/* forward */ true, forwardYslices, forwardHslice);
+    Hslices.push_back(forwardHslice);
+  }
+
+  // Load backward GRU.
+  std::vector<NodeValue> backwardYslices;
+  if (backwardEnabled) {
+    NodeValue backwardHslice;
+    loadGRUCell(/* forward */ false, backwardYslices, backwardHslice);
+    Hslices.push_back(backwardHslice);
+  }
+
+  // Gather Y slices.
+  for (size_t t = 0; t < seqLength; t++) {
+    if (forwardEnabled) {
+      YSlices.push_back(forwardYslices[t]);
+    }
+    if (backwardEnabled) {
+      YSlices.push_back(backwardYslices[seqLength - 1 - t]);
+    }
+  }
+
+  // Concatenate Y slices.
+  // Y size is [seqLength, numDirections, batchSize, hiddenSize].
+  Y = createReshape(opName + ".Y.reshape",
+                    createConcat(opName + ".Y.concat", YSlices, 0),
+                    {seqLength, numDirections, batchSize, hiddenSize});
+
+  // Concatenate Y_h slices.
+  // Y_h size is [numDirections, batchSize, hiddenSize].
+  Y_h = createReshape(opName + ".Y_h.reshape",
+                      createConcat(opName + ".Y_h.concat", Hslices, 0),
+                      {numDirections, batchSize, hiddenSize});
+
+#undef GRU_X_SLICE_RANGE
+#undef GRU_W_SLICE_RANGE
+#undef GRU_R_SLICE_RANGE
+#undef GRU_B_SLICE_RANGE
+#undef GRU_H_SLICE_RANGE
+#undef GRU_CREATE_FC
+}
+
+void Function::createOnnxLSTM(llvm::StringRef namePrefix, NodeValue X,
+                              NodeValue W, NodeValue R, NodeValue B,
+                              NodeValue initial_h, NodeValue initial_c,
+                              NodeValue P, NodeValue &Y, NodeValue &Y_h,
+                              NodeValue &Y_c, unsigned hiddenSize,
+                              RnnDirection direction,
+                              std::vector<RnnActivation> &activations,
+                              bool inputForget) {
+
+#define LSTM_X_SLICE_RANGE(idx)                                                \
+  {idx + 0, 0, 0}, { idx + 1, batchSize, inputSize }
+#define LSTM_H_SLICE_RANGE(idx)                                                \
+  {idx + 0, 0, 0}, { idx + 1, batchSize, hiddenSize }
+#define LSTM_C_SLICE_RANGE(idx)                                                \
+  {idx + 0, 0, 0}, { idx + 1, batchSize, hiddenSize }
+#define LSTM_W_SLICE_RANGE(idx0, idx1)                                         \
+  {idx0, idx1 * hiddenSize, 0}, { idx0 + 1, (idx1 + 1) * hiddenSize, inputSize }
+#define LSTM_R_SLICE_RANGE(idx0, idx1)                                         \
+  {idx0, idx1 * hiddenSize, 0}, {                                              \
+    idx0 + 1, (idx1 + 1) * hiddenSize, hiddenSize                              \
+  }
+#define LSTM_B_SLICE_RANGE(idx0, idx1)                                         \
+  {idx0, idx1 * hiddenSize}, { idx0 + 1, (idx1 + 1) * hiddenSize }
+#define LSTM_P_SLICE_RANGE(idx0, idx1)                                         \
+  {idx0, idx1 * hiddenSize}, { idx0 + 1, (idx1 + 1) * hiddenSize }
+#define LSTM_CREATE_FC(name, LHS, RHS, BIAS)                                   \
+  BIAS ? (Node *)createFullyConnected(name, LHS, RHS, BIAS)                    \
+       : (Node *)createMatMul(name, LHS, RHS)
+
+  // Operator name.
+  const std::string &opName = namePrefix.str();
+
+  // Get all size parameters.
+  dim_t numDirections = (direction == RnnDirection::Bidirectional) ? 2 : 1;
+  assert(X.dims().size() == 3 &&
+         "ONNX LSTM input 'X' should have 3 dimensions!");
+  dim_t seqLength = X.dims()[0];
+  dim_t batchSize = X.dims()[1];
+  dim_t inputSize = X.dims()[2];
+
+  // Validate W size.
+  assert(W.dims().size() == 3 &&
+         "ONNX LSTM input 'W' should have 3 dimensions!");
+  assert(W.dims()[0] == numDirections && W.dims()[1] == 4 * hiddenSize &&
+         W.dims()[2] == inputSize && "ONNX LSTM 'W' tensor size invalid!");
+
+  // Validate R size.
+  assert(R.dims().size() == 3 &&
+         "ONNX LSTM input 'R' should have 3 dimensions!");
+  assert(R.dims()[0] == numDirections && R.dims()[1] == 4 * hiddenSize &&
+         R.dims()[2] == hiddenSize && "ONNX LSTM 'R' tensor size invalid!");
+
+  // Validate B size.
+  if (B.getNode()) {
+    assert(B.dims().size() == 2 &&
+           "ONNX LSTM input 'B' should have 2 dimensions!");
+    assert(B.dims()[0] == numDirections && B.dims()[1] == 8 * hiddenSize &&
+           "ONNX LSTM 'B' tensor size invalid!");
+  }
+
+  // Validate initial_h size.
+  assert(initial_h.getNode() &&
+         "ONNX LSTM input 'initial_h' is mandatory. Null provided!");
+  assert(initial_h.dims().size() == 3 &&
+         "ONNX LSTM input 'initial_h' should have 2 dimensions!");
+  assert(initial_h.dims()[0] == numDirections &&
+         initial_h.dims()[1] == batchSize &&
+         initial_h.dims()[2] == hiddenSize &&
+         "ONNX LSTM 'initial_h' tensor size invalid!");
+
+  // Validate initial_c size.
+  assert(initial_c.getNode() &&
+         "ONNX LSTM input 'initial_c' is mandatory. Null provided!");
+  assert(initial_c.dims().size() == 3 &&
+         "ONNX LSTM input 'initial_c' should have 2 dimensions!");
+  assert(initial_c.dims()[0] == numDirections &&
+         initial_c.dims()[1] == batchSize &&
+         initial_c.dims()[2] == hiddenSize &&
+         "ONNX LSTM 'initial_c' tensor size invalid!");
+
+  // Validate P size.
+  if (P.getNode()) {
+    assert(P.dims().size() == 2 &&
+           "ONNX LSTM input 'P' should have 2 dimensions!");
+    assert(P.dims()[0] == numDirections && P.dims()[1] == 3 * hiddenSize &&
+           "ONNX LSTM 'P' tensor size invalid!");
+  }
+
+  // Validate number of activations.
+  assert(activations.size() == numDirections * 3 &&
+         "ONNX LSTM activations vector invalid!");
+
+  // Create X slices.
+  std::vector<Node *> Xslices;
+  for (dim_t t = 0; t < seqLength; t++) {
+    auto XsliceName = opName + ".X" + std::to_string(t) + ".slice";
+    Node *Xt = createSlice(XsliceName, X, LSTM_X_SLICE_RANGE(t));
+    auto XreshapeName = opName + ".X" + std::to_string(t) + ".reshape";
+    Xt = createReshape(XreshapeName, Xt, {batchSize, inputSize});
+    Xslices.push_back(Xt);
+  }
+
+  // Lambda to load forward/backward LSTM cell.
+  auto loadLSTMCell = [&](bool forward, std::vector<NodeValue> &Yslices,
+                          NodeValue &Hslice, NodeValue &Cslice) {
+    // Name prefix.
+    std::string dirLabel = forward ? ".fw" : ".bw";
+    std::string prefix = opName + ((numDirections > 1) ? dirLabel : "");
+
+    // Slice index used for creating weights slices.
+    dim_t sliceIdx0 = 0;
+    if (direction == RnnDirection::Bidirectional) {
+      sliceIdx0 = forward ? 0 : 1;
+    }
+
+    // Activations.
+    size_t activationOffset = sliceIdx0 * 3;
+    auto activationF = activations[activationOffset + 0];
+    auto activationG = activations[activationOffset + 1];
+    auto activationH = activations[activationOffset + 2];
+
+    // Create W slices (Required).
+    NodeValue Wi =
+        createSlice(prefix + ".Wi.", W, LSTM_W_SLICE_RANGE(sliceIdx0, 0));
+    NodeValue Wo =
+        createSlice(prefix + ".Wo.", W, LSTM_W_SLICE_RANGE(sliceIdx0, 1));
+    NodeValue Wf =
+        createSlice(prefix + ".Wf.", W, LSTM_W_SLICE_RANGE(sliceIdx0, 2));
+    NodeValue Wc =
+        createSlice(prefix + ".Wc.", W, LSTM_W_SLICE_RANGE(sliceIdx0, 3));
+
+    Wi = createReshape(prefix + ".Wi.reshape", Wi, {hiddenSize, inputSize});
+    Wo = createReshape(prefix + ".Wo.reshape", Wo, {hiddenSize, inputSize});
+    Wf = createReshape(prefix + ".Wf.reshape", Wf, {hiddenSize, inputSize});
+    Wc = createReshape(prefix + ".Wc.reshape", Wc, {hiddenSize, inputSize});
+
+    Wi = createTranspose(prefix + ".Wi.transp", Wi, {1, 0});
+    Wo = createTranspose(prefix + ".Wo.transp", Wo, {1, 0});
+    Wf = createTranspose(prefix + ".Wf.transp", Wf, {1, 0});
+    Wc = createTranspose(prefix + ".Wc.transp", Wc, {1, 0});
+
+    // Create R slices (Required).
+    NodeValue Ri =
+        createSlice(prefix + ".Ri.", R, LSTM_R_SLICE_RANGE(sliceIdx0, 0));
+    NodeValue Ro =
+        createSlice(prefix + ".Ro.", R, LSTM_R_SLICE_RANGE(sliceIdx0, 1));
+    NodeValue Rf =
+        createSlice(prefix + ".Rf.", R, LSTM_R_SLICE_RANGE(sliceIdx0, 2));
+    NodeValue Rc =
+        createSlice(prefix + ".Rc.", R, LSTM_R_SLICE_RANGE(sliceIdx0, 3));
+
+    Ri = createReshape(prefix + ".Ri.reshape", Ri, {hiddenSize, hiddenSize});
+    Ro = createReshape(prefix + ".Ro.reshape", Ro, {hiddenSize, hiddenSize});
+    Rf = createReshape(prefix + ".Rf.reshape", Rf, {hiddenSize, hiddenSize});
+    Rc = createReshape(prefix + ".Rc.reshape", Rc, {hiddenSize, hiddenSize});
+
+    Ri = createTranspose(prefix + ".Ri.transp", Ri, {1, 0});
+    Ro = createTranspose(prefix + ".Ro.transp", Ro, {1, 0});
+    Rf = createTranspose(prefix + ".Rf.transp", Rf, {1, 0});
+    Rc = createTranspose(prefix + ".Rc.transp", Rc, {1, 0});
+
+    // Create B slices (optional).
+    NodeValue bWi = nullptr;
+    NodeValue bWo = nullptr;
+    NodeValue bWf = nullptr;
+    NodeValue bWc = nullptr;
+    NodeValue bRi = nullptr;
+    NodeValue bRo = nullptr;
+    NodeValue bRf = nullptr;
+    NodeValue bRc = nullptr;
+
+    if (B) {
+
+      bWi = createSlice(prefix + ".bWi.", B, LSTM_B_SLICE_RANGE(sliceIdx0, 0));
+      bWo = createSlice(prefix + ".bWo.", B, LSTM_B_SLICE_RANGE(sliceIdx0, 1));
+      bWf = createSlice(prefix + ".bWf.", B, LSTM_B_SLICE_RANGE(sliceIdx0, 2));
+      bWc = createSlice(prefix + ".bWc.", B, LSTM_B_SLICE_RANGE(sliceIdx0, 3));
+      bRi = createSlice(prefix + ".bRi.", B, LSTM_B_SLICE_RANGE(sliceIdx0, 4));
+      bRo = createSlice(prefix + ".bRo.", B, LSTM_B_SLICE_RANGE(sliceIdx0, 5));
+      bRf = createSlice(prefix + ".bRf.", B, LSTM_B_SLICE_RANGE(sliceIdx0, 6));
+      bRc = createSlice(prefix + ".bRc.", B, LSTM_B_SLICE_RANGE(sliceIdx0, 7));
+
+      bWi = createReshape(prefix + ".bWi.reshape", bWi, {hiddenSize});
+      bWo = createReshape(prefix + ".bWo.reshape", bWo, {hiddenSize});
+      bWf = createReshape(prefix + ".bWf.reshape", bWf, {hiddenSize});
+      bWc = createReshape(prefix + ".bWc.reshape", bWc, {hiddenSize});
+      bRi = createReshape(prefix + ".bRi.reshape", bRi, {hiddenSize});
+      bRo = createReshape(prefix + ".bRo.reshape", bRo, {hiddenSize});
+      bRf = createReshape(prefix + ".bRf.reshape", bRf, {hiddenSize});
+      bRc = createReshape(prefix + ".bRc.reshape", bRc, {hiddenSize});
+    }
+
+    // Create P slices (optional).
+    NodeValue Pi = nullptr;
+    NodeValue Po = nullptr;
+    NodeValue Pf = nullptr;
+
+    if (P) {
+
+      Pi = createSlice(prefix + ".Pi.", P, LSTM_P_SLICE_RANGE(sliceIdx0, 0));
+      Po = createSlice(prefix + ".Po.", P, LSTM_P_SLICE_RANGE(sliceIdx0, 1));
+      Pf = createSlice(prefix + ".Pf.", P, LSTM_P_SLICE_RANGE(sliceIdx0, 2));
+
+      // Repeat P slices to match [batchSize, hiddenSize].
+      Pi = createTile(prefix + ".Pi.repeat", Pi, batchSize, 0);
+      Po = createTile(prefix + ".Po.repeat", Po, batchSize, 0);
+      Pf = createTile(prefix + ".Pf.repeat", Pf, batchSize, 0);
+    }
+
+    // Create H slice for this direction.
+    Node *Hinit = createSlice(prefix + ".H.slice", initial_h,
+                              LSTM_H_SLICE_RANGE(sliceIdx0));
+    Hinit =
+        createReshape(prefix + ".H.reshape", Hinit, {batchSize, hiddenSize});
+
+    // Create C slice for this direction.
+    Node *Cinit = createSlice(prefix + ".C.slice", initial_c,
+                              LSTM_C_SLICE_RANGE(sliceIdx0));
+    Cinit =
+        createReshape(prefix + ".C.reshape", Cinit, {batchSize, hiddenSize});
+
+    // Initialize.
+    Node *Ht = Hinit;
+    Node *Ct = Cinit;
+
+    // Unroll LSTM cell for all time steps.
+    for (size_t t = 0; t < seqLength; t++) {
+
+      // Input for current time step.
+      // For the reverse LSTM cell the inputs are provided in reverse order.
+      Node *Xt = forward ? Xslices[t] : Xslices[seqLength - 1 - t];
+
+      // Forget gate: ft = f(Xt * Wf + bWf + Ht-1 * Rf + bRf + Pf . Ct-1).
+      Node *ft = createAdd(prefix + ".F.add1",
+                           LSTM_CREATE_FC(prefix + ".F.fc1", Xt, Wf, bWf),
+                           LSTM_CREATE_FC(prefix + ".F.fc2", Ht, Rf, bRf));
+      if (Pf) {
+        ft = createAdd(prefix + ".F.add2", ft,
+                       createMul(prefix + ".F.mult", Pf, Ct));
+      }
+      ft = activationF(prefix + ".F.act", ft);
+
+      // Cell state candidate: ctild = g(Xt * Wc + bWc + Ht-1 * Rc + bRc).
+      Node *ctild =
+          createAdd(prefix + ".Ctild.add",
+                    LSTM_CREATE_FC(prefix + ".Ctild.fc1", Xt, Wc, bWc),
+                    LSTM_CREATE_FC(prefix + ".Ctild.fc2", Ht, Rc, bRc));
+      ctild = activationG(prefix + ".Ctild.act", ctild);
+
+      // Input gate:
+      // For inputForget == true:
+      //   it = 1 - ft.
+      // For inputForget == false:
+      //   it = f(Xt * Wi + bWi + Ht-1 * Ri + bRi + Pi . Ct-1).
+      Node *it;
+      if (inputForget) {
+        auto splatTy = ft->getNthResult(0).getType();
+        it = createSub(prefix + ".I.sub",
+                       createSplat(prefix + ".I.splat", splatTy, 1.0), ft);
+      } else {
+        it = createAdd(prefix + ".I.add1",
+                       LSTM_CREATE_FC(prefix + ".I.fc1", Xt, Wi, bWi),
+                       LSTM_CREATE_FC(prefix + ".I.fc2", Ht, Ri, bRi));
+        if (Pi) {
+          it = createAdd(prefix + ".I.add2", it,
+                         createMul(prefix + ".I.mult", Pi, Ct));
+        }
+        it = activationF(prefix + ".I.act", it);
+      }
+
+      // Cell state update: Ct = ft . Ct-1 + it . ctild.
+      Ct = createAdd(prefix + ".C.add", createMul(prefix + ".C.mult1", ft, Ct),
+                     createMul(prefix + ".C.mult2", it, ctild));
+
+      // Output gate: ot = f(Xt * Wo + bWo + Ht-1 * Ro + bRo + Po . Ct).
+      Node *ot = createAdd(prefix + ".O.add1",
+                           LSTM_CREATE_FC(prefix + ".O.fc1", Xt, Wo, bWo),
+                           LSTM_CREATE_FC(prefix + ".O.fc2", Ht, Ro, bRo));
+      if (Po) {
+        ot = createAdd(prefix + ".O.add2", ot,
+                       createMul(prefix + ".O.mult", Po, Ct));
+      }
+      ot = activationF(prefix + ".O.act", ot);
+
+      // Hidden state update: Ht = ot . h(Ct).
+      Ht =
+          createMul(prefix + ".H.mult", ot, activationH(prefix + ".H.act", Ct));
+
+      // Output.
+      Yslices.push_back(Ht);
+    }
+
+    // Updated states nodes.
+    Hslice = Ht;
+    Cslice = Ct;
+  }; // End of local lambda "loadLSTMCell".
+
+  bool forwardEnabled = ((direction == RnnDirection::Forward) ||
+                         (direction == RnnDirection::Bidirectional));
+  bool backwardEnabled = ((direction == RnnDirection::Reverse) ||
+                          (direction == RnnDirection::Bidirectional));
+
+  std::vector<NodeValue> YSlices;
+  std::vector<NodeValue> Hslices;
+  std::vector<NodeValue> Cslices;
+
+  // Load forward LSTM.
+  std::vector<NodeValue> forwardYslices;
+  if (forwardEnabled) {
+    NodeValue forwardHslice;
+    NodeValue forwardCslice;
+    loadLSTMCell(/* forward */ true, forwardYslices, forwardHslice,
+                 forwardCslice);
+    Hslices.push_back(forwardHslice);
+    Cslices.push_back(forwardCslice);
+  }
+
+  // Load backward LSTM.
+  std::vector<NodeValue> backwardYslices;
+  if (backwardEnabled) {
+    NodeValue backwardHslice;
+    NodeValue backwardCslice;
+    loadLSTMCell(/* forward */ false, backwardYslices, backwardHslice,
+                 backwardCslice);
+    Hslices.push_back(backwardHslice);
+    Cslices.push_back(backwardCslice);
+  }
+
+  // Gather Y slices.
+  for (size_t t = 0; t < seqLength; t++) {
+    if (forwardEnabled) {
+      YSlices.push_back(forwardYslices[t]);
+    }
+    if (backwardEnabled) {
+      YSlices.push_back(backwardYslices[seqLength - 1 - t]);
+    }
+  }
+
+  // Concatenate Y slices.
+  // Y size is [seqLength, numDirections, batchSize, hiddenSize].
+  Y = createReshape(opName + ".Y.reshape",
+                    createConcat(opName + ".Y.concat", YSlices, 0),
+                    {seqLength, numDirections, batchSize, hiddenSize});
+
+  // Concatenate Y_h slices.
+  // Y_h size is [numDirections, batchSize, hiddenSize].
+  Y_h = createReshape(opName + ".Y_h.reshape",
+                      createConcat(opName + ".Y_h.concat", Hslices, 0),
+                      {numDirections, batchSize, hiddenSize});
+
+  // Concatenate Y_c slices.
+  // Y_c size is [numDirections, batchSize, hiddenSize].
+  Y_c = createReshape(opName + ".Y_c.reshape",
+                      createConcat(opName + ".Y_c.concat", Cslices, 0),
+                      {numDirections, batchSize, hiddenSize});
+
+#undef LSTM_X_SLICE_RANGE
+#undef LSTM_H_SLICE_RANGE
+#undef LSTM_C_SLICE_RANGE
+#undef LSTM_W_SLICE_RANGE
+#undef LSTM_R_SLICE_RANGE
+#undef LSTM_B_SLICE_RANGE
+#undef LSTM_P_SLICE_RANGE
+#undef LSTM_CREATE_FC
+}
+
 TraceEventNode *Function::createTraceEvent(llvm::StringRef eventName,
                                            llvm::StringRef eventType,
                                            Node *data, unsigned index) {
   std::string name = (getName() + "_" + eventName + "_instrumentation").str();
   return addNode(new TraceEventNode(name, data, eventName, eventType, index));
+}
+
+NonMaxSuppressionNode *Function::createNonMaxSuppressionV4(
+    llvm::StringRef name, NodeValue boxes, NodeValue scores,
+    int64_t centerPointBox, int64_t maxOutputBoxesPerClass, float iouThreshold,
+    float scoreThreshold, ElemKind elTy) {
+  // V4
+  // Class/Score [BatchNum][BoxNum]
+  // Boxes [BatdhNum][BoxNum][4]
+  // Result [BatchNum*MaxOutputPerBatch]
+  // NumberOfIndicesDetected [BatchNum*MaxOutputPerBatch]
+  auto scoresDim = scores.dims();
+  int scoresBoxDim = scoresDim.size() - 1;
+  if (maxOutputBoxesPerClass == 0) {
+    maxOutputBoxesPerClass = scoresDim[scoresBoxDim];
+  }
+
+  // Allocating maximum because we don't know how many boxes will actually be
+  // detected.
+  std::vector<dim_t> newDim = {static_cast<dim_t>(maxOutputBoxesPerClass)};
+  auto indicesTy = getParent()->uniqueType(elTy, newDim);
+  auto numberOfSelectedIndicesTy = getParent()->uniqueType(
+      elTy, {static_cast<dim_t>(maxOutputBoxesPerClass)});
+  return addNode(new NonMaxSuppressionNode(
+      name, indicesTy, numberOfSelectedIndicesTy, boxes, scores, centerPointBox,
+      maxOutputBoxesPerClass, iouThreshold, scoreThreshold, true));
+}
+
+NonMaxSuppressionNode *
+Function::createNonMaxSuppressionV4(llvm::StringRef name, NodeValue boxes,
+                                    NodeValue scores, int64_t centerPointBox,
+                                    int64_t maxOutputBoxesPerClass,
+                                    float iouThreshold, float scoreThreshold) {
+  return createNonMaxSuppressionV4(name, boxes, scores, centerPointBox,
+                                   maxOutputBoxesPerClass, iouThreshold,
+                                   scoreThreshold, ElemKind::Int64ITy);
+}
+
+NonMaxSuppressionNode *Function::createNonMaxSuppressionV4(
+    llvm::StringRef name, NodeValue boxes, NodeValue scores,
+    int64_t centerPointBox, int64_t maxOutputBoxesPerClass, float iouThreshold,
+    float scoreThreshold, TypeRef indicesTy,
+    TypeRef numberOfSelectedIndicesTy) {
+  assert(maxOutputBoxesPerClass > 0 && "Invalid maxOutputBoxesPerClass.");
+
+  return addNode(new NonMaxSuppressionNode(
+      name, indicesTy, numberOfSelectedIndicesTy, boxes, scores, centerPointBox,
+      maxOutputBoxesPerClass, iouThreshold, scoreThreshold, true));
+}
+
+NonMaxSuppressionNode *Function::createNonMaxSuppressionONNX(
+    llvm::StringRef name, NodeValue boxes, NodeValue scores,
+    int64_t centerPointBox, int64_t maxOutputBoxesPerClass, float iouThreshold,
+    float scoreThreshold, ElemKind elTy) {
+  // ONNX
+  // Class/Score [BatchNum][ClassNum][BoxNum]
+  // Box [BatchNum][BoxNum][4]
+  // Result [BatchNum*MaxOutputPerBatch][3]
+  auto boxesDim = boxes.dims();
+  auto scoresDim = scores.dims();
+  int scoresBoxDim = scoresDim.size() - 1;
+  int scoresClassDim = scoresDim.size() - 2;
+  int scoresBatchDim = scoresDim.size() - 3;
+  int boxesBatchDim = boxesDim.size() - 3;
+  if (maxOutputBoxesPerClass == 0) {
+    maxOutputBoxesPerClass = scoresDim[scoresBoxDim];
+  }
+
+  // allocating maximum because we don't know how many boxes will actually be
+  // detected.
+  std::vector<dim_t> newDim = {scoresDim[scoresBatchDim] *
+                                   scoresDim[scoresClassDim] *
+                                   static_cast<dim_t>(maxOutputBoxesPerClass),
+                               3};
+  auto indicesTy = getParent()->uniqueType(elTy, newDim);
+  auto numberOfSelectedIndicesTy = getParent()->uniqueType(
+      elTy,
+      {boxesDim[boxesBatchDim] * static_cast<dim_t>(maxOutputBoxesPerClass)});
+  return addNode(new NonMaxSuppressionNode(
+      name, indicesTy, numberOfSelectedIndicesTy, boxes, scores, centerPointBox,
+      maxOutputBoxesPerClass, iouThreshold, scoreThreshold, false));
+}
+
+NonMaxSuppressionNode *Function::createNonMaxSuppressionONNX(
+    llvm::StringRef name, NodeValue boxes, NodeValue scores,
+    int64_t centerPointBox, int64_t maxOutputBoxesPerClass, float iouThreshold,
+    float scoreThreshold) {
+  return createNonMaxSuppressionONNX(name, boxes, scores, centerPointBox,
+                                     maxOutputBoxesPerClass, iouThreshold,
+                                     scoreThreshold, ElemKind::Int64ITy);
+}
+
+NonMaxSuppressionNode *Function::createNonMaxSuppressionONNX(
+    llvm::StringRef name, NodeValue boxes, NodeValue scores,
+    int64_t centerPointBox, int64_t maxOutputBoxesPerClass, float iouThreshold,
+    float scoreThreshold, TypeRef indicesTy) {
+  auto boxesDim = boxes.dims();
+  assert(maxOutputBoxesPerClass > 0 && "Invalid maxOutputBoxesPerClass.");
+
+  // allocating maximum because we don't know how many boxes will actually be
+  // detected.
+  auto numberOfSelectedIndicesTy = getParent()->uniqueType(
+      ElemKind::Int32ITy, {1, 1, 1,
+                           boxesDim[boxesDim.size() - 2] *
+                               static_cast<dim_t>(maxOutputBoxesPerClass)});
+  return addNode(new NonMaxSuppressionNode(
+      name, indicesTy, numberOfSelectedIndicesTy, boxes, scores, centerPointBox,
+      maxOutputBoxesPerClass, iouThreshold, scoreThreshold, false));
+}
+
+Constant *Function::createCosineWindow(llvm::StringRef name, dim_t length) {
+  auto window = getParent()->createConstant(ElemKind::FloatTy, {length}, name);
+  auto windowH = window->getHandle<float>();
+  for (dim_t n = 0; n < length; n++) {
+    windowH.raw(n) =
+        0.5 - 0.5 * cos(2.0 * M_PI * (double)(n) / (double)(length));
+  }
+  return window;
+}
+
+Constant *Function::createFFTTwiddleFactors(llvm::StringRef name,
+                                            dim_t fftLength) {
+  auto twiddleFactors =
+      getParent()->createConstant(ElemKind::FloatTy, {2 * fftLength}, name);
+  auto twiddleFactorsH = twiddleFactors->getHandle<float>();
+  for (dim_t k = 0; k < fftLength; k++) {
+    twiddleFactorsH.raw(2 * k + 0) =
+        cos(2.0 * M_PI * (double)(k) / (double)(fftLength));
+    twiddleFactorsH.raw(2 * k + 1) =
+        -sin(2.0 * M_PI * (double)(k) / (double)(fftLength));
+  }
+  return twiddleFactors;
+}
+
+Constant *Function::createFFTBitReverseIndices(llvm::StringRef name,
+                                               dim_t fftLength) {
+  assert(fftLength >= 1 && "FFT length must be at least 1!");
+  // Local function to reverse the bits of a number.
+  auto reverseBits = [](uint64_t bits, dim_t numBits) -> uint64_t {
+    assert(((0 <= numBits) && (numBits <= 64)) &&
+           "Maximum number of bits exceeded for 'reverseBits' function!");
+    if (numBits <= 0) {
+      return 0;
+    }
+    uint64_t bitsRev = 0;
+    uint64_t bitsMask = 1;
+    uint64_t bitsRevMask = 1 << (numBits - 1);
+    for (dim_t idx = 0; idx < numBits; idx++) {
+      if (bits & bitsMask) {
+        bitsRev |= bitsRevMask;
+      }
+      bitsMask <<= 1;
+      bitsRevMask >>= 1;
+    }
+    return bitsRev;
+  };
+  auto bitReverseIndices =
+      getParent()->createConstant(ElemKind::Int32ITy, {fftLength}, name);
+  auto bitReverseIndicesH = bitReverseIndices->getHandle<int32_t>();
+  dim_t numBits = std::log2((double)fftLength);
+  for (dim_t idx = 0; idx < fftLength; idx++) {
+    bitReverseIndicesH.raw(idx) =
+        static_cast<int32_t>(reverseBits(idx, numBits));
+  }
+  return bitReverseIndices;
+}
+
+Constant *Function::createFFTComplexToRealWeights(llvm::StringRef name,
+                                                  dim_t fftLength,
+                                                  dim_t outLength) {
+  auto complexToRealWeights =
+      getParent()->createConstant(ElemKind::FloatTy, {2 * outLength}, name);
+  auto complexToRealWeightsH = complexToRealWeights->getHandle<float>();
+  for (dim_t k = 0; k < outLength; k++) {
+    complexToRealWeightsH.raw(2 * k + 0) =
+        0.5 * (1 - sin(2.0 * M_PI * (double)(k) / (double)(fftLength)));
+    complexToRealWeightsH.raw(2 * k + 1) =
+        -0.5 * cos(2.0 * M_PI * (double)(k) / (double)(fftLength));
+  }
+  return complexToRealWeights;
+}
+
+AudioSpectrogramNode *Function::createAudioSpectrogram(llvm::StringRef name,
+                                                       NodeValue input,
+                                                       int64_t windowSize,
+                                                       int64_t windowStride,
+                                                       bool magnitudeSquared) {
+  // Output shape will be windowCount x (fftLength / 2 + 1).
+  dim_t inputLength = input.getType()->size();
+  dim_t windowCount = std::floor((inputLength - windowSize) / windowStride) + 1;
+  dim_t fftLength = 1 << (dim_t)std::ceil(std::log2((double)windowSize));
+  auto spectrogramTy = getParent()->uniqueType(
+      ElemKind::FloatTy, {windowCount, fftLength / 2 + 1});
+
+  // Create a cosine FFT windowing function.
+  auto window = createCosineWindow(std::string(name) + ".Window", windowSize);
+
+  // Create the FFT weights for a fftLength/2 complex FFT.
+  auto twiddleFactors = createFFTTwiddleFactors(
+      std::string(name) + ".TwiddleFactors", fftLength / 2);
+  auto bitReverseIndices = createFFTBitReverseIndices(
+      std::string(name) + ".BitReverseIndices", fftLength / 2);
+
+  // Create the complex to real FFT mapping coefficients.
+  // For small FFT length make sure to generate at least 1 coefficient.
+  auto complexToRealWeights = createFFTComplexToRealWeights(
+      std::string(name) + ".ComplexToRealWeights", fftLength,
+      (fftLength / 4) >= 1 ? (fftLength / 4) : 1);
+
+  // Create AudioSpectrogram node.
+  return addNode(new AudioSpectrogramNode(
+      name, spectrogramTy, input, window, twiddleFactors, bitReverseIndices,
+      complexToRealWeights, windowSize, windowStride, magnitudeSquared));
+}
+
+void Function::createMelWeights(llvm::StringRef prefix, dim_t spectrogramLength,
+                                float sampleRate, float lowerFrequency,
+                                float upperFrequency, dim_t filterBankCount,
+                                Constant *&melWeights, Constant *&melRanges) {
+  auto fftLength = 2 * (spectrogramLength - 1);
+  dim_t numFreqBins = fftLength / 2;
+  dim_t numMelBins = filterBankCount;
+
+  // Mel frequency scale local lambda function.
+  auto melFreqScale = [](float freq) -> float {
+    return 1127.0f * logf(1.0f + freq / 700.0f);
+  };
+
+  // Always exclude DC (TensorFlow implementation choice from HTK).
+  float freqDelta = sampleRate / (float)(fftLength);
+  dim_t freqIdxMin = (dim_t)(1.5 + (lowerFrequency / freqDelta));
+  dim_t freqIdxMax = (dim_t)(upperFrequency / freqDelta);
+  freqIdxMax = (freqIdxMax >= numFreqBins) ? numFreqBins : freqIdxMax;
+
+  // Create Mel ranges constant.
+  melRanges = getParent()->createConstant(ElemKind::Int32ITy, {2 * numMelBins},
+                                          std::string(prefix) + ".MelRanges");
+  auto melRangesH = melRanges->getHandle<int32_t>();
+
+  // Mel weights and frequency start/stop (inclusive) buffers.
+  auto melBinFreqWeights = std::make_unique<float[]>(numMelBins * numFreqBins);
+  dim_t melBinFreqWeightsNum = 0;
+
+  // Mel frequency limits.
+  float melFreqLower = melFreqScale(lowerFrequency);
+  float melFreqUpper = melFreqScale(upperFrequency);
+  float melFreqDelta = (melFreqUpper - melFreqLower) / (numMelBins + 1);
+  for (dim_t melIdx = 0; melIdx < numMelBins; melIdx++) {
+
+    float melFreqLeft = melFreqLower + (melIdx + 0) * melFreqDelta;
+    float melFreqCenter = melFreqLower + (melIdx + 1) * melFreqDelta;
+    float melFreqRight = melFreqLower + (melIdx + 2) * melFreqDelta;
+
+    int32_t freqIdxStart = -1;
+    int32_t freqIdxStop = -2;
+
+    for (dim_t freqIdx = freqIdxMin; freqIdx <= freqIdxMax; freqIdx++) {
+      float melFreq = melFreqScale(freqIdx * freqDelta);
+      if ((melFreqLeft < melFreq) && (melFreq < melFreqRight)) {
+
+        // Compute frequency bin weight for this Mel bin.
+        float weight = 1.0f - std::abs(melFreq - melFreqCenter) / melFreqDelta;
+
+        // Store the frequency bin weight.
+        melBinFreqWeights[melBinFreqWeightsNum++] = weight;
+
+        // Update frequency bin start/stop index.
+        if (freqIdxStart == -1) {
+          freqIdxStart = freqIdx;
+        }
+        freqIdxStop = freqIdx;
+      }
+    }
+
+    // Store the frequency bin start/stop index.
+    melRangesH.raw(2 * melIdx + 0) = freqIdxStart;
+    melRangesH.raw(2 * melIdx + 1) = freqIdxStop;
+  }
+
+  // Validate Mel ranges.
+  dim_t melBinFreqWeightsNumValidate = 0;
+  for (dim_t melIdx = 0; melIdx < numMelBins; melIdx++) {
+    int32_t freqIdxRange =
+        melRangesH.raw(2 * melIdx + 1) - melRangesH.raw(2 * melIdx + 0) + 1;
+    melBinFreqWeightsNumValidate += freqIdxRange;
+  }
+  assert(melBinFreqWeightsNum == melBinFreqWeightsNumValidate &&
+         "Invalid Mel ranges");
+
+  // Create Mel weights constant.
+  melWeights =
+      getParent()->createConstant(ElemKind::FloatTy, {melBinFreqWeightsNum},
+                                  std::string(prefix) + ".MelWeights");
+  auto melWeightsH = melWeights->getHandle<float>();
+  for (dim_t idx = 0; idx < melBinFreqWeightsNum; idx++) {
+    melWeightsH.raw(idx) = melBinFreqWeights[idx];
+  }
+}
+
+Constant *Function::createDCTMat(llvm::StringRef name, dim_t N, dim_t K) {
+  Constant *dctMat =
+      getParent()->createConstant(ElemKind::FloatTy, {K, N}, name);
+  auto dctMatH = dctMat->getHandle<float>();
+  float dctFact = (float)sqrt(2.0 / (double)(N));
+  for (dim_t k = 0; k < K; k++) {
+    for (dim_t n = 0; n < N; n++) {
+      dctMatH.at({k, n}) =
+          dctFact * cos(M_PI / (double)(N) * ((double)(n) + 0.5) * (double)(k));
+    }
+  }
+  return dctMat;
+}
+
+MFCCNode *Function::createMFCC(llvm::StringRef name, NodeValue spectrogram,
+                               float sampleRate, float lowerFrequency,
+                               float upperFrequency, int64_t filterBankCount,
+                               int64_t numCoefficients) {
+  // Create the Mel weights.
+  dim_t spectrogramLength = spectrogram.dims()[1];
+  Constant *melWeights;
+  Constant *melRanges;
+  createMelWeights(name, spectrogramLength, sampleRate, lowerFrequency,
+                   upperFrequency, filterBankCount, melWeights, melRanges);
+
+  // Create the DCT transform matrix.
+  Constant *dctMat = createDCTMat(std::string(name) + ".DCTMat",
+                                  filterBankCount, numCoefficients);
+
+  // Output shape will be windowCount x numCoefficients.
+  dim_t windowCount = spectrogram.dims()[0];
+  auto coefficientsTy = getParent()->uniqueType(
+      ElemKind::FloatTy, {windowCount, static_cast<dim_t>(numCoefficients)});
+
+  // Create MFCC node.
+  return addNode(new MFCCNode(name, coefficientsTy, spectrogram, melWeights,
+                              melRanges, dctMat, sampleRate, lowerFrequency,
+                              upperFrequency, filterBankCount,
+                              numCoefficients));
 }
 
 //===----------------------------------------------------------------------===//
@@ -2582,17 +4402,27 @@ void Function::dump() const {
   }
 }
 
-std::string Function::toString() const {
+std::string Function::toString(bool skipUsersForStorage) const {
   std::string storage;
   llvm::raw_string_ostream os(storage);
-  dump(os);
+  dump(os, skipUsersForStorage);
   return os.str();
 }
 
-void Function::dump(llvm::raw_ostream &os) const {
+void Function::dump(llvm::raw_ostream &os, bool skipUsersForStorage) const {
   os << "Graph structure " << getName() << ":\n";
-  for (auto &n : nodes_) {
-    os << n.getDebugDesc();
+  std::set<const Node *, SortNamed> sorted;
+  for (const Node &n : nodes_) {
+    sorted.insert(&n);
+  }
+  for (auto *n : sorted) {
+    os << n->getDebugDesc();
+  }
+  for (auto *C : getNamedSorted(findConstants())) {
+    os << C->getDebugDesc(skipUsersForStorage);
+  }
+  for (auto *P : getNamedSorted(findPlaceholders())) {
+    os << P->getDebugDesc(skipUsersForStorage);
   }
 }
 
@@ -2610,16 +4440,16 @@ class FunctionDottyPrinter : public AbstractDottyPrinter {
       return;
     visitedNodes_.insert(N);
 
-    dumpNode(N);
+    dumpNode(N, false);
 
     // Print edges for the predicate field, if it's used.
     if (N->hasPredicate()) {
       auto pred = N->getPredicate();
       size_t resNo = pred.getResNo();
       std::ostringstream edge;
-      edge << uniqueVertexName(pred) << ":"
+      edge << pred.getNode()->getName().str() << ":"
            << pred.getNode()->getOutputName(resNo).str() << " -> "
-           << uniqueVertexName(N) << ":w";
+           << N->getName().str() << ":w";
       dumpEdgeStyle(N, 0, pred, edge);
       edges_.insert(edge.str());
       visitNode(pred);
@@ -2630,8 +4460,8 @@ class FunctionDottyPrinter : public AbstractDottyPrinter {
       size_t resNo = N->getNthInput(i).getResNo();
 
       std::ostringstream edge;
-      edge << uniqueVertexName(to) << ":" << to->getOutputName(resNo).str()
-           << " -> " << uniqueVertexName(N) << ":" << N->getInputName(i);
+      edge << to->getName().str() << ":" << to->getOutputName(resNo).str()
+           << " -> " << N->getName().str() << ":" << N->getInputName(i);
       dumpEdgeStyle(N, i, to, edge);
       edges_.insert(edge.str());
 
@@ -2682,16 +4512,47 @@ Node *Function::getNodeByName(llvm::StringRef name) {
   return nullptr;
 }
 
+NodeValue Function::getNodeValueByName(llvm::StringRef name) {
+  auto strPair = name.split(':');
+  // Search node, constant or placeholder.
+  auto nodeName = strPair.first;
+  Node *node = getNodeByName(nodeName);
+  node = node ? node : getParent()->getConstantByName(nodeName);
+  node = node ? node : getParent()->getPlaceholderByName(nodeName);
+  if (!node || (node->getNumResults() == 0)) {
+    return NodeValue();
+  }
+  // Get result number.
+  if (node->getNumResults() == 1) {
+    return NodeValue(node);
+  } else {
+    unsigned resNo = 0;
+    CHECK(!strPair.second.getAsInteger(0, resNo)) << "Invalid node value name!";
+    return NodeValue(node, resNo);
+  }
+}
+
 void Module::eraseConstant(ConstList::iterator I) {
   if (I == constants_.end())
     return;
+  logStorageDeletion(functions_, *I);
   delete *I;
   constants_.erase(I);
 }
 
+void Module::erasePlaceholder(PlaceholderList::iterator I) {
+  if (I == placeholders_.end()) {
+    return;
+  }
+
+  logStorageDeletion(functions_, *I);
+  delete *I;
+  placeholders_.erase(I);
+}
+
 void Function::eraseNode(NodesList::iterator I) {
   // Log node deletion.
-  logCtx_.logNodeDeletion(*I);
+  logCtx_->logNodeDeletion(*I);
 
   nodes_.erase(I);
 }
@@ -2784,12 +4645,23 @@ ConstList Function::findConstants() const {
 }
 
 Function *Function::clone(llvm::StringRef newName,
-                          llvm::DenseMap<Node *, Node *> *map) {
+                          llvm::DenseMap<const Node *, Node *> *map,
+                          llvm::DenseMap<const Node *, Node *> *currToNewMap) {
   Module *M = getParent();
   auto *newF = M->createFunction(newName);
+  return clone(newF, map, currToNewMap);
+}
 
+Function *
+Function::clone(Function *newF, llvm::DenseMap<const Node *, Node *> *map,
+                llvm::DenseMap<const Node *, Node *> *currToNewMap) const {
   // Maps current nodes to new nodes.
-  llvm::DenseMap<Node *, Node *> currToNew;
+  llvm::DenseMap<const Node *, Node *> currToNew;
+
+  // Initialize the map from a user-provided map.
+  if (currToNewMap) {
+    currToNew.insert(currToNewMap->begin(), currToNewMap->end());
+  }
 
   // Clone all of the nodes in the function.
   for (auto &N : getNodes()) {
@@ -2797,6 +4669,9 @@ Function *Function::clone(llvm::StringRef newName,
     // Record the copy relationship between the graphs.
     currToNew[&N] = copy;
     newF->addNode(copy);
+    if (N.hasPredicate()) {
+      copy->setPredicate(N.getPredicate());
+    }
   }
 
   // At this point we have a new invalid function that points into nodes in
@@ -2816,6 +4691,13 @@ Function *Function::clone(llvm::StringRef newName,
 
       // Update the node with the edge to the current graph.
       N.setNthInput(inp, NodeValue(it->second, input.getResNo()));
+    }
+
+    if (N.hasPredicate()) {
+      auto it = currToNew.find(N.getPredicate().getNode());
+      if (it != currToNew.end()) {
+        N.setPredicate(NodeValue(it->second, N.getPredicate().getResNo()));
+      }
     }
   }
 
@@ -2847,6 +4729,49 @@ static bool verifyNodeInput(const Node &N, size_t idx) {
   report("Any node referencing another node N must be in the use-list of the "
          "node N");
   return false;
+}
+
+Module *Module::clone() const {
+  auto *M = new Module;
+  return clone(M);
+}
+
+Module *Module::clone(Module *M) const {
+  // Maps current nodes to new nodes.
+  llvm::DenseMap<const Node *, Node *> currToNew;
+  // Clone placeholders.
+  for (auto &PH : getPlaceholders()) {
+    auto *copyPH = M->createPlaceholder(PH->getType(), PH->getName(),
+                                        PH->isTraining(), PH->getLayout());
+    currToNew[PH] = copyPH;
+  }
+  // Clone constants.
+  for (auto &C : getConstants()) {
+    // Cloner cannot decide on its own what to do with constants having unowned
+    // payloads. Some kind of policy/hook maybe needed in the future for
+    // deciding what needs to be done in such cases.
+    DCHECK(!C->getPayload().isUnowned())
+        << "Cannot copy constant " << C->getName().str()
+        << ": Unowned payloads are not supported";
+    auto *copyC = M->createConstant(C->getType(), C->getName(), C->getLayout());
+    copyC->assign(&C->getPayload());
+    currToNew[C] = copyC;
+  }
+  // Clone all functions.
+  for (auto *F : getFunctions()) {
+    // Create an empty clone function in the new module.
+    auto *copyF = M->createFunction(F->getName());
+    // Clone function's body into the newly created cloned function. Use the
+    // currToNew to properly map constants and placeholders.
+    F->clone(copyF, nullptr, &currToNew);
+    // Update all types by cloned types.
+    for (auto &N : copyF->getNodes()) {
+      for (unsigned idx = 0, e = N.getNumResults(); idx < e; ++idx) {
+        N.setType(idx, M->uniqueType(*N.getType(idx)));
+      }
+    }
+  }
+  return M;
 }
 
 /// \returns True if \p n is a storage node (constant or placeholder) of the
@@ -2892,8 +4817,21 @@ insertAndReport(std::unordered_map<std::string, const Node *> &nameToNode,
   return true;
 }
 
-bool Function::verify() const {
+bool Function::verify(const Backend *backend) const {
   bool isValid = true;
+  if (backend) {
+    if (backend->getTensorLayoutRequirements().isEnabled()) {
+      isValid &= expectCompareTrue(
+          "Expected correct backend-specific layouts for the graph",
+          verifyLayouts(*this, backend->getTensorLayoutRequirements()), true,
+          this);
+    }
+  } else {
+    // Always run verification pre-lowering / when we don't have backend:
+    isValid &= expectCompareTrue(
+        "Expected correct Glow canonical layouts for the graph",
+        verifyLayouts(*this, CanonicalTensorLayout::getInstance()), true, this);
+  }
   std::unordered_map<std::string, const Node *> nameToNode;
 
   for (auto *V : getParent()->getConstants()) {
@@ -2930,6 +4868,20 @@ bool Function::verify() const {
           "All uses of a node should refer to this node", U.get()->getNode(),
           &N, &N);
       ;
+    }
+  }
+
+  // Check that all types used by nodes belong to the parent module.
+  auto &types = getParent()->getTypes();
+  for (const auto &N : nodes_) {
+    for (size_t idx = 0, e = N.getNumResults(); idx < e; ++idx) {
+      auto ty = N.getType(idx);
+      bool foundType =
+          std::find(types.begin(), types.end(), *ty) != types.end();
+      isValid &= expectCompareTrue(
+          "Every type used by one of the graph nodes should be part of "
+          "the graph",
+          foundType, true, &N);
     }
   }
 
@@ -3024,7 +4976,73 @@ SaveNode *glow::getOutputSave(Function *F, Placeholder *PH) {
   return nullptr;
 }
 
+Node *glow::recursiveClone(Function *newF, Node *node, NodeMap &currToNew) {
+  Node *copy = node->clone();
+  currToNew[node] = copy;
+  newF->addNode(copy);
+  for (unsigned inp = 0, e = copy->getNumInputs(); inp < e; inp++) {
+    auto input = copy->getNthInput(inp);
+    auto it = currToNew.find(input.getNode());
+    Node *newInput;
+    if (it != currToNew.end()) {
+      newInput = it->second;
+    } else if (llvm::isa<Storage>(input.getNode())) {
+      continue;
+    } else {
+      newInput = recursiveClone(newF, input.getNode(), currToNew);
+    }
+    copy->setNthInput(inp, NodeValue(newInput, input.getResNo()));
+  }
+  return copy;
+}
+
 namespace glow {
+/// If \p PH is an output placeholder, \returns true.
+/// This is determined by checking if the PH has a user which uses the PH as an
+/// overwritten input.
+bool isOutput(const Placeholder *PH, const Function &F) {
+  for (const auto &use : PH->getUsers()) {
+    // Look through the inputs of the PH's users. If an input is overwritten
+    // check if it's the PH, if it is return true.
+    auto *user = use.getUser();
+    // Consider only users inside the same function.
+    if (user->getParent() != &F) {
+      continue;
+    }
+    for (unsigned i = 0, numInputs = user->getNumInputs(); i < numInputs; i++) {
+      // If the input is not overwritten we can continue.
+      if (!user->isOverwrittenNthInput(i)) {
+        continue;
+      }
+      auto input = use.getUser()->getNthInput(i);
+      if (input.getNode() == PH) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/// If \p PH is an input placeholder, \returns true.
+bool isInput(const Placeholder *PH, const Function &F) {
+  // Check that the PH is the input to a saveNode or is used by a non saveNode.
+  for (const auto &use : PH->getUsers()) {
+    // Consider only users inside the same function.
+    if (use.getUser()->getParent() != &F) {
+      continue;
+    }
+    // Check if PH is an input to a saveNode.
+    if (auto *save = dyn_cast<SaveNode>(use.getUser())) {
+      auto input = save->getInput();
+      // If the PH is not an input to the saveNode we keep looking.
+      if (input.getNode() != PH) {
+        continue;
+      }
+    }
+    return true;
+  }
+  return false;
+}
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Module &mod) {
   mod.dump(os);

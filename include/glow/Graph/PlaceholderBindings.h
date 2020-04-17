@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,7 +41,7 @@ public:
   using PlaceholderMap = std::unordered_map<Placeholder *, Tensor *>;
 
   /// Maps Placeholder names to Placeholders.
-  using PlaceholderNameMap = std::unordered_map<std::string, Placeholder *>;
+  using PlaceholderNameMap = llvm::StringMap<Placeholder *>;
 
 private:
   /// Maps Placeholders to Tensors.
@@ -52,9 +52,11 @@ private:
 
 public:
   /// \returns true if \p A and \p B contain the same Placeholders mapped to
-  /// equivalent Tensors.
+  /// equivalent Tensors. \p allowedError is used when comparing each
+  /// Placeholder's backing payload data.
   static bool compare(const PlaceholderBindings *A,
-                      const PlaceholderBindings *B);
+                      const PlaceholderBindings *B,
+                      float allowedError = 0.0001);
 
   /// \returns the tensor that corresponds to Placeholder \p P or Null if the
   /// tensor is not found.
@@ -70,6 +72,14 @@ public:
   /// Inserts the Placeholder-Tensor pair. This takes ownership of the Tensor.
   void insert(Placeholder *P, Tensor *T);
 
+  /// Copy values from this PlaceholderBindings to another, \p dst, by \p name.
+  /// This is useful when trained weights need to be transferred between
+  /// bindings of two different modules.
+  void copyToTarget(llvm::StringRef name, PlaceholderBindings &dst);
+
+  /// Transfer all trainable weights to target PlaceholderBindings \p dst.
+  void copyTrainableWeightsTo(PlaceholderBindings &dst);
+
   /// Allocates a tensor to back the placeholder \p P. The new tensor has the
   /// type of P.
   Tensor *allocate(Placeholder *P);
@@ -77,12 +87,12 @@ public:
   /// Allocates zero-initialized backing tensors to all placeholders in \p lst
   /// that are not currently allocated in the bindings.
   /// \returns the number of tensors that were allocated.
-  unsigned allocate(std::list<Placeholder *> &lst);
+  unsigned allocate(const std::list<Placeholder *> &lst);
 
   /// \returns the first placeholder in \p list that is not allocated by this
   /// bindings. This method returns null if all placeholders in the list are
   /// allocated.
-  Placeholder *getFirstUnallocated(std::list<Placeholder *> &lst) const;
+  Placeholder *getFirstUnallocated(const std::list<Placeholder *> &lst) const;
 
   /// \returns True if \p P is a registered Placeholder.
   size_t count(Placeholder *P) const;
@@ -95,6 +105,10 @@ public:
   /// \p P must be a valid Placeholder registered in the bindings.
   void erase(Placeholder *P);
 
+  /// Removes the existing Tensor backing Placeholder \p P; Bind \p T to \P.
+  /// \p P must be a valid Placeholder registered in the bindings.
+  void update(Placeholder *P, Tensor &&T);
+
   /// \returns a copy of the PlaceholderBindings, with each placeholder mapped
   /// to a new Tensor, with their own memory.
   PlaceholderBindings clone() const;
@@ -105,6 +119,13 @@ public:
   /// \returns the size in bytes of allocated Tensors owned by
   /// PlaceholderBindings.
   uint64_t getDataSize() const;
+
+  /// Copies all Device Resident Tensors back to the host.
+  void ensureOnHost() {
+    for (auto &ph : pairs()) {
+      ph.second->ensureOnHost();
+    }
+  }
 
   PlaceholderBindings() = default;
 

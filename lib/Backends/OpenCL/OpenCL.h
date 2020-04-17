@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,8 +37,11 @@
 
 namespace glow {
 
-class OCLConvolutionInst;
+class ConvolutionInst;
 class Value;
+namespace runtime {
+struct OpenCLDeviceBindings;
+}
 
 /// A helper struct with information about kernels launches.
 struct KernelLaunch {
@@ -68,13 +71,16 @@ static void addIntOption(std::vector<std::string> &options,
   options.push_back("-D" + name + "=" + std::to_string(value));
 }
 
+using ManualEventMap =
+    std::map<std::string, std::pair<Placeholder *, const TraceInfo::Event *>>;
+
 /// A Glow IR function compiled for OpenCL.
 class OpenCLFunction final : public CompiledFunction {
   /// A helper type representing a key for the program's cache.
   /// Each compiled program is uniquely identified by its source code, set of
   /// compiler options that were used and the device it was compiled for.
-  using ProgramKey =
-      std::tuple<const std::string, const std::string, const cl_device_id>;
+  using ProgramKey = std::tuple<const std::string, const std::string,
+                                const cl_device_id, const cl_context>;
   struct ProgramKeyHash {
     std::size_t operator()(const ProgramKey &K) const noexcept {
       return llvm::hash_combine(std::get<0>(K), std::get<1>(K), std::get<2>(K));
@@ -82,46 +88,36 @@ class OpenCLFunction final : public CompiledFunction {
   };
   /// The IR to be executed.
   std::unique_ptr<IRFunction> F_;
-  /// CL compute device id.
-  cl_device_id deviceId_;
-  /// CL compute context.
-  cl_context context_;
-  /// CL compute command queue.
-  cl_command_queue commands_;
+
   /// Cache of compiled programs.
   /// The same source code can be compile with different options (e.g. with
   /// different set of macro definitions) and/or for a different device and
   /// would result in different programs.
   std::unordered_map<ProgramKey, cl_program, ProgramKeyHash> programsCache_;
-  /// A pointer to the on-device memory buffer.
-  cl_mem deviceBuffer_{0};
-  /// Information about kernel launches.
-  std::vector<KernelLaunch> kernelLaunches_;
+
   /// is kernel level profiling (autoInstrumentation) enabled.
   bool kernelProfiling_{false};
   /// Manual trace events:
-  std::map<std::string, std::pair<Placeholder *, const TraceInfo::Event *>>
-      manualTraceEvents_;
+  ManualEventMap manualTraceEvents_;
 
 public:
   /// Ctor.
   explicit OpenCLFunction(std::unique_ptr<IRFunction> F,
-                          const runtime::RuntimeBundle &bundle,
-                          TraceInfo traceInfo);
+                          runtime::RuntimeBundle &&bundle, TraceInfo traceInfo);
 
   /// @name CompiledFunction interface
   ///@{
   ~OpenCLFunction() override;
 
-  llvm::Error execute(ExecutionContext *context) override;
+  Error execute(ExecutionContext *context) override;
+
+  void freeCompilationResources() override;
 
   /// Collects constants for runtime.
   void collectConstants(const Module *module) override;
 
-  /// \returns the Kind of Backend used to compile this function.
-  virtual BackendKind getCompileBackendKind() const override {
-    return BackendKind::OpenCL;
-  }
+  /// \returns the backend used to compile this function.
+  std::string getCompileBackendName() const override { return "OpenCL"; }
   ///@}
 
   /// Returns IR function pointer.
@@ -132,30 +128,63 @@ public:
                            const std::vector<std::string> &options,
                            cl_command_queue queue);
 
+  /// Returns metadata about manual TraceEvents defined in this function.
+  ManualEventMap &getManualTraceEvents() { return manualTraceEvents_; }
+
 private:
+  /// Returns the directory of cached pre-built programs for the given device.
+  /// \returns the directory as given by the user.
+  std::string deviceProgramCacheDir(cl_device_id deviceId);
+
+  /// Returns the (hashed) file name of a cached pre-built program for the
+  /// given source and set of build options.
+  /// \returns the filename (without directory).
+  std::string diskCacheProgramFileName(cl_device_id deviceId,
+                                       const std::string &source,
+                                       const std::string &options);
+
+  /// (Tries to) load a program with the given (hashed) filename
+  /// from the disk cache.
+  /// \returns pointer to the program, if found, nullptr otherwise.
+  cl_program loadProgramFromDiskCache(std::string cacheDirectory,
+                                      std::string programFileName,
+                                      cl_context ctx, cl_device_id device);
+
+  /// Save the given program to the disk cache.
+  void saveProgramToDiskCache(std::string cacheDirectory,
+                              std::string programFilename, cl_program program,
+                              cl_context ctx, cl_device_id deviceId);
+
   /// Copy the value from a device to a provided buffer.
   /// \returns number of copied bytes.
-  uint64_t copyValueFromDevice(const Value *v, void *buf = nullptr);
+  uint64_t copyValueFromDevice(const Value *v,
+                               runtime::OpenCLDeviceBindings *devBindings,
+                               void *buf = nullptr);
   /// Copy value from the provided buffer to the device.
   /// \returns number of copied bytes.
-  uint64_t copyValueToDevice(const Value *v, void *buf = nullptr);
+  uint64_t copyValueToDevice(const Value *v,
+                             runtime::OpenCLDeviceBindings *devBindings,
+                             void *buf = nullptr);
   /// Fill the device \p buffer with a given \p value.
   /// \param len number of buffer elements to be filled by the \p value.
   /// Elements are considered to be of the type described by \p elemKind.
   void fillBuffer(cl_mem buffer, uint64_t start, uint64_t len, float value,
-                  ElemKind elemKind);
+                  ElemKind elemKind,
+                  runtime::OpenCLDeviceBindings *devBindings);
 
   /// Execution a convolution instruction which uses NCHW format.
-  void executeConvolution(const OCLConvolutionInst *CC);
+  void executeNCHWConvolution(const ConvolutionInst *CC,
+                              ExecutionContext *executionContext,
+                              runtime::OpenCLDeviceBindings *devBindings);
   /// Allocate a device buffer of required \p size.
-  cl_mem allocDeviceBuffer(uint64_t size);
+  cl_mem allocDeviceBuffer(uint64_t size, cl_context clContext);
   /// Frees a device buffer.
   void freeDeviceBuffer(cl_mem buf);
 
   /// Create kernel with a given \p name from a \p program.
   /// If \p program is nullptr, try to find the kernel with a given \p name
   /// in any of compiled programs.
-  cl_kernel createKernel(const std::string &name, cl_program program = nullptr);
+  cl_kernel createKernel(const std::string &name, cl_program program);
 
   /// Enqueue a \p kernel on a provided \p commands queue.
   void enqueueKernel(llvm::StringRef name, cl_command_queue commands,
@@ -170,14 +199,13 @@ private:
                      llvm::ArrayRef<size_t> local,
                      std::vector<KernelLaunch> &kernelLaunches);
 
-  /// Load inputs from \p bindings onto the device.
-  void loadPlaceholders(PlaceholderBindings *bindings);
-
   /// Load outputs from the device into \p bindings.
-  void updatePlaceholders(PlaceholderBindings *bindings);
+  void updatePlaceholders(PlaceholderBindings *bindings,
+                          runtime::OpenCLDeviceBindings *devBindings);
 
   /// Read trace events out of this func and write them into /p bindings
-  void translateTraceEvents(ExecutionContext *context) const override;
+  void translateTraceEventsCL(ExecutionContext *context,
+                              runtime::OpenCLDeviceBindings *devBindings);
 };
 
 /// This is the OpenCL backend.
@@ -191,32 +219,58 @@ public:
   ///@{
   ~OCLBackend() override = default;
 
-  BackendKind getBackendKind() const override { return BackendKind::OpenCL; }
-
-  std::string getBackendName() const override { return getName(); }
+  std::string getBackendName() const override {
+    return Named::getName().empty() ? getName() : Named::getName().str();
+  }
   static std::string getName() { return "OpenCL"; }
+  static unsigned numDevices() { return 1; }
 
   std::unique_ptr<CompiledFunction>
   compileIR(std::unique_ptr<IRFunction> IR) const override;
 
-  llvm::Expected<std::unique_ptr<CompiledFunction>>
+  Expected<std::unique_ptr<CompiledFunction>>
   compile(Function *F, const BackendOptions &opts) const override;
 
-  bool transformPostLowering(Function *F,
-                             CompilationContext &cctx) const override;
+  Expected<bool> transformPostLowering(
+      Function *F, CompilationContext &cctx,
+      const glow::runtime::DeviceInfo *devInfo) const override;
 
   bool isOpSupported(const NodeInfo &NI) const override;
 
+  bool verify(const Function &F, bool verbose = true) const override;
+  bool verify(const IRFunction &IR) const override;
+
+  TensorLayoutCommon &getTensorLayoutRequirements() const override;
+
   bool shouldLower(const Node *N) const override {
     // The group convolution is supported in OpenCL slow convolution kernel.
-    if (N->getKind() == Kinded::Kind::ConvolutionNodeKind)
+    if (N->getKind() == Kinded::Kind::ConvolutionNodeKind) {
       return false;
+    }
+    // Do not lower ReLU to max, but let it pass to the backend where we
+    // can implement it with a unary max(0, x) kernel. This also enables fusing
+    // convolution with ReLU.
+    if (N->getKind() == Kinded::Kind::ReluNodeKind) {
+      return false;
+    }
     return true;
   }
 
   /// Size of each TraceEvent (for manual events).
   size_t getTraceEventDataSize() const override { return sizeof(uint64_t); }
 
+  runtime::DeviceManager *
+  createDeviceManager(const runtime::DeviceConfig &deviceConfig) override;
+
+  /// \returns whether the backend supports fusing \p activation into \p parent.
+  bool supportsFusedActivation(Node *parent, Node *activation) const override {
+    // Only support convolution+relu fusions for now.
+    bool V = parent->getKind() == Kinded::Kind::ConvolutionNodeKind &&
+             activation->getKind() == Kinded::Kind::ReluNodeKind;
+    return V;
+  }
+
+private:
   /// Parses the graph \F and builds a TraceInfo structure from any found
   /// TraceEventNodes.
   TraceInfo buildManualTraceInfo(Function *F) const;
@@ -233,9 +287,9 @@ namespace runtime {
 /// device.
 struct OpenCLDeviceBindings : DeviceBindings {
   OpenCLDeviceBindings(cl_mem buffer, cl_command_queue commands,
-                       cl_device_id device, cl_context ctx)
-      : DeviceBindings(BackendKind::OpenCL), deviceBuffer{buffer},
-        commandQueue{commands}, deviceId{device}, context{ctx} {}
+                       cl_device_id device, cl_context ctx, cl_program prog)
+      : DeviceBindings(OCLBackend::getName()), deviceBuffer{buffer},
+        commandQueue{commands}, deviceId{device}, context{ctx}, program{prog} {}
 
   /// CL memory buffer. Currently this contains both mutable and immutable
   /// weights, the buffer is allocated once when the network is added.
@@ -253,6 +307,12 @@ struct OpenCLDeviceBindings : DeviceBindings {
   /// will take place in.
   ///
   cl_context context;
+
+  /// CL program which was compiled at addNetwork.
+  cl_program program;
+
+  /// A list of kernels and their associated events.
+  std::vector<KernelLaunch> kernelLaunches;
 };
 } // namespace runtime
 } // namespace glow

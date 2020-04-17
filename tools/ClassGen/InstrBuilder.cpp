@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ void InstrBuilder::emitCtor(std::ostream &os) const {
 
   // Extra class members:
   for (const auto &op : members_) {
-    os << ", " << getStorageTypename(op.first) << " " << op.second;
+    os << ", " << getStorageTypename(&op.first) << " " << op.second;
   }
 
   // Initialize the base clases:
@@ -76,8 +76,8 @@ void InstrBuilder::emitIRBuilderMethods(std::ostream &osH,
 
   // Extra class members:
   for (const auto &op : members_) {
-    osH << ", " << getStorageTypename(op.first) << " " << op.second;
-    osB << ", " << getStorageTypename(op.first) << " " << op.second;
+    osH << ", " << getStorageTypename(&op.first) << " " << op.second;
+    osB << ", " << getStorageTypename(&op.first) << " " << op.second;
   }
 
   osH << ");\n";
@@ -115,6 +115,11 @@ void InstrBuilder::emitInplaceMethod(std::ostream &os) const {
   os << "    return false;\n  }\n";
 }
 
+void InstrBuilder::emitCanonicalProperty(std::ostream &os) const {
+  os << "\n  bool isCanonical() const {\n";
+  os << "    return " << (isBackendSpecific_ ? "false" : "true") << ";\n  }\n";
+}
+
 void InstrBuilder::emitDataParallelProperty(std::ostream &os) const {
   os << "\n  bool isDataParallel() const {\n";
   os << "    return " << (isDataParallel_ ? "true" : "false") << ";\n  }\n";
@@ -128,7 +133,7 @@ void InstrBuilder::emitProperties(std::ostream &os) const {
 void InstrBuilder::emitClassMembers(std::ostream &os) const {
   // Emit class members:
   for (const auto &op : members_) {
-    os << "  " << getStorageTypename(op.first) << " " << op.second << "_;\n";
+    os << "  " << getStorageTypename(&op.first) << " " << op.second << "_;\n";
   }
 }
 
@@ -139,7 +144,8 @@ void InstrBuilder::emitOperandGetter(std::ostream &os, const std::string &name,
      << ").first; }\n";
 }
 
-void InstrBuilder::emitMemberGetter(std::ostream &os, MemberType type,
+void InstrBuilder::emitMemberGetter(std::ostream &os,
+                                    const MemberTypeInfo *type,
                                     const std::string &name) const {
   // Synthesize the general getter.
   auto returnTypeStr = getReturnTypename(type);
@@ -155,7 +161,7 @@ void InstrBuilder::emitSettersGetters(std::ostream &os) const {
   }
 
   for (const auto &op : members_) {
-    emitMemberGetter(os, op.first, op.second);
+    emitMemberGetter(os, &op.first, op.second);
   }
 
   // Synthesize the 'classof' method that enables the non-rtti polymorphism.
@@ -182,6 +188,32 @@ void InstrBuilder::emitPrettyPrinter(std::ostream &os) const {
   os << "}\n";
 }
 
+void InstrBuilder::emitCloner(std::ostream &os) const {
+  os << "\nInstruction* " << name_ << "Inst::clone() const {\n";
+
+  os << "  return new " << name_ << "Inst(getName()";
+
+  for (const auto &op : operands_) {
+    os << ", get" << op.first << "()";
+  }
+
+  for (const auto &mem : members_) {
+    os << ", get" << mem.second << "()";
+  }
+
+  os << ");\n}\n";
+}
+
+void InstrBuilder::emitGetOperandName(std::ostream &os) const {
+  os << "\nllvm::StringRef " << name_
+     << "Inst::getOperandName(unsigned idx) const {\n";
+  for (size_t i = 0; i < operands_.size(); i++) {
+    os << "  if (idx == " << i << ") { return \"" << operands_[i].first
+       << "\"; }\n";
+  }
+  os << "  llvm_unreachable(\"Invalid index\");\n}\n";
+}
+
 std::string getOpElementType(const std::string &name) {
   const std::string elemKindPrefix = "ElemKind::";
   if (name.substr(0, elemKindPrefix.size()) == elemKindPrefix) {
@@ -206,7 +238,9 @@ void InstrBuilder::emitClass(std::ostream &os) const {
     os << "  " << m.first << "\n";
   }
 
+  os << "\n  Instruction* clone() const;\n";
   os << "\n  void dump(llvm::raw_ostream &os) const;\n";
+  os << "\n  llvm::StringRef getOperandName(unsigned idx) const;\n";
 
   // If there is no auto-verification then we assume verification is manually
   // provided.
@@ -273,7 +307,8 @@ void InstrBuilder::emitClass(std::ostream &os) const {
 
 void InstrBuilder::emitCppMethods(std::ostream &os) const {
   emitPrettyPrinter(os);
-
+  emitCloner(os);
+  emitGetOperandName(os);
   // Emit the "extra" method bodies.
   for (const auto &m : extraMethods_) {
     os << "  " << m.second << "\n";
@@ -416,4 +451,46 @@ void InstrBuilder::emitAutoIRGen(std::ostream &os) const {
   os << "  nodeToInstr_[N] = V;\n";
   os << "  break;\n";
   os << "}\n";
+}
+
+InstrBuilder &InstrBuilder::addMember(MemberType type,
+                                      const std::string &name) {
+  MemberTypeInfo *typeInfo = nullptr;
+
+  if (type == MemberType::TypeRef) {
+    typeInfo = &kTypeRefTypeInfo;
+  } else if (type == MemberType::Float) {
+    typeInfo = &kFloatTypeInfo;
+  } else if (type == MemberType::Unsigned) {
+    typeInfo = &kUnsignedTypeInfo;
+  } else if (type == MemberType::Boolean) {
+    typeInfo = &kBooleanTypeInfo;
+  } else if (type == MemberType::Int64) {
+    typeInfo = &kInt64TypeInfo;
+  } else if (type == MemberType::String) {
+    typeInfo = &kStringTypeInfo;
+  } else if (type == MemberType::VectorFloat) {
+    typeInfo = &kVectorFloatTypeInfo;
+  } else if (type == MemberType::VectorUnsigned) {
+    typeInfo = &kVectorUnsignedTypeInfo;
+  } else if (type == MemberType::VectorInt64) {
+    typeInfo = &kVectorInt64TypeInfo;
+  } else if (type == MemberType::VectorSigned) {
+    typeInfo = &kVectorSignedTypeInfo;
+  } else if (type == MemberType::VectorSizeT) {
+    typeInfo = &kVectorSizeTTypeInfo;
+  } else if (type == MemberType::VectorDimT) {
+    typeInfo = &kVectorDimTTypeInfo;
+  } else if (type == MemberType::VectorNodeValue) {
+    typeInfo = &kVectorNodeValueTypeInfo;
+  } else if (type == MemberType::Enum) {
+    typeInfo = &kEnumTypeInfo;
+  } else if (type == MemberType::UserDefinedType) {
+    llvm_unreachable("addMember should be called with a MemberTypeInfo "
+                     "parameter in this case");
+  } else {
+    llvm_unreachable("Type not recognized");
+  }
+
+  return addMember(*typeInfo, name);
 }

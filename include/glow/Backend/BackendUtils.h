@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@
 
 #include "glow/CodeGen/MemoryAllocator.h"
 #include "glow/IR/IR.h"
+
+#include <map>
 
 namespace glow {
 namespace runtime {
@@ -47,7 +49,7 @@ struct RuntimeSymbolInfo {
   SymbolCategory symbolCategory;
 };
 
-using SymbolTableTy = std::unordered_map<std::string, RuntimeSymbolInfo>;
+using SymbolTableTy = std::map<std::string, RuntimeSymbolInfo>;
 
 /// Contains the information needed to be passed forward from compile time to
 /// runtime. In order to allocate and initialize memory.
@@ -62,6 +64,8 @@ class RuntimeBundle {
   size_t mutableWeightVarsMemSize_{0};
   /// Amount of memory needed for activations.
   size_t activationsMemSize_{0};
+  /// True if the RuntimeBundle is valid, false if not.
+  bool isValid_{false};
 
 public:
   /// Get Constant Weights memory size.
@@ -100,6 +104,21 @@ public:
                                        MemoryAllocator &placeholderAllocator,
                                        MemoryAllocator &activationsAllocator);
 
+  /// Computes offsets and total allocation for Constants, Placeholders, and
+  /// Activations to build runtime symbol table. \returns RuntimeBundle.
+  /// Constants and Placeholders are taken from \p F, and all Activations
+  /// required by each function in \p funcs are placed into the same
+  /// RuntimeBundle.
+  static runtime::RuntimeBundle
+  create(const Function &F, const std::vector<const IRFunction *> &funcs);
+
+  /// Computes offsets and total allocations for Constants, Placeholders, and
+  /// Activations to build runtime symbol table. \returns RuntimeBundle. Uses a
+  /// single allocator \p allocator and allocates all buffers contiguously in
+  /// the same block.
+  static runtime::RuntimeBundle create(const IRFunction &F,
+                                       MemoryAllocator &allocator);
+
   /// Build a runtime symbol table from a Function.  Computes Constant and
   /// Placeholder sizes, but not Activations, since Functions are unserialized.
   /// Only use this method to generate bundles for backends that do not use
@@ -116,9 +135,107 @@ public:
       : symbolTable_(std::move(symbolTable)), constants_(nullptr),
         constantWeightVarsMemSize_(constWeight),
         mutableWeightVarsMemSize_(mutableWeight),
-        activationsMemSize_(activations) {}
+        activationsMemSize_(activations), isValid_(true) {}
+
+  // Explicit copy constructor and deleted assignment operator. A RuntimeBundle
+  // should be moved. It should only be copied if absolutely necessary and never
+  // implicitly.
+  explicit RuntimeBundle(const RuntimeBundle &) = default;
+  RuntimeBundle &operator=(const RuntimeBundle &) = delete;
+
+  // Move constructor and assignment operator.
+  RuntimeBundle(RuntimeBundle &&rhs);
+  RuntimeBundle &operator=(RuntimeBundle &&rhs);
 };
 } // namespace runtime
+
+/// Generates a struct named has_\p METHOD_NAME that looks for a method called
+/// \p METHOD_NAME inside of ClassName with return type ReturnType.
+#define CLASS_CONTAINS_METHOD(METHOD_NAME)                                     \
+  template <typename ClassName, typename ReturnType>                           \
+  struct has_##METHOD_NAME {                                                   \
+  private:                                                                     \
+    template <typename T>                                                      \
+    static constexpr auto check(T *) ->                                        \
+        typename std::is_same<decltype(std::declval<T>().METHOD_NAME()),       \
+                              ReturnType>::type;                               \
+    template <typename> static constexpr std::false_type check(...);           \
+    typedef decltype(check<ClassName>(0)) type;                                \
+                                                                               \
+  public:                                                                      \
+    static constexpr bool value = type::value;                                 \
+  };
+
+/// Use template meta-programming to check if typename ClassName contains
+/// getFusedActivation() method. Below generates a struct named
+/// has_getFusedActivation that looks for said method.
+CLASS_CONTAINS_METHOD(getFusedActivation)
+
+/// If \p PH is an output placeholder in the IRFunction \p F,
+/// \returns true.
+/// This is determined by checking if the PH has weights which are referenced by
+/// other Instructions as OperandKind::InOut or OperandKind::Out.
+bool isOutput(const Placeholder *PH, const IRFunction &F);
+
+/// If \p PH is an input placeholder in the IRFunction \p F,
+/// \returns true.
+/// This is determined by checking if the PH is always used as an @in parameter
+/// by the current function.
+bool isInput(const Placeholder *PH, const IRFunction &F);
+
+/// If \p N does not have fused activation \returns true.
+template <typename T,
+          std::enable_if_t<!has_getFusedActivation<T, FusedActivation>::value,
+                           int> = 0>
+bool checkNoFusion(const T &N) {
+  (void)N;
+  return true;
+}
+
+/// If \p N does not have fused activation \returns true.
+template <typename T,
+          std::enable_if_t<has_getFusedActivation<T, FusedActivation>::value,
+                           int> = 0>
+bool checkNoFusion(const T &N) {
+  if (N.getFusedActivation() != FusedActivation::NONE) {
+    report("Glow backend does not support fused Activations for: " +
+           std::string(N.getKindName()));
+    return false;
+  }
+  return true;
+}
+
+/// If \p N does not have fused activation \returns true.
+bool checkNoFusionForNode(const Node &N);
+
+/// If \p I does not have fused activation \returns true.
+bool checkNoFusionForInstr(const Instruction &I);
+
+/// Contains information for placeholder during allocation.
+struct PlaceholderInputOutputInfo {
+  /// The placeholder address.
+  const Placeholder *addr;
+  /// Is the placeholder an input for the function.
+  bool isInput;
+  /// Is the placeholder an onput for the function.
+  bool isOutput;
+};
+
+using ContiguousPlaceholders = std::vector<PlaceholderInputOutputInfo>;
+
+/// Convert placeholders to be ordered as input|inputOutput|output|neither.
+/// Packed into {Placeholder *, isInput, isOutput} as
+/// PlaceholderInputOutputInfo. FUN could be Function or IRFunction. ARR could
+/// be std::list<Placeholder *> or std::vector<const Placeholder *>
+template <typename FUN, typename ARR>
+ContiguousPlaceholders getContiguousPlaceHolder(const ARR &holders,
+                                                const FUN &F);
+
+/// \returns true if \p V is capable of handling a partial tensor as input.
+bool allowsPartialInput(const Placeholder *V, const Function *F);
+
+/// \returns true if \p V is used in \p F; false otherwise.
+bool usedInFunction(const Placeholder *V, const Function *F);
 
 } // end namespace glow
 #endif // GLOW_BACKENDS_BACKENDUTILS_H

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <stdint.h>
 #include <string.h>
+
+#include "libjit_dim_t.h"
 
 #if defined(_MSC_VER)
 #include <BaseTsd.h>
@@ -70,8 +72,8 @@ inline void AdduFloat8(float *p, float8 v) {
 }
 
 /// \returns the index of the element at x,y,z,w,q,r.
-inline size_t libjit_getXYZWQR(const size_t *dims, size_t x, size_t y, size_t z,
-                               size_t w, size_t q, size_t r) {
+inline dim_t libjit_getXYZWQR(const dim_t *dims, dim_t x, dim_t y, dim_t z,
+                              dim_t w, dim_t q, dim_t r) {
   return (x * dims[1] * dims[2] * dims[3] * dims[4] * dims[5]) +
          (y * dims[2] * dims[3] * dims[4] * dims[5]) +
          (z * dims[3] * dims[4] * dims[5]) + (w * dims[4] * dims[5]) +
@@ -79,27 +81,27 @@ inline size_t libjit_getXYZWQR(const size_t *dims, size_t x, size_t y, size_t z,
 }
 
 /// \returns the index of the element at x,y,z,w,q.
-inline size_t libjit_getXYZWQ(const size_t *dims, size_t x, size_t y, size_t z,
-                              size_t w, size_t q) {
+inline dim_t libjit_getXYZWQ(const dim_t *dims, dim_t x, dim_t y, dim_t z,
+                             dim_t w, dim_t q) {
   return (x * dims[1] * dims[2] * dims[3] * dims[4]) +
          (y * dims[2] * dims[3] * dims[4]) + (z * dims[3] * dims[4]) +
          (w * dims[4]) + q;
 }
 
 /// \returns the index of the element at x,y,z,w.
-inline size_t libjit_getXYZW(const size_t *dims, size_t x, size_t y, size_t z,
-                             size_t w) {
+inline dim_t libjit_getXYZW(const dim_t *dims, dim_t x, dim_t y, dim_t z,
+                            dim_t w) {
   return (x * dims[1] * dims[2] * dims[3]) + (y * dims[2] * dims[3]) +
          (z * dims[3]) + w;
 }
 
 /// \returns the index of the element at x,y,z.
-inline size_t libjit_getXYZ(const size_t *dims, size_t x, size_t y, size_t z) {
+inline dim_t libjit_getXYZ(const dim_t *dims, dim_t x, dim_t y, dim_t z) {
   return (x * dims[1] * dims[2]) + (y * dims[2]) + z;
 }
 
 /// \returns the index of the element at x,y.
-inline size_t libjit_getXY(const size_t *dims, size_t x, size_t y) {
+inline dim_t libjit_getXY(const dim_t *dims, dim_t x, dim_t y) {
   return (x * dims[1]) + y;
 }
 
@@ -111,8 +113,9 @@ inline int8_t libjit_clip(int32_t val) {
 /// See QuantizationTransform32To8 for more details.
 inline int32_t libjit_scale_i32i8(int32_t input, int32_t pre, int32_t post,
                                   int32_t scale, int32_t offset) {
-  // The operation x >> y is rounded down to negative infinity. To get to
-  // round-nearest we add (1 << (shift - 1)) to the value prior to shifting.
+  // The operation x >> post is rounded down to negative infinity. To get to
+  // round-nearest we add (1 << (post - 1)) to the value prior to shifting.
+  // Rounding is performed only when shifting right (pos > 0).
   int rtn = (post > 0) ? (1 << (post - 1)) : 0;
 
   // NOTICE: If your tests are failing because of signed integer overflow then

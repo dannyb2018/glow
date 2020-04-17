@@ -1,6 +1,8 @@
 add_executable(image-classifier
   Loader.cpp
-  ImageClassifier.cpp)
+  ImageClassifier.cpp
+  ExecutorCore.cpp
+  ExecutorCoreHelperFunctions.cpp)
 
 target_link_libraries(image-classifier
                       PRIVATE
@@ -11,7 +13,7 @@ target_link_libraries(image-classifier
                         HostManager
                         Graph
                         Importer
-                        Optimizer
+                        GraphOptimizer
                         Quantization
                         LLVMSupport)
 
@@ -28,7 +30,7 @@ target_link_libraries(text-translator
                         HostManager
                         Importer
                         ExecutionEngine
-                        Optimizer
+                        GraphOptimizer
                         Quantization
                         LLVMSupport)
 
@@ -45,6 +47,76 @@ target_link_libraries(model-runner
                         HostManager
                         Importer
                         ExecutionEngine
-                        Optimizer
+                        GraphOptimizer
+                        Quantization
+                        LLVMSupport)
+
+add_executable(x-model-builder
+  Loader.cpp
+  XModelBuilder.cpp)
+
+target_link_libraries(x-model-builder
+                      PRIVATE
+                        Backends
+                        Base
+                        Converter
+                        Graph
+                        HostManager
+                        Importer
+                        ExecutionEngine
+                        GraphOptimizer
+                        Quantization
+                        LLVMSupport)
+
+add_executable(model-compiler
+  Loader.cpp
+  ModelCompiler.cpp)
+
+target_link_libraries(model-compiler
+                      PRIVATE
+                        Backends
+                        Base
+                        Converter
+                        Graph
+                        HostManager
+                        Importer
+                        ExecutionEngine
+                        GraphOptimizer
+                        Quantization
+                        LLVMSupport)
+
+add_executable(model-profiler
+  Loader.cpp
+  LoaderUtils.cpp
+  ModelProfiler.cpp)
+
+target_link_libraries(model-profiler
+                      PRIVATE
+                        Backends
+                        Base
+                        Converter
+                        Graph
+                        HostManager
+                        Importer
+                        ExecutionEngine
+                        GraphOptimizer
+                        Quantization
+                        LLVMSupport)
+
+add_executable(model-tuner
+  Loader.cpp
+  LoaderUtils.cpp
+  ModelTuner.cpp)
+
+target_link_libraries(model-tuner
+                      PRIVATE
+                        Backends
+                        Base
+                        Converter
+                        Graph
+                        HostManager
+                        Importer
+                        ExecutionEngine
+                        GraphOptimizer
                         Quantization
                         LLVMSupport)

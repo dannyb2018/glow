@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,8 @@
 #include "glow/Backend/Backend.h"
 #include "glow/Graph/Graph.h"
 #include "glow/Graph/PlaceholderBindings.h"
-#include "glow/Optimizer/Optimizer.h"
+#include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
+#include "glow/Support/Error.h"
 
 #include "llvm/ADT/STLExtras.h"
 
@@ -26,55 +27,64 @@
 
 using namespace glow;
 
-ExecutionEngine::ExecutionEngine(BackendKind backendKind) {
-  setBackend(backendKind);
-}
-
-/// Set the code generator kind to \p backendKind.
-void ExecutionEngine::setBackend(BackendKind backendKind) {
-  setBackend(createBackend(backendKind));
+ExecutionEngine::ExecutionEngine(llvm::StringRef backend, uint64_t deviceMemory,
+                                 bool ignoreUserDeviceConfig,
+                                 unsigned numDevices)
+    : deviceMemory_(deviceMemory),
+      ignoreUserDeviceConfig_(ignoreUserDeviceConfig) {
+  setBackendName(backend, numDevices);
 }
 
 /// Set the code generator to the given \p backend.
-void ExecutionEngine::setBackend(Backend *backend, bool ownsBackend) {
-  bool differentKinds = (backend_ == nullptr || backend == nullptr) ||
-                        backend->getBackendKind() != backend_->getBackendKind();
-  if (ownsBackend_) {
-    delete backend_;
-  }
-  backend_ = backend;
-  ownsBackend_ = ownsBackend;
+void ExecutionEngine::setBackendName(llvm::StringRef backend,
+                                     size_t numDevices) {
   clear();
+  module_.reset(new Module);
+  rawModule_ = module_.get();
+  backendName_ = backend;
 
-  if (differentKinds) {
-    if (device_) {
-      EXIT_ON_ERR(device_->stop());
-      device_.reset();
-    }
+  if (hostManager_) {
+    EXIT_ON_ERR(hostManager_->clearHost());
+    hostManager_.reset();
+  }
 
-    if (backend) {
-      device_ = std::unique_ptr<runtime::DeviceManager>(
-          runtime::DeviceManager::createDeviceManager(
-              runtime::DeviceConfig(backend->getBackendKind())));
-      EXIT_ON_ERR(device_->init());
+  std::vector<std::unique_ptr<runtime::DeviceConfig>> configs;
+  if (!ignoreUserDeviceConfig_ &&
+      loadDeviceConfigsFromFile(configs, deviceMemory_)) {
+    // Loaded from file, so verify that there is just a single device configured
+    // and that it matches the expected backend name.
+    CHECK_EQ(configs.size(), 1)
+        << "Expected a single device for the ExecutionEngine";
+    CHECK(backendName_ == configs[0]->backendName)
+        << "Expected backend name to match the ExecutionEngine";
+  } else {
+    for (size_t i = 0; i < numDevices; i++) {
+      auto config = glow::make_unique<runtime::DeviceConfig>(backendName_);
+      if (deviceMemory_) {
+        config->setDeviceMemory(deviceMemory_);
+      }
+      configs.push_back(std::move(config));
     }
   }
+  hostManager_ = glow::make_unique<runtime::HostManager>(std::move(configs));
 }
 
-const Backend *ExecutionEngine::getBackend() const { return backend_; }
+llvm::StringRef ExecutionEngine::getBackendName() const { return backendName_; }
 
-ExecutionEngine::~ExecutionEngine() {
-  // Call setBackend to make sure that backend_ is deleted if it's owned.
-  setBackend(nullptr, /*ownsBackend*/ false);
+Function *ExecutionEngine::getSingleFunctionFromModule() const {
+  auto &fList = getModule().getFunctions();
+  assert(fList.size() == 1 && "More than one Function in Module.");
+  return *fList.begin();
 }
+
+ExecutionEngine::~ExecutionEngine() { clear(); }
 
 void ExecutionEngine::clear() {
-  for (auto &func : compiledFunctions_) {
-    device_->evictNetwork(func.first(), [](std::string, llvm::Error err) {
-      EXIT_ON_ERR(std::move(err));
-    });
+  if (hostManager_) {
+    EXIT_ON_ERR(hostManager_->clearHost());
   }
   compiledFunctions_.clear();
+  module_.reset(nullptr);
 }
 
 void glow::updateInputPlaceholders(PlaceholderBindings &bindings,
@@ -112,96 +122,62 @@ void glow::updateInputPlaceholdersByName(PlaceholderBindings &bindings,
 }
 
 void ExecutionEngine::runInternal(ExecutionContext &context,
-                                  llvm::StringRef name,
-                                  CompiledFunction &compiledFunction) {
-  // Make sure that the bindings have backing tensors for all placeholders.
-  context.getPlaceholderBindings()->allocate(M_.getPlaceholders());
-
+                                  llvm::StringRef name) {
   std::unique_ptr<ExecutionContext> contextPtr(&context);
+  std::unique_ptr<ExecutionContext> contextOut;
   std::promise<void> runPromise;
   auto fut = runPromise.get_future();
-  llvm::Error runErr = llvm::Error::success();
-  device_->runFunction(
-      name, std::move(contextPtr),
-      [&runPromise, &runErr](runtime::RunIdentifierTy, llvm::Error err,
-                             std::unique_ptr<ExecutionContext> contextPtr) {
-        // Don't delete context.
-        contextPtr.release();
-        runErr = std::move(err);
-        runPromise.set_value();
-      });
+  Error runErr = Error::empty();
+  hostManager_->runNetwork(name, std::move(contextPtr),
+                           [&runPromise, &runErr, &contextOut](
+                               runtime::RunIdentifierTy, Error err,
+                               std::unique_ptr<ExecutionContext> contextPtr) {
+                             contextOut = std::move(contextPtr);
+                             runErr = std::move(err);
+                             runPromise.set_value();
+                           });
 
   fut.wait();
+  if (ensureOutputsOnHost_) {
+    contextOut->getPlaceholderBindings()->ensureOnHost();
+  }
+  // Don't delete context.
+  contextOut.release();
   EXIT_ON_ERR(std::move(runErr));
 }
 
 void ExecutionEngine::run(ExecutionContext &context) {
-  assert(compiledFunctions_.size() == 1 &&
+  assert((compiledFunctions_.size() == 1 || allowMultiFunction_) &&
          "Expected exactly one compiled function.");
-  runInternal(context, *compiledFunctions_.keys().begin(),
-              getCompiledFunction());
+  runInternal(context, *compiledFunctions_.begin());
 }
 
 void ExecutionEngine::run(ExecutionContext &context, llvm::StringRef name) {
-  runInternal(context, name, getCompiledFunction(name));
+  runInternal(context, name);
 }
 
 void ExecutionEngine::run(PlaceholderBindings &bindings) {
-  assert(compiledFunctions_.size() == 1 &&
+  assert((compiledFunctions_.size() == 1 || allowMultiFunction_) &&
          "Expected exactly one compiled function.");
   std::unique_ptr<PlaceholderBindings> bindingsPtr(&bindings);
   ExecutionContext context(std::move(bindingsPtr));
-  runInternal(context, *compiledFunctions_.keys().begin(),
-              getCompiledFunction());
-  // don't delete bindings
+  runInternal(context, *compiledFunctions_.begin());
+  // Don't delete bindings.
   context.movePlaceholderBindings().release();
 }
 
 void ExecutionEngine::run(PlaceholderBindings &bindings, llvm::StringRef name) {
   std::unique_ptr<PlaceholderBindings> bindingsPtr(&bindings);
   ExecutionContext context(std::move(bindingsPtr));
-  runInternal(context, name, getCompiledFunction(name));
-  // don't delete bindings
+  runInternal(context, name);
+  // Don't delete bindings.
   context.movePlaceholderBindings().release();
-}
-
-CompiledFunction &ExecutionEngine::getCompiledFunction() {
-  assert(compiledFunctions_.size() == 1 &&
-         "Expected exactly one compiled function.");
-  return *compiledFunctions_.begin()->second;
-}
-
-CompiledFunction &ExecutionEngine::getCompiledFunction(llvm::StringRef name) {
-  auto functionIt = compiledFunctions_.find(name);
-  assert(functionIt != compiledFunctions_.end() &&
-         "Could not find a compiled function with the given name.");
-  return *functionIt->second;
-}
-
-void ExecutionEngine::insertCompiledFunction(
-    llvm::StringRef name, std::unique_ptr<CompiledFunction> func) {
-  assert(compiledFunctions_.find(name) == compiledFunctions_.end());
-
-  runtime::FunctionMapTy functionMap;
-  functionMap[name] = func.get();
-  compiledFunctions_[name] = std::move(func);
-
-  std::promise<void> addPromise;
-  auto fut = addPromise.get_future();
-  llvm::Error addErr = llvm::Error::success();
-  device_->addNetwork(&M_, std::move(functionMap),
-                      [&addPromise, &addErr](const Module *, llvm::Error err) {
-                        addErr = std::move(err);
-                        addPromise.set_value();
-                      });
-  fut.wait();
-  EXIT_ON_ERR(std::move(addErr));
 }
 
 void glow::runBatch(ExecutionEngine &EE, PlaceholderBindings &bindings,
                     size_t iterations, size_t &sampleCounter,
                     llvm::ArrayRef<Placeholder *> ph,
-                    llvm::ArrayRef<Tensor *> inputs) {
+                    llvm::ArrayRef<Tensor *> inputs, llvm::StringRef name) {
   // This is the size of one batch (the number of samples in the batch).
   size_t batchSize = ph[0]->getType()->dims()[0];
 
@@ -229,48 +205,111 @@ void glow::runBatch(ExecutionEngine &EE, PlaceholderBindings &bindings,
     }
 
     // Run the network.
-    EE.run(bindings);
+    if (name == "") {
+      EE.run(bindings);
+    } else {
+      EE.run(bindings, name);
+    }
     sampleCounter += batchSize;
   }
 }
 
-void ExecutionEngine::compile(CompilationMode mode, Function *F,
-                              bool clearOtherFunctions) {
+void glow::evalBatch(
+    ExecutionEngine &EE, PlaceholderBindings &bindings, size_t numMinibatchRuns,
+    size_t &sampleCounter, Placeholder *inputPH, Placeholder *outputPH,
+    Tensor &samplesInput, Tensor &labelsInput, llvm::StringRef name,
+    std::function<void(const Tensor &sampleIn, const Tensor &sampleOut,
+                       const Tensor &label, size_t sampleIndex)> &&cb) {
+  // The number of samples in a minibatch (a single function run)
+  size_t minibatchSize = inputPH->getType()->dims()[0];
+
+  assert(samplesInput.dims()[0] == labelsInput.dims()[0] &&
+         "The number of sample inputs does not match the number of labels");
+
+  auto LIH = labelsInput.getHandle<int64_t>();
+
+  // For each iteration in the batch:
+  for (size_t j = 0; j < numMinibatchRuns; j++) {
+    assert(inputPH && "Invalid value");
+    auto *backingTensor = bindings.get(inputPH);
+    assert(backingTensor && "Can't find the backing tensor");
+    auto dim = samplesInput.dims();
+    assert(backingTensor->dims().drop_front() == dim.drop_front() &&
+           "Invalid slice size");
+    // Extract the n'th slice, that must be a tensor.
+    size_t slc = sampleCounter % dim[0];
+    // Pick up one slice from the input tensors, and load it into the
+    // corresponding network Placeholder.
+    backingTensor->copyConsecutiveSlices(&samplesInput, slc);
+
+    // Run the network.
+    if (name == "") {
+      EE.run(bindings);
+    } else {
+      EE.run(bindings, name);
+    }
+
+    for (unsigned i = 0; i < minibatchSize; i++) {
+      auto sampleInputTensor = backingTensor->getHandle().extractSlice(i);
+      auto sampleOutputTensor =
+          bindings.get(outputPH)->getHandle().extractSlice(i);
+      // If index is out of bounds of samples/labels first dimension, it is
+      // wrapped around to be consistent with "copyConsecutiveSlices".
+      auto labelTensor = LIH.extractSlice((sampleCounter + i) % dim[0]);
+
+      cb(sampleInputTensor, sampleOutputTensor, labelTensor, sampleCounter + i);
+    }
+    sampleCounter += minibatchSize;
+  }
+}
+
+void ExecutionEngine::compile(CompilationMode mode) {
   CompilationContext cctx;
   cctx.compMode = mode;
-  compile(F, cctx, clearOtherFunctions);
+  if (skipModuleStrip_) {
+    cctx.skipModuleStrip = true;
+  }
+  compile(cctx);
 }
 
-void ExecutionEngine::compile(Function *F, CompilationContext &cctx,
-                              bool clearOtherFunctions) {
-  llvm::StringRef name = F->getName();
+void ExecutionEngine::compile(CompilationContext &cctx) {
+  assert(module_.get() && "Compile has already been called.");
 
-  if (clearOtherFunctions) {
-    clear();
+  if (skipModuleStrip_) {
+    cctx.skipModuleStrip = true;
   }
 
-  assert(!compiledFunctions_.count(name) &&
-         "A function with this name has already been compiled.");
+  if (cctx.prepartitionedConfig) {
+    if (cctx.prepartitionedConfig->funcs.size() > 1) {
+      allowMultiFunction_ = true;
+    }
 
-  EXIT_ON_ERR(::glow::optimizeFunction(F, *backend_, cctx));
-
-  for (const Node &N : F->getNodes()) {
-    CHECK(backend_->isOpSupported(N))
-        << "Backend must support all nodes after high-level optimizations but "
-           "encountered unsupported operator: "
-        << N.getDebugDesc();
+    // If we are compiling a prepartitioned model then we should add the name of
+    // the prepartitioned config, which is later used as the root of the DAG,
+    // and also used to kick off running.
+    compiledFunctions_.insert(cctx.prepartitionedConfig->funcName);
   }
 
-  if (auto funcOrErr = backend_->compile(F, cctx.backendOpts)) {
-    insertCompiledFunction(name, std::move(*funcOrErr));
-  } else {
-    EXIT_ON_ERR(funcOrErr.takeError());
+  for (auto *F : module_->getFunctions()) {
+    // Check to see if this Function is part of the prepartitioned config if it
+    // exists, as we do not kick off execution for the partitions individually.
+    bool skipAdding = false;
+    if (cctx.prepartitionedConfig) {
+      auto &pFuns = cctx.prepartitionedConfig->funcs;
+      skipAdding = std::find(pFuns.begin(), pFuns.end(), F) != pFuns.end();
+    }
+    if (!skipAdding) {
+      compiledFunctions_.insert(F->getName());
+    }
   }
+
+  EXIT_ON_ERR(hostManager_->addNetwork(std::move(module_), cctx));
 }
 
-void ExecutionEngine::save(Function *F, CompilationContext &cctx,
-                           llvm::StringRef outputDir,
-                           llvm::StringRef networkName) {
-  EXIT_ON_ERR(::glow::optimizeFunction(F, *backend_, cctx));
-  backend_->save(F, outputDir, networkName);
+Backend &ExecutionEngine::getBackend(llvm::StringRef backendName) const {
+  return hostManager_->getBackend(backendName);
+}
+
+Backend &ExecutionEngine::getBackend() const {
+  return hostManager_->getBackend(backendName_);
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 #include "glow/ExecutionEngine/ExecutionEngine.h"
 #include "glow/Graph/Graph.h"
 #include "glow/IR/IR.h"
+#include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
 #include "glow/Support/Support.h"
 
 #include "llvm/Support/CommandLine.h"
@@ -44,13 +45,10 @@ static llvm::cl::opt<std::string> inputFilename(llvm::cl::desc("input file"),
                                                 llvm::cl::Positional,
                                                 llvm::cl::cat(category));
 
-llvm::cl::opt<BackendKind> executionBackend(
-    llvm::cl::desc("Backend to use:"), llvm::cl::Optional,
-    llvm::cl::values(clEnumValN(BackendKind::Interpreter, "interpreter",
-                                "Use interpreter (default option)"),
-                     clEnumValN(BackendKind::CPU, "cpu", "Use CPU"),
-                     clEnumValN(BackendKind::OpenCL, "opencl", "Use OpenCL")),
-    llvm::cl::init(BackendKind::Interpreter), llvm::cl::cat(category));
+llvm::cl::opt<std::string> executionBackend(
+    "backend",
+    llvm::cl::desc("Backend to use, e.g., Interpreter, CPU, OpenCL:"),
+    llvm::cl::Optional, llvm::cl::init("Interpreter"), llvm::cl::cat(category));
 
 llvm::cl::opt<unsigned> numEpochs("epochs",
                                   llvm::cl::desc("Process the input N times."),
@@ -98,9 +96,9 @@ static void loadText(Tensor &inputText, Tensor &nextChar, llvm::StringRef text,
   //  |ello| |World
   //  |llo |W|orld
   //  |lo W|o|rld
-  for (size_t i = 0; i < B; i++) {
-    for (size_t j = 0; j < S; j++) {
-      size_t c = clipASCII(text[i + j]);
+  for (dim_t i = 0; i < B; i++) {
+    for (dim_t j = 0; j < S; j++) {
+      dim_t c = clipASCII(text[i + j]);
 
       IH.at({i, j, c}) = 1.0;
       if (train) {
@@ -127,14 +125,14 @@ PseudoRNG &getRNG() {
 /// to one. The algorithm that we use here picks a random number between zero
 /// and one. Then, we scan the tensor and accumulate the probabilities. We stop
 /// and pick the index when sum is greater than the selected random number.
-static char getPredictedChar(Tensor &inputText, size_t slice, size_t word) {
+static char getPredictedChar(Tensor &inputText, dim_t slice, dim_t word) {
   auto IH = inputText.getHandle();
 
   // Pick a random number between zero and one.
   double x = std::abs(getRNG().nextRand());
   double sum = 0;
   // Accumulate the probabilities into 'sum'.
-  for (size_t i = 0; i < 128; i++) {
+  for (dim_t i = 0; i < 128; i++) {
     sum += IH.at({slice, word, i});
     // As soon as we cross the threshold return the index.
     if (sum > x) {
@@ -161,8 +159,8 @@ static std::unique_ptr<llvm::MemoryBuffer> loadFile(llvm::StringRef filename) {
 /// Creates a new RNN network. The network answers the question, given N chars
 /// of input, what is the character following each one of these chars.
 static Function *createNetwork(Module &mod, PlaceholderBindings &bindings,
-                               size_t minibatchSize, size_t numSteps,
-                               size_t hiddenSize) {
+                               dim_t minibatchSize, dim_t numSteps,
+                               dim_t hiddenSize) {
   Function *F = mod.createFunction("main");
 
   auto *X = mod.createPlaceholder(
@@ -212,30 +210,32 @@ int main(int argc, char **argv) {
   auto mb = loadFile(inputFilename);
   auto text = mb.get()->getBuffer();
   LOG(INFO) << "Loaded " << text.size() << " chars.\n";
-  PlaceholderBindings bindings;
+  PlaceholderBindings inferBindings, trainingBindings;
 
-  const size_t numSteps = 50;
-  const size_t minibatchSize = 32;
-  const size_t batchSize = text.size() - numSteps;
-  const size_t hiddenSize = 256;
+  const dim_t numSteps = 50;
+  const dim_t minibatchSize = 32;
+  const dim_t batchSize = text.size() - numSteps;
+  const dim_t hiddenSize = 256;
 
   CHECK_GT(text.size(), numSteps) << "Text is too short";
   TrainingConfig TC;
 
-  ExecutionEngine EE(executionBackend);
+  ExecutionEngine EET(executionBackend);
   TC.learningRate = 0.001;
   TC.momentum = 0.9;
   TC.batchSize = minibatchSize;
 
-  auto &mod = EE.getModule();
+  auto &modT = EET.getModule();
 
   //// Train the network ////
-  Function *F =
-      createNetwork(mod, bindings, minibatchSize, numSteps, hiddenSize);
-  Function *TF = differentiate(F, TC);
+  Function *F2 = createNetwork(modT, trainingBindings, minibatchSize, numSteps,
+                               hiddenSize);
+  differentiate(F2, TC);
+  EET.compile(CompilationMode::Train);
+  trainingBindings.allocate(modT.getPlaceholders());
 
-  auto *X = mod.getPlaceholderByName("input");
-  auto *Y = mod.getPlaceholderByName("expected");
+  auto *XT = modT.getPlaceholderByName("input");
+  auto *YT = modT.getPlaceholderByName("expected");
 
   Tensor thisCharTrain(ElemKind::FloatTy, {batchSize, numSteps, 128});
   Tensor nextCharTrain(ElemKind::Int64ITy, {batchSize, numSteps});
@@ -248,28 +248,34 @@ int main(int argc, char **argv) {
   // Run this number of iterations over the input. On each iteration: train the
   // network on the whole input and then generate some sample text.
   for (unsigned i = 0; i < numEpochs; i++) {
-    EE.compile(CompilationMode::Train, TF);
 
     // Train the network on the whole input.
     LOG(INFO) << "Iteration " << i + 1 << "/" << numEpochs;
-    runBatch(EE, bindings, batchSize / minibatchSize, sampleCounter, {X, Y},
-             {&thisCharTrain, &nextCharTrain});
+    runBatch(EET, trainingBindings, batchSize / minibatchSize, sampleCounter,
+             {XT, YT}, {&thisCharTrain, &nextCharTrain});
+
+    ExecutionEngine EEO(executionBackend);
+    inferBindings.clear();
+    auto &mod = EEO.getModule();
+    auto OF =
+        createNetwork(mod, inferBindings, minibatchSize, numSteps, hiddenSize);
+    auto *X = mod.getPlaceholderByName("input");
+    inferBindings.allocate(mod.getPlaceholders());
+    trainingBindings.copyTrainableWeightsTo(inferBindings);
 
     //// Use the trained network to generate some text ////
     auto *res =
-        llvm::cast<SaveNode>(F->getNodeByName("result"))->getPlaceholder();
-    // Clone the function before optimizing it, so that we can promote
-    // placeholders to constants.
-    auto *OF = F->clone("clone");
-    ::glow::convertPlaceholdersToConstants(OF, bindings, {X, res});
-    EE.compile(CompilationMode::Infer, OF);
+        llvm::cast<SaveNode>(OF->getNodeByName("result"))->getPlaceholder();
+    // Promote placeholders to constants.
+    ::glow::convertPlaceholdersToConstants(OF, inferBindings, {X, res});
+    EEO.compile(CompilationMode::Infer);
 
     // Load a few characters to start the text that we generate.
     Tensor currCharInfer(ElemKind::FloatTy, {minibatchSize, numSteps, 128});
     Tensor nextCharInfer(ElemKind::Int64ITy, {minibatchSize, numSteps});
     loadText(currCharInfer, nextCharInfer, text.slice(0, 128), false);
 
-    auto *T = bindings.get(res);
+    auto *T = inferBindings.get(res);
     std::string result;
     std::string input;
     input.insert(input.begin(), text.begin(), text.begin() + numSteps);
@@ -278,8 +284,8 @@ int main(int argc, char **argv) {
     // Generate a sentence by running inference over and over again.
     for (unsigned i = 0; i < generateChars; i++) {
       // Generate a char:
-      updateInputPlaceholders(bindings, {X}, {&currCharInfer});
-      EE.run(bindings);
+      updateInputPlaceholders(inferBindings, {X}, {&currCharInfer});
+      EEO.run(inferBindings);
 
       // Pick a char at random from the softmax distribution.
       char c = getPredictedChar(*T, 0, numSteps - 1);

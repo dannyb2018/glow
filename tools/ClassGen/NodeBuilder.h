@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,87 +32,6 @@
 class Builder;
 class NodeBuilder;
 
-class EnumBuilder {
-  struct EnumCase {
-    // The name of the enum case (i.e. <enum type>::<enum case name>).
-    std::string name;
-    // The value of the enum case.
-    int value;
-    // The docstring for the enum case.
-    std::string doc;
-    // Whether or not the value for this case was explicitly defined.
-    bool definedWithValue;
-  };
-  ;
-
-  /// The name of the enum.
-  std::string name_;
-  /// The fully qualified name of the enum (i.e. with all enclosing namespaces).
-  std::string fullyQualifiedName_;
-  /// The containing namespaces for the enum.
-  std::vector<std::string> namespaces_;
-  /// The enum cases.
-  std::vector<EnumCase> enumCases_;
-  /// CPP file stream.
-  std::ofstream &cStream;
-  /// Specifies if this enum is backend specific. If true, a definition
-  /// will not be generated.
-  bool isBackendSpecific_{false};
-  /// Documentation string printed with the class definition.
-  std::string docstring_;
-  /// An integer value that is guaranteed to be unused by the enum at all times.
-  int unusedValue_{0};
-
-public:
-  /// Constructor.
-  EnumBuilder(std::ofstream &C, const std::string &name,
-              bool isBackendSpecific);
-
-  /// Delete copy constructor to force moves and ensure one destructor call.
-  EnumBuilder(const EnumBuilder &src) = delete;
-
-  /// Set the documentation string. Each line will be prepended with "/// ".
-  EnumBuilder &setDocstring(const std::string &docstring) {
-    docstring_ = docstring;
-    return *this;
-  }
-
-  /// Add a new enum case to the enumeration.
-  EnumBuilder &addEnumCase(const std::string &name,
-                           const std::string &doc = "");
-  EnumBuilder &addEnumCaseWithValue(const std::string &name, const int value,
-                                    const std::string &doc = "");
-
-  /// Get a MemberTypeInfo object describing the enum being built by this
-  /// builder instance.
-  MemberTypeInfo getMemberTypeInfo() const;
-
-  /// Destructor.
-  ~EnumBuilder();
-
-private:
-  /// Emit the opening of the namespace that contains the enum.
-  void emitNamespaceOpen(std::ostream &os) const;
-
-  /// Emit the closing of the namespace that contains the enum.
-  void emitNamespaceClose(std::ostream &os) const;
-
-  /// Emit the class-level documentation string, if any.
-  void emitDocstring(std::ostream &os) const;
-
-  /// Emit the forward declaration of the enum.
-  void emitForwardDecl(std::ostream &os) const;
-
-  /// Return the fully qualified name of the enum.
-  std::string getFullyQualifiedName() const { return fullyQualifiedName_; }
-
-  /// Emit the cases of the enum.
-  void emitEnumCases(std::ostream &os) const;
-
-  /// Emit the definition of the enum.
-  void emitEnumDefinition(std::ostream &os) const;
-};
-
 class NodeBuilder {
   /// The node name.
   std::string name_;
@@ -126,7 +45,7 @@ class NodeBuilder {
   /// argument is the name of the return type. Format: (type, name)
   std::vector<std::pair<std::string, std::string>> nodeOutputs_;
   /// A list of node members. Format: (type, name).
-  std::vector<std::pair<const MemberTypeInfo *, std::string>> members_;
+  std::vector<std::pair<MemberTypeInfo, std::string>> members_;
   /// The node enum cases.
   std::vector<std::string> enum_;
   /// A list of extra parameter that are declared in the node constructor. The
@@ -141,17 +60,28 @@ class NodeBuilder {
   std::ofstream &cStream;
   /// Def file stream.
   std::ofstream &dStream;
+  /// Import file stream.
+  std::ofstream &iStream;
+  /// Export file stream.
+  std::ofstream &eStream;
   /// Documentation string printed with the class definition.
   std::string docstring_;
   /// Whether node has side effects. By default there are no side effects.
   bool hasSideEffects_{false};
   /// Specifies if this Node is backend specific.
   bool isBackendSpecific_{false};
+  /// Specifies if this Node is data parallel.
+  bool isDataParallel_{false};
+  /// Specifies if this Node can have extra results.
+  bool hasExtraResults_{false};
+  /// Specifies if this Node should skip serialization autogen.
+  bool skipAutogenSerialization_{false};
 
 public:
   NodeBuilder(std::ofstream &H, std::ofstream &C, std::ofstream &D,
-              const std::string &name, bool isBackendSpecific)
-      : name_(name), hStream(H), cStream(C), dStream(D),
+              std::ofstream &I, std::ofstream &E, const std::string &name,
+              bool isBackendSpecific)
+      : name_(name), hStream(H), cStream(C), dStream(D), iStream(I), eStream(E),
         isBackendSpecific_(isBackendSpecific) {
     dStream << "DEF_NODE(" << name << "Node, " << name << ")\n";
   }
@@ -165,9 +95,29 @@ public:
   /// Add a member to the node. Format: type, name.
   /// The name should start with a capital letter.
   /// For example: "Filter".
-  NodeBuilder &addMember(MemberType type, const std::string &name);
-  NodeBuilder &addMember(const MemberTypeInfo *typeInfo,
-                         const std::string &name) {
+  /// If \p addSetter then a setter will be generated for this member.
+  NodeBuilder &addMember(MemberType type, const std::string &name,
+                         bool addSetter = false);
+  /// Add a member to the node. Format type, name.
+  /// The name should start with a capital letter.
+  /// For example: "Filter".
+  /// If MemberTypeInfo refers to an external user-defined type, this type T
+  /// should satisfy the following requirements:
+  ///   * There should be a hash function with a signature like `llvm::hash_code
+  ///   hash_value(const T)` which takes T by value, by reference or as a
+  ///   pointer, depending on the intended use.
+  ///   * There should be a stream output operator with a signature like
+  ///   `llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const T);`, which
+  ///   takes T by value, by reference or as a pointer, depending on the
+  ///   intended use.
+  ///   * There should be a comparison operator `bool operator==(const T LHS,
+  ///   const T RHS)` (or a custom comparator function mentioned in
+  ///   MemberTypeInfo::cmpFn), which takes T by reference or by value depending
+  ///   on the intended use.
+  /// If \p addSetter then a setter will be generated for this member.
+  NodeBuilder &addMember(MemberTypeInfo typeInfo, const std::string &name,
+                         bool addSetter = false) {
+    typeInfo.addSetter = addSetter;
     members_.push_back({typeInfo, name});
     return *this;
   }
@@ -226,12 +176,31 @@ public:
                      "input of a node");
   }
 
+  NodeBuilder &dataParallel() {
+    isDataParallel_ = true;
+    return *this;
+  }
+
+  NodeBuilder &hasExtraResults() {
+    hasExtraResults_ = true;
+    return *this;
+  }
+
+  NodeBuilder &skipAutogenSerialization() {
+    skipAutogenSerialization_ = true;
+    return *this;
+  }
+
   /// Constructs a new gradient node that is based on the current node that we
   /// are building. The gradient node will produce one gradient output for each
   /// input. The rule is that each output becomes an input (named "Output", to
   /// preserve the original name) and each input becomes a gradient output with
   /// the same name.
   NodeBuilder &addGradient();
+
+  /// Helper to add a FusedActivation Member to this node, along with getters
+  /// and setters.
+  NodeBuilder &addFusedActivation();
 
   ~NodeBuilder();
 
@@ -248,9 +217,9 @@ private:
   /// Emits the class members (the fields of the class).
   void emitClassMembers(std::ostream &os) const;
 
-  /// Emit the getter for a accessible class member.
-  void emitMemberGetter(std::ostream &os, const MemberTypeInfo *type,
-                        const std::string &name) const;
+  /// Emit the getter for a accessible class member, and optionally a setter.
+  void emitMemberGetterSetter(std::ostream &os, const MemberTypeInfo *type,
+                              const std::string &name) const;
 
   /// Emit setters/getters for each accessible class member.
   void emitSettersGetters(std::ostream &os) const;
@@ -285,22 +254,33 @@ private:
   /// Emit the methods that go into the CPP file and implement the methods that
   /// were declared in the header file.
   void emitCppMethods(std::ostream &os) const;
+
+  /// Emit cases for importing to \p os.
+  void emitImportMethods(std::ostream &os) const;
+
+  /// Emit cases for exporting to \p os.
+  void emitExportMethods(std::ostream &os) const;
+
+  // \returns whether \p res is contained in \ref ctorTypeParams_.
+  bool hasCtorTypeParams(llvm::StringRef res) const;
 };
 
 class Builder {
   std::ofstream &hStream;
   std::ofstream &cStream;
   std::ofstream &dStream;
-  std::vector<std::shared_ptr<EnumBuilder>> enumBuilders_;
+  std::ofstream &iStream;
+  std::ofstream &eStream;
 
 public:
   /// Create a new top-level builder that holds the three output streams that
   /// point to the header file, cpp file and enum definition file.
-  Builder(std::ofstream &H, std::ofstream &C, std::ofstream &D)
-      : hStream(H), cStream(C), dStream(D) {
+  Builder(std::ofstream &H, std::ofstream &C, std::ofstream &D,
+          std::ofstream &I, std::ofstream &E)
+      : hStream(H), cStream(C), dStream(D), iStream(I), eStream(E) {
     cStream << "#include \"glow/Graph/Nodes.h\"\n"
                "#include \"glow/Base/Type.h\"\n"
-               "#include \"glow/Support/Support.h\"\n\n"
+               "#include \"glow/Support/Support.h\"\n"
                "using namespace glow;\n";
     dStream << "#ifndef DEF_NODE\n#error The macro DEF_NODE was not declared.\n"
                "#endif\n";
@@ -311,29 +291,15 @@ public:
   /// Declare a new node and generate code for it.
   NodeBuilder newNode(const std::string &name) {
     const bool isBackendSpecific = false;
-    return NodeBuilder(hStream, cStream, dStream, name, isBackendSpecific);
+    return NodeBuilder(hStream, cStream, dStream, iStream, eStream, name,
+                       isBackendSpecific);
   }
 
   /// Declare a new backend specific node and generate code for it.
   NodeBuilder newBackendSpecificNode(const std::string &name) {
     const bool isBackendSpecific = true;
-    return NodeBuilder(hStream, cStream, dStream, name, isBackendSpecific);
-  }
-
-  /// Declare a new enum and generate code for it.
-  EnumBuilder &newEnum(const std::string &name) {
-    const bool isBackendSpecific = false;
-    auto eb = std::make_shared<EnumBuilder>(cStream, name, isBackendSpecific);
-    enumBuilders_.emplace_back(eb);
-    return *eb;
-  }
-
-  /// Declare a new backend specific enum. This will NOT generate a definition.
-  EnumBuilder &newBackendSpecificEnum(const std::string &name) {
-    const bool isBackendSpecific = true;
-    auto eb = std::make_shared<EnumBuilder>(cStream, name, isBackendSpecific);
-    enumBuilders_.emplace_back(eb);
-    return *eb;
+    return NodeBuilder(hStream, cStream, dStream, iStream, eStream, name,
+                       isBackendSpecific);
   }
 
   /// Declare the node in the def file but don't generate code for it.
@@ -345,6 +311,11 @@ public:
   /// Nodes cpp file.
   void includeBackendSpecificVerification(const std::string &filename) {
     cStream << "\n#include \"" << filename << "\"\n";
+  }
+
+  /// Include header into the auto-generated Nodes include file.
+  void includeHeader(const std::string &filename) {
+    hStream << "\n#include \"" << filename << "\"\n";
   }
 };
 

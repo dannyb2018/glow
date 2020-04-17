@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2018-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 
 #include "glow/Base/Traits.h" // For KindSet.
 #include "glow/Base/Type.h"
+#include "glow/Optimizer/GraphOptimizer/CompilationContext.h"
 
 namespace glow {
 
@@ -38,8 +39,8 @@ protected:
   /// Source type of the conversions. I.e., the values of this
   /// element type are going to be converted.
   ElemKind srcKind_;
-  /// Set of node kinds that should not be converted.
-  KindSet doNotConvertKinds_;
+  /// Precision configuration used during conversion.
+  const PrecisionConfiguration &precConfig_;
 
   /// If the element type of \p out is srcKind_ returns a similarly shaped type
   /// using dstKind_. Otherwise returns nullptr.
@@ -53,10 +54,10 @@ protected:
   /// is used.
   TypeRef getTargetTypeForInput(const Node &use, unsigned idx) const override;
 
-  /// Create a node in \p function that converts \p val to \p destTy.
-  /// \p val and \p destTy must have the same shape.
-  Node *createConversion(Function &function, NodeValue &val,
-                         TypeRef destTy) override;
+  /// Create a node in \p function that converts \p val to \p destTy, given
+  /// context \p node. \p val and \p destTy must have the same shape.
+  Node *createConversion(Function &function, const Node &node, NodeValue &val,
+                         TypeRef destTy, bool isInput) override;
 
   /// Check if \p node can be converted.
   bool canConvert(const Node &node) const override;
@@ -64,11 +65,13 @@ protected:
   void convertTensor(Tensor &tensor, TypeRef destTy) override;
 
 public:
-  /// Create a type converter from \p fromKind to \p toKind for \p F.
-  /// If \p doNotConvertKinds is not nullptr, the nodes which kind
-  /// is in this set won't be converted.
+  /// Create a type converter from \p fromKind to \p toKind for \p F given
+  /// \p precConfig.
   TypeAToTypeBFunctionConverter(Function &F, ElemKind fromKind, ElemKind toKind,
-                                const KindSet *doNotConvertKinds = nullptr);
+                                const PrecisionConfiguration &precConfig);
+
+  /// Convert and clip all Storage nodes used by the function.
+  void convertAndClipStorage();
 };
 } // namespace glow
 #endif

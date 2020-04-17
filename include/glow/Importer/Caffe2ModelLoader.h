@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@ class Value;
 class Caffe2ModelLoader
     : public CommonOperatorLoader<caffe2::OperatorDef, caffe2::Argument> {
   /// \returns True if the operator has broadcasting activated.
-  llvm::Expected<bool> getBroadcast(const ArgumentDictionaryTy &dict) override;
+  Expected<bool> getBroadcast(ArgumentDictionaryTy &dict) override;
 
   /// \returns True if the operator with the name \p typeName has support for
   /// multidirectional broadcasting.
@@ -48,45 +48,95 @@ class Caffe2ModelLoader
 
   /// Load the weight tensors from the 'init' file and register them in the map
   /// \p tensors.
-  llvm::Error loadWeightsFromNet(caffe2::NetDef &net);
+  Error loadWeightsFromNet(caffe2::NetDef &net);
 
   /// Loads an individual weight \p op.
-  llvm::Error loadWeight(const caffe2::OperatorDef &op);
+  Error loadWeight(const caffe2::OperatorDef &op);
 
   /// Load the structure of the network from the 'net' file.
-  llvm::Error loadNetwork(caffe2::NetDef &net);
+  Error loadNetwork(caffe2::NetDef &net);
 
   /// Load the operator \p op into the network. This creates one or more nodes
   /// in the network.
-  llvm::Error loadOperator(const caffe2::OperatorDef &op);
+  Error loadOperator(const caffe2::OperatorDef &op);
+
+  /// \returns True if the operator \p op is successfully folded.
+  Expected<bool> foldOperator(const caffe2::OperatorDef &op);
 
   /// Load the Conv or ConvRelu operators.
-  llvm::Error loadConv(const caffe2::OperatorDef &op,
-                       ArgumentDictionaryTy &dict);
+  Error loadConv(const caffe2::OperatorDef &op, ArgumentDictionaryTy &dict);
+
+  /// Load the ConvTranspose operator.
+  Error loadConvTranspose(const caffe2::OperatorDef &op,
+                          ArgumentDictionaryTy &dict);
 
   /// Load the Int8Conv or Int8ConvRelu operators.
-  llvm::Error loadConvQuantized(const caffe2::OperatorDef &op,
-                                ArgumentDictionaryTy &dict);
+  Error loadConvQuantized(const caffe2::OperatorDef &op,
+                          ArgumentDictionaryTy &dict);
+
+  /// Load LayerNorm Caffe2 operator \p op given \p dict.
+  Error loadLayerNorm(const caffe2::OperatorDef &op,
+                      ArgumentDictionaryTy &dict);
 
   /// Reads a network (weights or structure) from the serialized protocol
   /// buffer file.
-  llvm::Expected<caffe2::NetDef> loadProtoFile(const std::string &filename);
+  Expected<caffe2::NetDef> loadProtoFile(const std::string &filename);
 
   /// loadInputs calls this function for each member in its target arguments.
   /// Currently we are supporting two tensorprototypes:
   /// caffe2::TensorProto, caffe2::QTensorProto
   template <class TensorProtoType>
-  llvm::Error loadInputsWithTensorProtoType(const caffe2::NetDef &net,
-                                            bool loadInputsAsPlaceholders,
-                                            const TensorProtoType &in);
+  Error loadInputsWithTensorProtoType(
+      const caffe2::NetDef &net,
+      const std::unordered_set<std::string> &initializers,
+      const TensorProtoType &in);
 
-  /// Load the inputs from the NetDef. If \p loadInputsAsPlaceholders is
-  /// true then this will load each graph input as a placeholder otherwise it
-  /// will create an empty tensor for each input.
-  llvm::Error loadInputs(const caffe2::NetDef &net,
-                         bool loadInputsAsPlaceholders);
+  /// Load the inputs from the NetDef. \p initializers is the set of tensors
+  /// that should be loaded as empty Constants in the graph for the purposes of
+  /// onnxifi compatibility checks, any other inputs will be loaded as
+  /// placeholders.
+  Error loadInputs(const caffe2::NetDef &net,
+                   const std::unordered_set<std::string> &initializers);
+
+  /// \returns Expected<NetDef> if a NetDef can be constructed from the
+  /// in-memory serialized protobuf.
+  /// Loads ModelProto from the in-memory serialized protobuf \p
+  /// c2Model with the model size \p c2ModelSize.
+  static Expected<caffe2::NetDef> loadProto(const void *c2Model,
+                                            size_t c2ModelSize);
+
+  /// Creates a Caffe2 model loader to build one or more Functions in \p mod.
+  /// Loads the ONNIXFI \p model from memory of \p modelSize size,
+  /// and \p weightsCount, and \p onnxTensorDescriptorV1 correspondent
+  /// descriptors. Reports success/failure through optional parameter \p errPtr.
+  /// This constructor always overrides the default constant folding in loader
+  /// flag with \p constFoldInLoader. If the model is pre-partitioned, then \p
+  /// PPC will be filled with relevant configuration for partitioning, and all
+  /// Functions created will be named with prefix /p funNamePrefix. Otherwise \p
+  /// PPC is ignored, and \p funNamePrefix is used as the name of the single
+  /// Function that is created inside \p mod.
+  Caffe2ModelLoader(const void *model, uint32_t modelSize,
+                    uint32_t weightsCount,
+                    const onnxTensorDescriptorV1 *weightDescriptors,
+                    Module &mod, llvm::StringRef funNamePrefix,
+                    runtime::PrePartitionedConfig *PPC, Error *errPtr = nullptr,
+                    bool constFoldInLoader = true);
 
   friend class ONNXIFIModelLoader;
+
+  /// Complete initialization when loading a module, including loading
+  /// pre-partitioned models, given \p networkDef loaded from caller, as well as
+  /// \p funNamePrefix, and \p PPC forwarded from caller.
+  Error initWithModule(caffe2::NetDef &networkDef,
+                       llvm::StringRef funNamePrefix,
+                       runtime::PrePartitionedConfig *PPC);
+
+  /// \returns success if the folding of operator \p op in the loader
+  /// \p loader is successful. The folding utility uses temporary
+  /// loader \p tmpLoader, and associated temporary function \p F.
+  template <class LoaderType, class OpType>
+  friend Error constantFoldInLoader(Function *F, LoaderType &tmpLoader,
+                                    LoaderType *loader, const OpType &op);
 
 public:
   /// Loads the caffe2 model that's represented by a network description file,
@@ -100,19 +150,30 @@ public:
                     const std::string &netWeightFilename,
                     llvm::ArrayRef<const char *> names,
                     llvm::ArrayRef<TypeRef> types, Function &F,
-                    llvm::Error *errPtr = nullptr);
+                    Error *errPtr = nullptr);
+
+  /// Loads the caffe2 model that's represented by a network description file,
+  /// serialized in \p netDescFilename, and weights file, serialized in
+  /// \p netWeightFilename, and populates the network in \p mod.
+  /// Any Functions created in \p mod will have name (or prefixed name for
+  /// pre-partitioned protos) \p funNamePrefix.  \p PPC is used to store the
+  /// pre-partitioned config for the model if relevant.
+  /// The list \p types and \p names are used to initialized the inputs and
+  /// outputs with specific names and types.
+  /// If \p errPtr is not null then if an error occurs it will get assigned
+  /// there otherwise if an error occurs it will abort.
+  Caffe2ModelLoader(const std::string &netDescFilename,
+                    const std::string &netWeightFilename,
+                    llvm::ArrayRef<const char *> names,
+                    llvm::ArrayRef<TypeRef> types, Module &mod,
+                    llvm::StringRef funNamePrefix,
+                    runtime::PrePartitionedConfig *PPC = nullptr,
+                    Error *errPtr = nullptr);
 
   /// Creates a Caffe2 model loader to build \p F.
   /// If \p errPtr is not null then if an error occurs it will get assigned
   /// there otherwise if an error occurs it will abort.
-  Caffe2ModelLoader(Function &F, llvm::Error *errPtr);
-
-  /// \returns Expected<NetDef> if a NetDef can be constructed from the
-  /// in-memory serialized protobuf.
-  /// Loads ModelProto from the in-memory serialized protobuf \p
-  /// c2Model with the model size \p c2ModelSize.
-  static llvm::Expected<caffe2::NetDef> loadProto(const void *c2Model,
-                                                  size_t c2ModelSize);
+  Caffe2ModelLoader(Function &F, Error *errPtr);
 };
 
 } // namespace glow

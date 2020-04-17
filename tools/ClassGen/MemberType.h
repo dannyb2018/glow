@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,21 @@
 #include <string>
 #include <unordered_map>
 
+/// Define a MemberTypeInfo for the type T. The definition of type T does not
+/// need to be known when compiling the NodeGen.cpp, but it should be known when
+/// compiling the generated files. T can be a simple type like CustomType or
+/// have a more complex form like e.g. CustomType * or CustomType &.
+#define MEMBER_TYPE_INFO(T)                                                    \
+  MemberTypeInfo { MemberType::UserDefinedType, #T, #T, #T, "" }
+
+/// Define a MemberTypeInfo for the type T that uses a custom comparator instead
+/// of ==. The definition of type T does not need to be known when compiling the
+/// NodeGen.cpp, but it should be known when compiling the generated files. T
+/// can be a simple type like CustomType or have a more complex form like e.g.
+/// CustomType * or CustomType &.
+#define MEMBER_TYPE_INFO_WITH_CMP(T, CMP_FN)                                   \
+  MemberTypeInfo { MemberType::UserDefinedType, #T, #T, #T, "", CMP_FN }
+
 enum class MemberType : unsigned {
   TypeRef,
   Float,
@@ -32,18 +47,30 @@ enum class MemberType : unsigned {
   VectorUnsigned,
   VectorInt64,
   VectorSizeT,
+  VectorDimT,
   VectorNodeValue,
   Enum,
+  UserDefinedType,
 };
 
 /// This struct encapsulates all of the information NodeBuilder needs about the
 /// type of a member in order to generate a cloner, hasher, equator, etc.
 struct MemberTypeInfo {
+  /// Kind of the member type.
   MemberType type;
+  /// Type to be used when this member type is returned.
   std::string returnTypename;
+  /// Type to be used for storing members of this type.
   std::string storageTypename;
+  /// Type to be used when providing this member type as a constructor arguments
+  /// of a node.
   std::string ctorArgTypename;
+  /// Forward declaration of this member type.
   std::string forwardDecl;
+  /// Comparator function to be used for comparing members of this type.
+  std::string cmpFn = "==";
+  /// Whether to include a setter for this member type.
+  bool addSetter{false};
 };
 
 /// These are instances of MemberTypeInfo for commonly used types.
@@ -58,6 +85,7 @@ extern MemberTypeInfo kVectorUnsignedTypeInfo;
 extern MemberTypeInfo kVectorInt64TypeInfo;
 extern MemberTypeInfo kVectorSignedTypeInfo;
 extern MemberTypeInfo kVectorSizeTTypeInfo;
+extern MemberTypeInfo kVectorDimTTypeInfo;
 extern MemberTypeInfo kVectorNodeValueTypeInfo;
 extern MemberTypeInfo kEnumTypeInfo;
 
@@ -86,7 +114,9 @@ inline const char *getReturnTypename(MemberType type) {
                                "llvm::ArrayRef<unsigned_t>",
                                "llvm::ArrayRef<int64_t>",
                                "llvm::ArrayRef<size_t>",
+                               "llvm::ArrayRef<dim_t>",
                                "NodeValueArrayRef",
+                               nullptr,
                                nullptr};
   return returnTypes[(int)type];
 }
@@ -103,7 +133,9 @@ inline const char *getStorageTypename(MemberType type) {
                                 "std::vector<unsigned_t>",
                                 "std::vector<int64_t>",
                                 "std::vector<size_t>",
+                                "std::vector<dim_t>",
                                 "std::vector<NodeHandle>",
+                                nullptr,
                                 nullptr};
   return storageTypes[(int)type];
 }
@@ -120,7 +152,9 @@ inline const char *getCtorArgTypename(MemberType type) {
                                 "std::vector<unsigned_t>",
                                 "std::vector<int64_t>",
                                 "std::vector<size_t>",
+                                "std::vector<dim_t>",
                                 "std::vector<NodeValue>",
+                                nullptr,
                                 nullptr};
   return ctorArgTypes[(int)type];
 }

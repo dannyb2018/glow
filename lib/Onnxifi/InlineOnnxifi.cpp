@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 #include "InlineOnnxifi.h"
 
+#include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
 #include "glow/Quantization/Quantization.h"
 #include "glow/Quantization/Serialization.h"
 #include "glow/Support/Support.h"
@@ -24,6 +25,8 @@
 
 namespace glow {
 namespace onnxifi {
+
+extern bool GlowSaveOnnxifiModel;
 
 namespace {
 std::string getProfileFile(llvm::StringRef hash) {
@@ -43,17 +46,33 @@ void computeModelHash(const void *onnxModel, size_t onnxModelSize,
 onnxStatus
 InlineGraph::initGraph(const void *onnxModel, size_t onnxModelSize,
                        uint32_t weightCount,
-                       const onnxTensorDescriptorV1 *weightDescriptors) {
-  function_ = executionEngine_.getModule().createFunction("function");
+                       const onnxTensorDescriptorV1 *weightDescriptors,
+                       uint32_t maxSeqLength, void * /*unused */) {
+  Module &mod = executionEngine_.getModule();
+  // Note: Pass in a nullptr for PPC here because we do not currently support
+  // pre-partitioned models here.
+  std::unique_ptr<ONNXIFIModelLoader> loader;
+  auto loaderOrErr = ONNXIFIModelLoader::parse(
+      onnxModel, onnxModelSize, weightCount, weightDescriptors, mod, "function",
+      /* PPC */ nullptr, true /*loadInputsAsPlaceholdersForOnnx*/,
+      backendPtr_->getUseOnnx());
+  if (loaderOrErr) {
+    loader = std::move(*loaderOrErr);
+  } else {
+    LOG(ERROR) << "Error when loading model: "
+               << ERR_TO_STRING(loaderOrErr.takeError());
+    return ONNXIFI_STATUS_INVALID_MODEL;
+  }
 
-  std::unique_ptr<ONNXIFIModelLoader> loader =
-      TEMP_EXIT_ON_ERR(ONNXIFIModelLoader::parse(
-          onnxModel, onnxModelSize, weightCount, weightDescriptors, *function_,
-          true /*loadInputsAsPlaceholders*/, backendPtr_->getUseOnnx()));
+  CHECK_EQ(mod.getFunctions().size(), 1) << "Should have exactly one Function.";
+  function_ = *mod.getFunctions().begin();
 
-  onnxInputToPlaceholder_ = loader->getInputVarsMapping();
-  onnxOutputToPlaceholder_ = loader->getOutputVarsMapping();
+  bindPlaceholders(*loader);
+  if (GlowSaveOnnxifiModel) {
+    saveOnnxifiModel(function_);
+  }
 
+  setZeroLengthSequence(maxSeqLength);
   computeModelHash(onnxModel, onnxModelSize, modelHash_);
   optimize(function_, CompilationMode::Infer);
 
@@ -65,11 +84,11 @@ InlineGraph::initGraph(const void *onnxModel, size_t onnxModelSize,
   // If quantizing, load quantization infos and setup the schema.
   if (quantizationMode_ == QuantizationMode::Quantize) {
     precConfig.quantConfig.infos =
-        deserializeFromYaml(getProfileFile(modelHash_));
+        deserializeProfilingInfosFromYaml(getProfileFile(modelHash_));
     precConfig.quantConfig.schema = quantization::Schema::Symmetric;
   }
 
-  executionEngine_.compile(CompilationMode::Infer, function_);
+  executionEngine_.compile(CompilationMode::Infer);
 
   return ONNXIFI_STATUS_SUCCESS;
 }
@@ -80,19 +99,17 @@ onnxStatus InlineGraph::run(std::unique_ptr<ExecutionContext> ctx,
   executionEngine_.run(*ctx);
 
   // Dump profile if requested.
-  // TODO: enable configuration of quantization schema
   if (quantizationMode_ == QuantizationMode::Profile) {
-    auto QI = quantization::generateNodeQuantizationInfos(
-        *(ctx->getPlaceholderBindings()), function_, loweredMap_,
-        quantization::Schema::Symmetric, ElemKind::Int8QTy);
-    serializeToYaml(getProfileFile(modelHash_), QI);
+    auto PI = quantization::generateNodeProfilingInfos(
+        *(ctx->getPlaceholderBindings()), function_, loweredMap_);
+    serializeProfilingInfosToYaml(getProfileFile(modelHash_), PI);
   }
 
   if (auto *traceContext = ctx->getTraceContext()) {
     setTraceEvents(traceEvents, traceContext);
   }
 
-  outputEvent->signal();
+  outputEvent->signal(ONNXIFI_STATUS_SUCCESS);
   return ONNXIFI_STATUS_SUCCESS;
 }
 

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,9 +27,8 @@ namespace glow {
 
 class ONNXIFIModelLoader {
 private:
-  /// If \p errPtr is not null then if an error occurs it will get assigned
-  /// there otherwise if an error occurs it will abort.
-  explicit ONNXIFIModelLoader(llvm::Error *errPtr = nullptr) {}
+  /// Default constructor.
+  explicit ONNXIFIModelLoader() {}
 
   /// The real loader. It can be ONNXModelLoader or Caffe2ModelLoader
   std::unique_ptr<ProtobufLoader> core_{nullptr};
@@ -45,18 +44,36 @@ public:
     return core_->getOutputVarsMapping();
   }
 
+  /// \returns vector of primary input names based on their position
+  const std::vector<std::string> &getPositionalInputNames() const {
+    return core_->getPositionalInputNames();
+  }
+
+  /// \returns vector of primary output names based on their position
+  const std::vector<std::string> &getPositionalOutputNames() const {
+    return core_->getPositionalOutputNames();
+  }
+
   /// \returns a unique_ptr<ONNXIFIModelLoader> if \p onnxModel can be
-  /// parsed and static weights can be loaded from the \p wightDescriptors.
-  /// \returns Error otherwise. \p loadInputsAsPlaceholders is passed to
+  /// parsed and static weights can be loaded from the \p weightDescriptors.
+  /// \returns Error otherwise. \p loadInputsAsPlaceholdersForOnnx is passed to
   /// loadInputs to determine whether graph inputs are loaded as Placeholders or
   /// Tensors. Loading inputs as Tensors is useful for when weights are not
   /// provided such as when the graph being loaded is actually a small patch of
   /// a larger graph because the graph inputs in this case may represent
-  /// internal values for the larger graph.
-  static llvm::Expected<std::unique_ptr<ONNXIFIModelLoader>>
+  /// internal values for the larger graph. \p constFoldInLoader is used to
+  /// determine whether to try constant folding at load time. \p mod will be
+  /// filled wth one or more Functions built. If the model is pre-partitioned,
+  /// then \p PPC will be filled with relevant configuration for partitioning,
+  /// and all Functions created will be named with prefix /p netName. Otherwise
+  /// \p PPC is ignored, and \p netName is used as the name of the single
+  /// Function that is created inside \p mod.
+  static Expected<std::unique_ptr<ONNXIFIModelLoader>>
   parse(const void *onnxModel, uint32_t onnxModelSize, uint32_t weightsCount,
-        const onnxTensorDescriptorV1 *weightDescriptors, Function &F,
-        bool loadInputsAsPlaceholders = true, bool use_onnx = true);
+        const onnxTensorDescriptorV1 *weightDescriptors, Module &mod,
+        llvm::StringRef netName, runtime::PrePartitionedConfig *PPC,
+        bool loadInputsAsPlaceholdersForOnnx = true, bool use_onnx = true,
+        bool constFoldInLoader = true);
 };
 
 } // namespace glow

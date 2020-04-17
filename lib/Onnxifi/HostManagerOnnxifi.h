@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,26 +23,28 @@
 namespace glow {
 namespace onnxifi {
 
-class HostManagerBackendId : public BackendId {
+class HostManagerBackend : public Backend {
 public:
   /// Create Glow ONNXIFI backend identifier using HostManager with the
-  /// given Glow backend \p kind, whether to use onnx or caffe2 for models
+  /// given Glow backend \p kindName, whether to use onnx or caffe2 for models
   /// (\p useOnnx).
-  HostManagerBackendId(std::shared_ptr<runtime::HostManager> hostManager,
-                       glow::BackendKind kind, bool useOnnx)
-      : BackendId(kind, useOnnx), hostManager_(hostManager) {}
+  HostManagerBackend(std::shared_ptr<runtime::HostManager> hostManager,
+                     llvm::StringRef backendName, bool useOnnx)
+      : Backend(backendName, useOnnx), hostManager_(hostManager) {}
 
   void runNetwork(const Graph *graph, std::unique_ptr<ExecutionContext> context,
-                  runtime::ResultCBTy callback) override;
+                  runtime::ResultCBTy callback, uint64_t priority = 0) override;
 
-  onnxStatus addNetwork(std::unique_ptr<Module> module);
+  onnxStatus addNetwork(std::unique_ptr<Module> module,
+                        void *deferredBlobReader,
+                        runtime::PrePartitionedConfig *PPC);
 
   onnxStatus removeNetwork(const Graph *graph) override;
 
-  // \returns a unique_ptr to a new HostManager for the given BackendKind \p
-  // kind.
+  // \returns a unique_ptr to a new HostManager for the given Backend \p
+  // backendName.
   static std::unique_ptr<runtime::HostManager>
-  createHostManager(glow::BackendKind kind);
+  createHostManager(llvm::StringRef backendName);
 
 private:
   std::shared_ptr<runtime::HostManager> hostManager_;
@@ -58,10 +60,13 @@ public:
   static size_t makeUniqueGraphId();
 
   /// Init Glow graph based on the ONNX model \p onnxModel and
-  /// static trained weights \p weightDescriptors.
-  onnxStatus
-  initGraph(const void *onnxModel, size_t onnxModelSize, uint32_t weightCount,
-            const onnxTensorDescriptorV1 *weightDescriptors) override;
+  /// static trained weights \p weightDescriptors. Weights can be read in later
+  /// by a \p deferedBlobReader.
+  onnxStatus initGraph(const void *onnxModel, size_t onnxModelSize,
+                       uint32_t weightCount,
+                       const onnxTensorDescriptorV1 *weightDescriptors,
+                       uint32_t maxSeqLengths,
+                       void *deferedBlobReader) override;
 
   /// Async run HostManagerGraph with the given ExecutionContext \p ctx then
   /// signal \p outputEvent when done. \p phNameToOnnxTensorOutputs is a mapping
@@ -76,6 +81,9 @@ public:
 
 private:
   std::string netName_;
+  std::mutex tracesMutex_;
+  std::unique_ptr<TraceContext> mergedTraceContext_;
+  int numTracesToDump_{0};
 };
 
 } // namespace onnxifi

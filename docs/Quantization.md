@@ -103,24 +103,35 @@ can be listed via comma separation). For example:
 
 ```./bin/image-classifier tests/images/imagenet/*.png -image-mode=0to1 -m=shufflenet -model-input-name=gpu_0/data -dump-profile="shufflenet.yaml" -do-not-lower-nodes-for-profiling=Convolution```
 
-By default, the loader will produce quantized results using asymmetric ranges.
-That is ranges not necessarily centered on 0. The loader supports three modes
-or schemas of quantization: asymmetric, symmetric, and symmetric with uint8. The symmetric schema
-will always map the data on ranges centered on 0. In practice, this means
-the symmetric schema may extend the range it needs to capture to make
-sure 0.0 is at the center of that range. Therefore, this schema potentially
-waste some encoding space to enforce the symmetric property, but it comes
-with the property that the offset is always equal to zero.
-The symmetric with uint8 schema conceptually produces ranges where the offset
-is always equal to zero but allows the quantized ranges to be either
-int8 [-128; 127] or uint8 [0; 255]. In practice, this schema represents
-uint8 ranges using int8 ranges with an offset of -128. Therefore, when
-using this schema, the produced profile will have two kinds of ranges:
-one with an offset of 0 and the other with an offset of -128.
-Use ```quantization-schema=<schema>``` to specify the schema for
-the quantization process, where schema is ```asymmetric```,
-```symmetric```, or ```symmetric_with_uint8```.
+The loader supports the following modes (or schemas) of quantization:
 
+- ```asymmetric``` - maps the floating data to quantized ranges not necessarily
+centered on 0. This is the default quantization schema.
+
+- ```symmetric``` - maps the floating data to ranges centered on 0. In practice,
+this means the symmetric schema may extend the range it needs to capture to make
+sure 0.0 is at the center of that range. Therefore, this schema potentially wastes
+some encoding space to enforce the symmetric property, but it comes with the 
+property that the offset is always equal to zero.
+
+- ```symmetric with uint8``` - produces ranges where the offset is always equal to
+zero but allows the quantized ranges to be either int8 [-128; 127] or uint8 [0; 255].
+In practice, this schema represents uint8 ranges using int8 ranges with an offset of
+-128. Therefore, when using this schema, the produced profile will have two kinds of
+ranges: one with an offset of 0 and the other with an offset of -128.
+
+- ```symmetric with power of 2 scale``` - produces quantized ranges centered on 0
+(symmetric) but also restricts the scale parameter to be a power of 2. Restricting
+the scale parameter to be a power of 2 might result in a poor exploitation of the
+quantized range (poor accuracy) but has the potential to provide a better performance.
+
+Use ```quantization-schema=<schema>``` to specify the schema for the quantization
+process, where schema will have one of the values:
+
+- ```asymmetric```
+- ```symmetric```
+- ```symmetric_with_uint8```
+- ```symmetric_with_power2_scale```
 
 ```load-profile=profile.yaml``` option is used to quantize graph based on the
 captured profile in ```profile.yaml``` file. Important note, graph structure
@@ -238,10 +249,12 @@ fused inline with the data. Caffe2 implements nodes with fused storage, such as
 [SparseLengthsWeightedSum](https://caffe2.ai/docs/operators-catalogue.html#sparselengthsweightedsumfused8bitrowwise). Glow
 supports such fused Nodes/Instructions, for example
 `FusedRowwiseQuantizedSparseLengthsWeightedSum`. The `ElemKind` of fused tensors
-is `UInt8FusedQTy`. Tensors with `UInt8FusedQTy` are 2-dimensional, and have an
-extra 8 columns for each row. The first extra 4 bytes are the scale of the row,
-and the second extra 4 bytes are the offset. Note that similar to normal
-row-wise quantized tensors, they use a dummy scale and offset in the Type.
+is either `UInt8FusedQTy` or `UInt8FusedFP16QTy`. Tensors with these `ElemKind`s
+are 2-dimensional, and have extra columns for each row to store scales and
+offsets for that row. `UInt8FusedQTy` stores scales and offsets as float (so
+there are 8 extra columns), while `UInt8FusedFP16QTy` stores them as float16_t
+(so there are 4 extra columns). Note that similar to normal row-wise quantized
+tensors, they use a dummy scale and offset in the Type.
 
 ### Conversion formula when using row-wise quantization
 

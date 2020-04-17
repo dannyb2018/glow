@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,9 @@
 #include "glow/Backend/CompiledFunction.h"
 #include "glow/Backends/BackendOptions.h"
 #include "glow/Base/Traits.h"
-#include "glow/Optimizer/Optimizer.h"
+#include "glow/Optimizer/GraphOptimizer/CompilationContext.h"
+#include "glow/Optimizer/GraphOptimizer/FunctionPassPipeline.h"
+#include "glow/Optimizer/IROptimizer/IRFunctionPassPipeline.h"
 #include "glow/Support/Register.h"
 
 #include "llvm/ADT/StringRef.h"
@@ -30,44 +32,41 @@ class IRFunction;
 class Node;
 class PlaceholderBindings;
 class IRGenVisitor;
+class TensorLayoutCommon;
 
-enum class BackendKind {
-  Interpreter, // Execute the network with the built-in interpreter.
-  OpenCL,      // Run the code on an OpenCL device.
-  CPU,         // Compile and run the code on the host.
-  Habana,      // Compile and run the code on a Habana accelerator.
+/// Information about an entry point of a saved bundle.
+struct BundleEntry {
+  /// Name of the bundle entry point for the function to be saved.
+  std::string name;
+  /// Function to be saved.
+  Function *func;
 };
 
-/// Stop gap measure while migrating from BackendKind to backend names.
-/// TODO: Remove this after migration.
-inline std::string BackendKindToString(BackendKind kind) {
-  switch (kind) {
-  case BackendKind::Interpreter:
-    return "Interpreter";
-  case BackendKind::OpenCL:
-    return "OpenCL";
-  case BackendKind::CPU:
-    return "CPU";
-  case BackendKind::Habana:
-    return "Habana";
-  }
-}
+namespace runtime {
+
+class DeviceManager;
+struct DeviceInfo;
+struct DeviceConfig;
+struct ContextBinding;
+
+struct DAGNode;
+
+} // namespace runtime
 
 // This is the interface that glow backends need to implement.
-class Backend {
+class Backend : public Named {
 public:
+  Backend() : Named("") {}
   /// Dtor.
   virtual ~Backend() = default;
 
-  /// \returns the kind of Backend this is.
-  virtual BackendKind getBackendKind() const = 0;
-
+  // \returns backend name.
   virtual std::string getBackendName() const = 0;
 
   /// Generate code for a vector of functions, \p functions. All compilations
   /// use the same settings provided by \p opts. This allows the compiler to
   /// support shared constants between functions.
-  virtual llvm::Expected<std::vector<std::unique_ptr<CompiledFunction>>>
+  virtual Expected<std::vector<std::unique_ptr<CompiledFunction>>>
   compileFunctions(llvm::ArrayRef<Function *> functions,
                    BackendOptions &opts) const {
     std::vector<std::unique_ptr<CompiledFunction>> compiledFunctions;
@@ -78,41 +77,89 @@ public:
         return resOrErr.takeError();
       }
     }
-    return llvm::Expected<std::vector<std::unique_ptr<CompiledFunction>>>(
+    return Expected<std::vector<std::unique_ptr<CompiledFunction>>>(
         std::move(compiledFunctions));
   }
 
-  virtual llvm::Expected<std::unique_ptr<CompiledFunction>>
+  virtual Expected<std::unique_ptr<CompiledFunction>>
   compile(Function *F) const {
     BackendOptions opts;
     return compile(F, opts);
   }
 
   /// Generate code for input function \param F given settings in \p opts.
-  virtual llvm::Expected<std::unique_ptr<CompiledFunction>>
+  virtual Expected<std::unique_ptr<CompiledFunction>>
   compile(Function *F, const BackendOptions &opts) const = 0;
 
-  /// Save the bundle for \p F for a later standalone execution
-  /// in \p outputDir. Make \p networkName the function name for
-  /// the entry point of the network and prepend all generated
-  /// files with this name.
+  /// Save the bundle for \p F for a later standalone execution in \p outputDir
+  /// under name \p bundleName. Make \p mainEntryName the function name for the
+  /// entry point of the network and prepend all generated files with this name.
   virtual void save(Function *F, llvm::StringRef outputDir,
-                    llvm::StringRef networkName) const {
+                    llvm::StringRef bundleName,
+                    llvm::StringRef mainEntryName) const {
+    LOG(FATAL) << "Saving a bundle is not supported by the backend";
+  }
+
+  virtual void saveFunctions(llvm::ArrayRef<BundleEntry> entries,
+                             llvm::StringRef outputDir,
+                             llvm::StringRef bundleName) const {
     LOG(FATAL) << "Saving a bundle is not supported by the backend";
   }
 
   /// Used by the compiler during graph optimization and before code generation,
   /// giving the backend an opportunity to transform the graph before IRGen. The
-  /// backend may insert backend-specific nodes. The backend is responsible for
-  /// cleaning up after itself.
-  /// \returns True if the graph was modified.
-  virtual bool transformPostLowering(Function *F,
-                                     CompilationContext &cctx) const {
+  /// backend may insert backend and device-specific nodes. The backend is
+  /// responsible for cleaning up after itself.
+  /// \returns an Expected True if the graph was modified.
+  virtual Expected<bool> transformPostLowering(
+      Function *F, CompilationContext &cctx,
+      const glow::runtime::DeviceInfo *devInfo = nullptr) const {
     return false;
   }
 
+  /// \returns true if Constants must be actually quantized before
+  /// Post-Lowering, false if it must be done after post-lowering.
+  virtual bool shouldPreQuantizeConstants() const { return true; }
+
   /// \returns whether the provided \p NI is supported by the backend.
   virtual bool isOpSupported(const NodeInfo &NI) const = 0;
+
+  /// \returns whether the backend would like to accept \p NI for execution. By
+  /// default falls back to just checking for support via \ref isOpSupported(),
+  /// however can also take into account things like performance considerations.
+  virtual bool acceptForExecution(const NodeInfo &NI) const {
+    return isOpSupported(NI);
+  }
+
+  /// \returns whether all nodes inside \p F are supported. \p verbose
+  /// represents whether to print Nodes that are unsupported.
+  bool checkAllNodesSupported(const Function &F, bool verbose = true) const;
+
+  /// \returns whether the provided \p F conforms to the backend-dependent graph
+  /// constraints. Giving the backend an opportunity to check that everything
+  /// conforms to its specific restrictions by overriding this function. It is
+  /// highly recommended for backends to make their backend specific
+  /// verifications a super-set of target independent Function::verify() by
+  /// calling it in their overridden implementation. It is not a strict
+  /// requirement, of course, in case they diverge / the backend has a good
+  /// reason not to call Function::verify(). \p verbose represents whether to
+  /// print out nodes that are unsupported by the backend.
+  virtual bool verify(const Function &F, bool verbose = true) const;
+
+  /// \returns whether the provided \p IR conforms to the backend-dependent
+  /// graph constraints. Giving the backend an opportunity to check that
+  /// everything conforms to its specific restrictions by overriding this
+  /// function. It is highly recommended for backends to make their backend
+  /// specific verifications a super-set of target independent
+  /// IRFunction::verify() by calling it in their overridden implementation. It
+  /// is not a strict requirement, of course, in case they diverge / the backend
+  /// has a good reason not to call IRFunction::verify().
+  virtual bool verify(const IRFunction &IR) const;
+
+  /// \returns a reference to the backend-specific tensor layout requirements
+  /// singleton. If not overridden, the default requirement is Glow's
+  /// "canonical" form.
+  virtual TensorLayoutCommon &getTensorLayoutRequirements() const;
 
   /// \returns true if the supplied Node \N should be lowered. By default, all
   /// Nodes are candidates for lowering.
@@ -122,6 +169,25 @@ public:
   /// performed.
   virtual bool shouldShareBuffers() const { return true; }
 
+  /// Modify the \p optimizationOpts however desired.
+  virtual FunctionPassPipeline getOptimizationPipeline() const;
+  /// Modify the \p optimizationOpts however desired.
+  virtual IRFunctionPassPipeline getIROptimizationPipeline() const;
+
+  /// \returns true if the Backend supports partial, unpadded tensors for
+  /// inputs that can have variable size (e.g., embedding indices).
+  virtual bool supportsPartialTensors() const { return false; }
+
+  /// \returns true if the Backend supports static Placeholders. This means
+  /// an input can be treated as a placeholder that can be reused on the device
+  /// for multiple requests.
+  virtual bool supportsStaticPlaceholders() const { return false; }
+
+  /// \returns whether the backend supports fusing \p activation into \p parent.
+  virtual bool supportsFusedActivation(Node *parent, Node *activation) const {
+    return false;
+  }
+
   /// \returns true if Backend generated Instruction for Node \p N,
   /// using IRGenVisitor \p irgen.
   virtual bool generateInst(Node *N, IRGenVisitor &irgen) const {
@@ -129,6 +195,43 @@ public:
   }
 
   virtual size_t getTraceEventDataSize() const { return 0; }
+
+  /// Create device manager corresponding to the backend based on the
+  /// deviceConfig.
+  virtual runtime::DeviceManager *
+  createDeviceManager(const runtime::DeviceConfig &deviceConfig);
+
+  /// Walks the provided /p bindings and does any setup needed for copying data
+  /// to/from host or peers. Also has access to /p root the root node of the
+  /// graph, which contains partition dependency and symbol information. Any
+  /// state information should be stored in the ExecutionContext or
+  /// DeviceManager.
+  virtual Error bindContexts(llvm::ArrayRef<runtime::ContextBinding> bindings,
+                             const runtime::DAGNode *root, bool enableP2P,
+                             bool enableDRT) {
+    return Error::success();
+  }
+
+  /// \returns the supported options for compiled functions (name=>description).
+  virtual llvm::StringMap<std::string>
+  getSupportedCompiledFunctionOptions() const {
+    return llvm::StringMap<std::string>();
+  };
+
+  /// \returns the supported options for device managers (name=>description).
+  virtual llvm::StringMap<std::string>
+  getSupportedDeviceManagerOptions() const {
+    return llvm::StringMap<std::string>();
+  };
+
+  /// \returns true if network supports Type Lowering from \p T1 to \p T2.
+  /// Populates PrecisionConfiguration with black list of operations that can't
+  /// be converted.
+  virtual bool
+  canDoIndexTypeDemotion(ElemKind fromTy, ElemKind toTy,
+                         PrecisionConfiguration &precConfig) const {
+    return false;
+  };
 
 protected:
   /// Parses the graph \F and builds a TraceInfo structure from any found
@@ -141,10 +244,6 @@ protected:
   /// Modifies \p IR and updates \p traceInfo.
   void autoInstrument(TraceInfo &traceInfo, IRFunction *IR) const;
 };
-
-/// Create a backend of kind \p kind.
-/// Deprecated. Moving gradualy to the createBackend based on the backend name.
-Backend *createBackend(BackendKind backendKind);
 
 /// Create a backend based on the registered backend name \p backendName.
 Backend *createBackend(llvm::StringRef backendName);
@@ -167,9 +266,43 @@ public:
     std::string getRegistrationKey() const override {                          \
       return BackendClass::getName();                                          \
     }                                                                          \
+    unsigned numDevices() const override {                                     \
+      return BackendClass::numDevices();                                       \
+    }                                                                          \
   };                                                                           \
   static RegisterFactory<std::string, FactoryName, Backend>                    \
       FactoryName##_REGISTERED;
+
+/// Perform dynamic Backend Factory registration. Register the backend factory
+/// under the provided \p Name and use \p CreateFn expression to create new
+/// instances of the backends.
+#define REGISTER_DYNAMIC_GLOW_BACKEND_FACTORY(FactoryName, BackendClass, Name, \
+                                              CreateFn)                        \
+  class FactoryName : public BaseFactory<std::string, Backend> {               \
+  public:                                                                      \
+    FactoryName() : registrationKey_(Name) {}                                  \
+    Backend *create() override { return CreateFn; }                            \
+    std::string getRegistrationKey() const override {                          \
+      return registrationKey_;                                                 \
+    }                                                                          \
+    unsigned numDevices() const override {                                     \
+      return BackendClass::numDevices();                                       \
+    }                                                                          \
+                                                                               \
+  private:                                                                     \
+    std::string registrationKey_;                                              \
+  };                                                                           \
+  RegisterFactory<std::string, FactoryName, Backend> FactoryName##_REGISTERED;
+
+/// \returns the set of names for all available, registered backends.
+std::vector<std::string> getAvailableBackends();
+
+/// The backend name used in Glow quantization profiling.
+#ifdef GLOW_WITH_CPU
+constexpr const char *profilingBackend = "CPU";
+#else
+constexpr const char *profilingBackend = "Interpreter";
+#endif
 
 } // namespace glow
 

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,10 +22,20 @@
 #include <future>
 #include <mutex>
 #include <queue>
+#include <set>
 #include <thread>
 #include <vector>
 
 namespace glow {
+
+namespace threads {
+/// Returns a unique id associated with the current thread.
+size_t getThreadId();
+
+/// Returns a unique id associated with a new virtual thread (i.e. a device
+/// tid).
+size_t createThreadId();
+} // namespace threads
 
 #ifdef WIN32
 /// A copyable wrapper for a lambda function that has non-copyable objects in
@@ -54,7 +64,7 @@ shared_function<std::decay_t<F>> make_shared_function(F &&f) {
 class ThreadExecutor final {
 public:
   /// Constructor. Initializes one thread backed by the workQueue_.
-  ThreadExecutor();
+  explicit ThreadExecutor(const std::string &name = "");
 
   /// Destructor. Signals the thread to stop and waits for exit.
   ~ThreadExecutor();
@@ -110,7 +120,7 @@ class ThreadPool final {
 public:
   /// Constructor. Initializes a thread pool with \p numWorkers
   /// threads and has them all run ThreadPool::threadPoolWorkerMain.
-  ThreadPool(unsigned numWorkers = kNumWorkers);
+  ThreadPool(unsigned numWorkers = kNumWorkers, const std::string &name = "");
 
   /// Destructor. Signals to all threads to stop and waits for all of them
   /// to exit.
@@ -160,6 +170,8 @@ public:
     return promise->get_future();
   }
 
+  const std::set<size_t> &getThreadIds() { return threadIds_; }
+
 private:
   /// The default number of workers in the thread pool (overridable).
   constexpr static unsigned kNumWorkers = 10;
@@ -171,6 +183,9 @@ private:
 
   /// Round robin index for the next work thread.
   std::atomic<size_t> nextWorker_{0};
+
+  /// Thread Ids and associated names owned by this ThreadPool.
+  std::set<size_t> threadIds_;
 };
 } // namespace glow
 

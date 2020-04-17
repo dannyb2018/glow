@@ -66,10 +66,14 @@ linux_default: &linux_default
       name: Test
       no_output_timeout: "1h"
       command: |
-        docker exec -e CIRCLE_JOB=${CIRCLE_JOB} -u jenkins $(cat .docker_pid) .circleci/test.sh
+        docker exec -e AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} -e AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} -e CIRCLE_BRANCH=${CIRCLE_BRANCH} -e CIRCLE_JOB=${CIRCLE_JOB} -u jenkins $(cat .docker_pid) .circleci/test.sh
 
 jobs:
   DEBUG:
+    environment:
+      DOCKER_IMAGE: "308535385114.dkr.ecr.us-east-1.amazonaws.com/caffe2/py2-clang8-ubuntu16.04:283"
+    <<: *linux_default
+  OPENCL:
     environment:
       DOCKER_IMAGE: "308535385114.dkr.ecr.us-east-1.amazonaws.com/caffe2/py2-clang8-ubuntu16.04:283"
     <<: *linux_default
@@ -77,11 +81,7 @@ jobs:
     environment:
       DOCKER_IMAGE: "308535385114.dkr.ecr.us-east-1.amazonaws.com/caffe2/py2-clang8-ubuntu16.04:283"
     <<: *linux_default
-  TSAN:
-    environment:
-      DOCKER_IMAGE: "308535385114.dkr.ecr.us-east-1.amazonaws.com/caffe2/py2-clang8-ubuntu16.04:283"
-    <<: *linux_default
-  SHARED:
+  32B_DIM_T:
     environment:
       DOCKER_IMAGE: "308535385114.dkr.ecr.us-east-1.amazonaws.com/caffe2/py2-clang8-ubuntu16.04:283"
     <<: *linux_default
@@ -89,11 +89,11 @@ jobs:
     environment:
       DOCKER_IMAGE: "308535385114.dkr.ecr.us-east-1.amazonaws.com/caffe2/py2-clang8-ubuntu16.04:283"
     <<: *linux_default
-  COVERAGE:
+  PYTORCH:
     environment:
-      DOCKER_IMAGE: "308535385114.dkr.ecr.us-east-1.amazonaws.com/caffe2/py2-clang8-ubuntu16.04:283"
+      DOCKER_IMAGE: "308535385114.dkr.ecr.us-east-1.amazonaws.com/caffe2/py3.6-clang7-ubuntu16.04:287"
     <<: *linux_default
-  CHECK_CLANG_FORMAT:
+  CHECK_CLANG_AND_PEP8_FORMAT:
     environment:
       DOCKER_IMAGE: "308535385114.dkr.ecr.us-east-1.amazonaws.com/caffe2/py2-clang6.0-ubuntu16.04:230"
     <<: *linux_default
@@ -102,9 +102,9 @@ workflows:
   build:
     jobs:
       - DEBUG
+      - OPENCL
       - ASAN
-      - TSAN
-      - SHARED
+      - 32B_DIM_T
       - RELEASE_WITH_EXPENSIVE_TESTS
-      - COVERAGE
-      - CHECK_CLANG_FORMAT
+      - PYTORCH
+      - CHECK_CLANG_AND_PEP8_FORMAT

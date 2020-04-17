@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,10 +33,24 @@ NodeValue::NodeValue(Node *N, unsigned resNo) {
   resNo_ = resNo;
 }
 
-void NodeValue::replaceAllUsesOfWith(NodeValue v, const Function *F) const {
-  if (v.getNode()) {
-    assert(getType() == v.getType() && "Replacing value with the wrong type");
+void NodeValue::replaceAllUsesOfWith(NodeValue v, const Function *F,
+                                     Node *skipReplacement) const {
+  if (v.getNode() && getType() != v.getType()) {
+    // Fresh replacement nodes without users are usually created by the graph
+    // optimizer, where the type of the replacement value should always match
+    // the type of the original node value. Check if the only difference is
+    // related to strides and adjust accordingly.
+    assert(v.getNumUsers() == 0 && "Cannot update type if there are users");
+    assert(getType()->isEqual(*v.getType(), /* allowDifferentShape */ false,
+                              /* allowDifferentStrides */ true) &&
+           "Replacing value with the wrong type");
+    v.setType(getType());
   }
+  typeUnsafeReplaceAllUsesOfWith(v, F, skipReplacement);
+}
+
+void NodeValue::typeUnsafeReplaceAllUsesOfWith(NodeValue v, const Function *F,
+                                               Node *skipReplacement) const {
   // Copy the list of users in a temporary vector since that list (and the
   // underlying iterators) are going to be invalidated by the next loop.
   auto nodeValueUsers = getUsers();
@@ -46,17 +60,28 @@ void NodeValue::replaceAllUsesOfWith(NodeValue v, const Function *F) const {
     NodeHandle *site = U.get();
     auto *userF = U.getUser()->getParent();
     // If the user is not in function F, don't touch it.
-    if (F && userF != F)
+    if (F && userF != F) {
       continue;
+    }
     assert(site->getNode() == node_ && "Invalid user");
     assert(site->getResNo() == getResNo() && "Invalid list of uses");
-    site->setOperand(v.getNode(), v.getResNo());
-  }
 
-  // Log all nodes replacement.
-  if (getNode()->getParent()) {
-    getNode()->getParent()->getLogContext().logNodeReplacement(getNode(),
-                                                               v.getNode());
+    if (U.getUser() == skipReplacement) {
+      continue;
+    }
+
+    // Log the change of node input(operand).
+    if (Function *F = getNode()->getParent()) {
+      F->getLogContext()->logNodeInputChange(*(U.getUser()), *this, v);
+    }
+    // Constant or Placeholder has no associated Function, we need to log the
+    // input changes inside its user's Function.
+    else if (getNode()->getKind() == Kinded::Kind::ConstantKind ||
+             getNode()->getKind() == Kinded::Kind::PlaceholderKind) {
+      userF->getLogContext()->logNodeInputChange(*(U.getUser()), *this, v);
+    }
+
+    site->setOperand(v.getNode(), v.getResNo());
   }
 }
 
@@ -80,12 +105,19 @@ llvm::iterator_range<NodeValueConstIterator> NodeValue::getUsers() const {
 
 TypeRef NodeValue::getType() const { return node_->getType(resNo_); }
 void NodeValue::setType(TypeRef ty) { node_->setType(resNo_, ty); }
+void NodeValue::setTypeUnsafe(TypeRef ty) { node_->setTypeUnsafe(resNo_, ty); }
 
 ElemKind NodeValue::getElementType() const {
   return getType()->getElementType();
 }
 
-llvm::ArrayRef<size_t> NodeValue::dims() const { return getType()->dims(); }
+llvm::ArrayRef<dim_t> NodeValue::dims() const { return getType()->dims(); }
+
+std::string
+NodeValue::generateNodeOutputName(bool stripResNoFor0thInput) const {
+  return generateNodeOutputName(node_->getName(), resNo_,
+                                stripResNoFor0thInput);
+}
 
 NodeHandle::NodeHandle(Node *parent, Node *N) : NodeValue(N), parent_(parent) {
   setOperand(N, 0);

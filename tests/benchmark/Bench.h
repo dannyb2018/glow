@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,10 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <tuple>
+#include <vector>
+
+#include "glow/Base/DimType.h"
 
 namespace glow {
 
@@ -31,19 +35,34 @@ public:
   virtual void teardown() = 0;
 };
 
-/// Run a benchmark \p reps times and report the best execution time.
-double bench(Benchmark *b, size_t reps) {
-  double best = std::numeric_limits<double>::max();
+/// Run a benchmark \p reps times and return the execution times
+std::vector<double> bench(Benchmark *b, size_t reps) {
+  std::vector<double> times(reps);
   b->setup();
   for (size_t i = 0; i < reps; i++) {
     auto start = std::chrono::high_resolution_clock::now();
     b->run();
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration<double>(end - start).count();
-    best = std::min(best, duration);
+    times[i] = duration;
   }
   b->teardown();
-  return best;
+  return times;
+}
+
+std::vector<dim_t> getBatchSizePerCore(size_t batchSize, dim_t numCores) {
+  std::vector<dim_t> batchSizePerCore(numCores);
+  for (dim_t core = 0; core < numCores; core++) {
+    dim_t perCore = (batchSize + numCores - 1) / numCores;
+    dim_t startIdx = core * perCore;
+    dim_t endIdx = (core + 1) * perCore;
+    if (startIdx > batchSize)
+      startIdx = batchSize;
+    if (endIdx > batchSize)
+      endIdx = batchSize;
+    batchSizePerCore[core] = (endIdx - startIdx);
+  }
+  return batchSizePerCore;
 }
 
 } // namespace glow

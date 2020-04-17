@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include "glow/Graph/Graph.h"
 #include "glow/Graph/PlaceholderBindings.h"
 #include "glow/IR/Instrs.h"
+#include "glow/Optimizer/IROptimizer/IROptimizer.h"
 #include "glow/Support/Debug.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -48,18 +49,27 @@ void allocateJITMemory(const IRFunction *F, AllocationsInfo &allocationsInfo) {
 
 } // end namespace
 
-LLVMBackend::LLVMBackend() {
+LLVMBackendOptions::LLVMBackendOptions() {
   // Initialize using command-line options by default.
   arch_ = llvmArch;
   target_ = llvmTarget;
   cpu_ = llvmCPU;
+  abi_ = llvmABI;
+  floatABI_ = floatABI;
+  codeModel_ = llvmCodeModel;
+  bundleCodeModel_ = llvmBundleCodeModel;
+  relocModel_ = llvmRelocModel;
+  bundleAPI_ = bundleAPI;
+  targetFeatures_.append(llvmTargetFeatures.begin(), llvmTargetFeatures.end());
 }
+
+LLVMBackend::LLVMBackend() {}
 
 /// Emit the entry point for JIT called "jitmain".
 /// Function has the following API:
 ///   void jitmain(uint8_t *baseConstantWeightVars,
 ///                uint8_t *baseInOutWeightVars,
-///                nuint8_t *baseActivations);
+///                uint8_t *baseActivations);
 void LLVMBackend::emitJitMain(LLVMIRGen &irgen) const {
   AllocationsInfo &allocationsInfo = irgen.getAllocationsInfo();
   llvm::Type *voidTy = llvm::Type::getVoidTy(irgen.getLLVMContext());
@@ -108,18 +118,18 @@ LLVMBackend::compileIRWithoutConstants(IRFunction *IR) const {
   std::unique_ptr<LLVMIRGen> irgen = createIRGen(IR, allocationsInfo);
   llvm::SmallVector<std::string, 8> targetFeatures(llvmTargetFeatures.begin(),
                                                    llvmTargetFeatures.end());
-  irgen->initTargetMachine(getTarget(), getArch(), getCPU(), targetFeatures,
-                           llvm::CodeModel::Model::Large);
+  irgen->initTargetMachine(getOptions());
   irgen->initCodeGen();
+  irgen->setIRFunction(IR);
   // Perform the address assignment for activations and WeightVars.
-
   allocateJITMemory(IR, irgen->getAllocationsInfo());
-  // Create the jitmain function to be invoked by JIT.
-  emitJitMain(*irgen);
   // Emit the code for the body of the entry function.
   irgen->performCodeGen();
+  // Create the jitmain function to be invoked by JIT.
+  emitJitMain(*irgen);
+  irgen->finishCodeGen();
   // Hand over the module to JIT for the machine code generation.
-  auto JIT = llvm::make_unique<llvm::orc::GlowJIT>(irgen->getTargetMachine());
+  auto JIT = glow::make_unique<llvm::orc::GlowJIT>(irgen->getTargetMachine());
   JIT->addModule(irgen->borrowModule());
   // Build runtimeBundle object containing offsets and allocation sizes.
   MemoryAllocator constantAllocator("ConstantWeights", 0);
@@ -127,10 +137,10 @@ LLVMBackend::compileIRWithoutConstants(IRFunction *IR) const {
   MemoryAllocator activationsAllocator("Activations", 0);
   auto runtimeInfo = runtime::RuntimeBundle::create(
       *IR, constantAllocator, placeholderAllocator, activationsAllocator);
-  return createCompiledFunction(std::move(JIT), runtimeInfo);
+  return createCompiledFunction(std::move(JIT), std::move(runtimeInfo));
 }
 
-llvm::Expected<std::unique_ptr<CompiledFunction>>
+Expected<std::unique_ptr<CompiledFunction>>
 LLVMBackend::compile(Function *F, const BackendOptions &opts) const {
   TraceInfo traceInfo = buildManualTraceInfo(F);
   auto IR = generateAndOptimizeIR(F, *this, shouldShareBuffers());
@@ -147,16 +157,29 @@ LLVMBackend::compile(Function *F, const BackendOptions &opts) const {
   }
 
   compiledFunc->setTraceInfo(std::move(traceInfo));
-  return llvm::Expected<std::unique_ptr<CompiledFunction>>(
-      std::move(compiledFunc));
+  return Expected<std::unique_ptr<CompiledFunction>>(std::move(compiledFunc));
 }
 
 void LLVMBackend::save(Function *F, llvm::StringRef outputDir,
-                       llvm::StringRef networkName) const {
+                       llvm::StringRef bundleName,
+                       llvm::StringRef mainEntryName) const {
   llvm::SmallVector<std::string, 8> targetFeatures(llvmTargetFeatures.begin(),
                                                    llvmTargetFeatures.end());
   auto IR = generateAndOptimizeIR(F, *this, shouldShareBuffers());
-  BundleSaver(IR.get(), *this)
-      .save(getTarget(), getArch(), getCPU(), targetFeatures, outputDir,
-            networkName);
+  BundleSaver bundleSaver(*this, outputDir, bundleName);
+  bundleSaver.save(mainEntryName, IR.get());
+  bundleSaver.produceBundle();
+}
+
+void LLVMBackend::saveFunctions(llvm::ArrayRef<BundleEntry> entries,
+                                llvm::StringRef outputDir,
+                                llvm::StringRef bundleName) const {
+  BundleSaver bundleSaver(*this, outputDir, bundleName);
+  std::vector<std::unique_ptr<glow::IRFunction>> irFunctions;
+  for (auto &entry : entries) {
+    auto IR = generateAndOptimizeIR(entry.func, *this, shouldShareBuffers());
+    bundleSaver.save(entry.name, IR.get());
+    irFunctions.emplace_back(std::move(IR));
+  }
+  bundleSaver.produceBundle();
 }

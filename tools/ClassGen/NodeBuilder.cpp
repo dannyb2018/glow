@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,137 +16,8 @@
 
 #include "NodeBuilder.h"
 
-EnumBuilder::EnumBuilder(std::ofstream &C, const std::string &name,
-                         bool isBackendSpecific)
-    : fullyQualifiedName_(name), cStream(C),
-      isBackendSpecific_(isBackendSpecific) {
-  // Parse out and store namespaces if any have been provided by repeatedly
-  // searching for tokens delimited by the scope resolution operator "::"".
-  const std::string kScopeOperator("::");
-
-  size_t namespaceStart = 0;
-  size_t namespaceEnd = name.find(kScopeOperator, namespaceStart);
-
-  while (namespaceEnd != std::string::npos) {
-    // Extract and store the current outermost namespace.
-    const size_t namespaceLength = namespaceEnd - namespaceStart;
-    namespaces_.emplace_back(name.substr(namespaceStart, namespaceLength));
-
-    // Look for the next namespace.
-    namespaceStart = namespaceEnd + kScopeOperator.size();
-    namespaceEnd = name.find(kScopeOperator, namespaceStart);
-  }
-
-  // Once the scope resolution operator is no longer found, that which was
-  // thought to be the beginning of the next namespace must be the beginning
-  // of the enum class name instead.
-  const size_t enumNameStart = namespaceStart;
-  name_ = name.substr(enumNameStart);
-
-  // Sanity check that there are no scope resolution operators in the parsed
-  // enum name.
-  assert(name_.find(kScopeOperator) == std::string::npos);
-}
-
-EnumBuilder &EnumBuilder::addEnumCase(const std::string &name,
-                                      const std::string &doc) {
-  enumCases_.emplace_back(EnumCase{name, unusedValue_++, doc, false});
-  return *this;
-}
-
-EnumBuilder &EnumBuilder::addEnumCaseWithValue(const std::string &name,
-                                               const int value,
-                                               const std::string &doc) {
-  // First, check if the value is already in use. If it is, replace the old
-  // use of it with unusedValue_.
-  for (auto &enumCase : enumCases_) {
-    if (!enumCase.definedWithValue && (enumCase.value == value)) {
-      enumCase.value = unusedValue_++;
-      break;
-    }
-  }
-
-  enumCases_.emplace_back(EnumCase{name, value, doc, true});
-
-  // Maintain the invariant that unusedValue_ is always a value that is NOT
-  // used by the enum.
-  unusedValue_ = std::max(unusedValue_, value + 1);
-  return *this;
-}
-
-MemberTypeInfo EnumBuilder::getMemberTypeInfo() const {
-  // Emit the forward declaration into a string so that it can be packed into
-  // a MemberTypeInfo.
-  std::stringstream ss;
-  emitForwardDecl(ss);
-  std::string forwardDecl = ss.str();
-
-  return MemberTypeInfo{MemberType::Enum, fullyQualifiedName_,
-                        fullyQualifiedName_, fullyQualifiedName_, forwardDecl};
-}
-
-EnumBuilder::~EnumBuilder() {
-  // If the enum is backend specific, do not print out a definition. It must
-  // be defined elsewhere in the same namespace it was declared with
-  // Builder::newEnum.
-  if (!isBackendSpecific_) {
-    emitEnumDefinition(cStream);
-  }
-}
-
-void EnumBuilder::emitNamespaceOpen(std::ostream &os) const {
-  for (const auto &ns : namespaces_) {
-    os << "namespace " << ns << " {\n";
-  }
-}
-
-void EnumBuilder::emitNamespaceClose(std::ostream &os) const {
-  for (size_t i = 0, e = namespaces_.size(); i < e; ++i) {
-    os << "}\n";
-  }
-}
-
-void EnumBuilder::emitDocstring(std::ostream &os) const {
-  std::istringstream stream(docstring_);
-  std::string line;
-  while (std::getline(stream, line)) {
-    os << "  /// " << line << "\n";
-  }
-}
-
-void EnumBuilder::emitForwardDecl(std::ostream &os) const {
-  emitNamespaceOpen(os);
-  os << "  enum class " << name_ << ";\n";
-  emitNamespaceClose(os);
-
-  os << "\n";
-}
-
-void EnumBuilder::emitEnumCases(std::ostream &os) const {
-  os << "  enum class " << name_ << " {\n";
-
-  for (const auto &enumCase : enumCases_) {
-    if (!enumCase.doc.empty()) {
-      os << "    // " << enumCase.doc << "\n";
-    }
-    os << "    " << enumCase.name << " = " << enumCase.value << ",\n";
-  }
-
-  os << "  };\n";
-
-  os << "\n";
-}
-
-void EnumBuilder::emitEnumDefinition(std::ostream &os) const {
-  emitNamespaceOpen(os);
-  emitDocstring(os);
-  emitEnumCases(os);
-  emitNamespaceClose(os);
-
-  os << "\n";
-}
-
-NodeBuilder &NodeBuilder::addMember(MemberType type, const std::string &name) {
+NodeBuilder &NodeBuilder::addMember(MemberType type, const std::string &name,
+                                    bool addSetter) {
   MemberTypeInfo *typeInfo = nullptr;
 
   if (type == MemberType::TypeRef) {
@@ -171,20 +42,34 @@ NodeBuilder &NodeBuilder::addMember(MemberType type, const std::string &name) {
     typeInfo = &kVectorSignedTypeInfo;
   } else if (type == MemberType::VectorSizeT) {
     typeInfo = &kVectorSizeTTypeInfo;
+  } else if (type == MemberType::VectorDimT) {
+    typeInfo = &kVectorDimTTypeInfo;
   } else if (type == MemberType::VectorNodeValue) {
     typeInfo = &kVectorNodeValueTypeInfo;
   } else if (type == MemberType::Enum) {
     typeInfo = &kEnumTypeInfo;
+  } else if (type == MemberType::UserDefinedType) {
+    llvm_unreachable("addMember should be called with a MemberTypeInfo "
+                     "parameter in this case");
   } else {
     llvm_unreachable("Type not recognized");
   }
 
-  return addMember(typeInfo, name);
+  return addMember(*typeInfo, name, addSetter);
+}
+
+NodeBuilder &NodeBuilder::addFusedActivation() {
+  return addMember(MEMBER_TYPE_INFO(glow::FusedActivation), "FusedActivation",
+                   /* addSetter */ true)
+      .addExtraMethod(
+          "bool hasFusedActivation() const;",
+          "bool ConvolutionNode::hasFusedActivation() const { return "
+          "getFusedActivation() != FusedActivation::NONE; }");
 }
 
 void NodeBuilder::emitMemberForwardDecls(std::ostream &os) const {
   for (const auto &mem : members_) {
-    const std::string &forwardDecl = (mem.first)->forwardDecl;
+    const std::string &forwardDecl = (mem.first).forwardDecl;
     if (!forwardDecl.empty()) {
       os << forwardDecl << "\n";
     }
@@ -225,7 +110,7 @@ void NodeBuilder::emitCtor(std::ostream &os) const {
 
   // Extra class members:
   for (const auto &op : members_) {
-    os << ", " << getCtorArgTypename(op.first) << " " << op.second;
+    os << ", " << getCtorArgTypename(&op.first) << " " << op.second;
   }
 
   // Initialize the base clases:
@@ -244,7 +129,7 @@ void NodeBuilder::emitCtor(std::ostream &os) const {
 
   // Initialize the members:
   for (const auto &op : members_) {
-    if ((op.first)->type != MemberType::VectorNodeValue) {
+    if ((op.first).type != MemberType::VectorNodeValue) {
       os << ", " << op.second << "_(" << op.second << ")";
       continue;
     }
@@ -261,7 +146,7 @@ void NodeBuilder::emitCtor(std::ostream &os) const {
   }
 
   for (const auto &op : members_) {
-    if ((op.first)->type != MemberType::VectorNodeValue) {
+    if ((op.first).type != MemberType::VectorNodeValue) {
       continue;
     }
     os << "    " << op.second << "_.resize(" << op.second << ".size());\n";
@@ -293,17 +178,22 @@ void NodeBuilder::emitClassMembers(std::ostream &os) const {
     os << "  NodeHandle " << op << "_;\n";
   }
   for (const auto &op : members_) {
-    os << "  " << getStorageTypename(op.first) << " " << op.second << "_;\n";
+    os << "  " << getStorageTypename(&op.first) << " " << op.second << "_;\n";
   }
 }
 
-void NodeBuilder::emitMemberGetter(std::ostream &os,
-                                   const MemberTypeInfo *typeInfo,
-                                   const std::string &name) const {
+void NodeBuilder::emitMemberGetterSetter(std::ostream &os,
+                                         const MemberTypeInfo *typeInfo,
+                                         const std::string &name) const {
   // Synthesize the general getter.
-  auto returnTypeStr = getReturnTypename(typeInfo);
-  os << "  " << returnTypeStr << " get" << name << "() const { return " << name
+  auto typeStr = getReturnTypename(typeInfo);
+  os << "  " << typeStr << " get" << name << "() const { return " << name
      << "_; }\n";
+
+  if (typeInfo->addSetter) {
+    os << "  void set" << name << "(" << typeStr << " a) {" << name
+       << "_ = a; }\n";
+  }
 }
 
 void NodeBuilder::emitSettersGetters(std::ostream &os) const {
@@ -323,7 +213,7 @@ void NodeBuilder::emitSettersGetters(std::ostream &os) const {
   }
 
   for (const auto &op : members_) {
-    emitMemberGetter(os, op.first, op.second);
+    emitMemberGetterSetter(os, &op.first, op.second);
   }
 
   // Synthesize the 'classof' method that enables the non-rtti polymorphism.
@@ -347,7 +237,7 @@ void NodeBuilder::emitEdges(std::ostream &os) const {
   os << "\nunsigned " << name_ << "Node::getNumInputs() const {\n"
      << "  return " << nodeInputs_.size();
   for (const auto &op : members_) {
-    if ((op.first)->type != MemberType::VectorNodeValue) {
+    if ((op.first).type != MemberType::VectorNodeValue) {
       continue;
     }
     os << " + " << op.second << "_.size()";
@@ -362,7 +252,7 @@ void NodeBuilder::emitEdges(std::ostream &os) const {
   }
   os << "  idx -= " << nodeInputs_.size() << ";\n";
   for (const auto &op : members_) {
-    if ((op.first)->type != MemberType::VectorNodeValue) {
+    if ((op.first).type != MemberType::VectorNodeValue) {
       continue;
     }
     os << "  if (idx < " << op.second << "_.size()) { return \"" << op.second
@@ -377,7 +267,7 @@ void NodeBuilder::emitEdges(std::ostream &os) const {
   }
   os << "  idx -= " << nodeInputs_.size() << ";\n";
   for (const auto &op : members_) {
-    if ((op.first)->type != MemberType::VectorNodeValue) {
+    if ((op.first).type != MemberType::VectorNodeValue) {
       continue;
     }
     os << "  if (idx < " << op.second << "_.size()) { return " << op.second
@@ -393,7 +283,7 @@ void NodeBuilder::emitEdges(std::ostream &os) const {
   }
   os << "  idx -= " << nodeInputs_.size() << ";\n";
   for (const auto &op : members_) {
-    if ((op.first)->type != MemberType::VectorNodeValue) {
+    if ((op.first).type != MemberType::VectorNodeValue) {
       continue;
     }
     os << "  if (idx < " << op.second << "_.size()) { " << op.second
@@ -429,7 +319,7 @@ void NodeBuilder::emitPrettyPrinter(std::ostream &os) const {
 
   for (const auto &mem : members_) {
     // Don't try to print the node operands directly.
-    MemberType ty = (mem.first)->type;
+    MemberType ty = (mem.first).type;
     if (ty == MemberType::VectorNodeValue) {
       continue;
     }
@@ -445,15 +335,17 @@ void NodeBuilder::emitPrettyPrinter(std::ostream &os) const {
   os << "    .addParam(\"users\", getNumUsers());\n";
 
   for (const auto &mem : members_) {
-    if ((mem.first)->type != MemberType::VectorNodeValue) {
+    if ((mem.first).type != MemberType::VectorNodeValue) {
       continue;
     }
 
     // Make sure that inputs are properly indexed.
+    os << "  {\n";
     os << "  unsigned mIndex = 0;\n";
     os << "  for (const auto &II : get" << mem.second << "()) {\n"
        << "    db.addParam(\"" << mem.second
        << "\"+std::to_string(mIndex++), *II.getType());\n"
+       << "  }\n"
        << "  }\n";
   }
 
@@ -494,6 +386,9 @@ void NodeBuilder::emitCloner(std::ostream &os) const {
   os << ");\n}\n";
 }
 
+/// \returns true if a can be a part of a valid C/C++ identifier.
+static bool isIdentifierChar(char c) { return (c == '_' || isalnum(c)); }
+
 void NodeBuilder::emitEquator(std::ostream &os) const {
   os << "\nbool " << name_ << "Node::isEqual(const " << name_
      << "Node &other) const {\n  return true";
@@ -509,7 +404,19 @@ void NodeBuilder::emitEquator(std::ostream &os) const {
   os << " &&\n      predicate_ == other.predicate_";
 
   for (const auto &mem : members_) {
-    os << " &&\n      " << mem.second << "_ == other." << mem.second << "_";
+    // Use custom user-defined comparator functions if available.
+    std::string cmpFn = mem.first.cmpFn;
+    if (cmpFn.empty() || !isIdentifierChar(cmpFn.at(0))) {
+      if (cmpFn.empty()) {
+        // Default comparator is ==.
+        cmpFn = "==";
+      }
+      os << " &&\n      " << mem.second << "_ " << cmpFn << " other."
+         << mem.second << "_";
+    } else {
+      os << " &&\n      " << cmpFn << "(" << mem.second << "_, other."
+         << mem.second << "_)";
+    }
   }
 
   for (int i = 0, e = nodeOutputs_.size(); i < e; i++) {
@@ -520,8 +427,13 @@ void NodeBuilder::emitEquator(std::ostream &os) const {
 
 static bool isVectorType(MemberType ty) {
   return ty == MemberType::VectorFloat || ty == MemberType::VectorNodeValue ||
-         ty == MemberType::VectorSizeT || ty == MemberType::VectorUnsigned ||
-         ty == MemberType::VectorInt64 || ty == MemberType::VectorSigned;
+         ty == MemberType::VectorSizeT || ty == MemberType::VectorDimT ||
+         ty == MemberType::VectorUnsigned || ty == MemberType::VectorInt64 ||
+         ty == MemberType::VectorSigned;
+}
+
+static bool isFloatVectorType(MemberType ty) {
+  return ty == MemberType::VectorFloat;
 }
 
 void NodeBuilder::emitHasher(std::ostream &os) const {
@@ -538,11 +450,17 @@ void NodeBuilder::emitHasher(std::ostream &os) const {
     os << delim << "\n      getMode()";
     delim = ",";
   }
-
   for (const auto &mem : members_) {
-    auto ty = (mem.first)->type;
+    auto ty = (mem.first).type;
     if (ty == MemberType::Float) {
       os << delim << "\n      toBinary(" << mem.second << "_)";
+    } else if (isFloatVectorType(ty)) {
+      os << delim
+         << "\n      [](const std::vector<float>& floatVec) -> llvm::hash_code "
+            "{\n        std::vector<size_t> sizeVec = toBinary(floatVec);\n    "
+            "    return llvm::hash_combine_range(sizeVec.begin(), "
+            "sizeVec.end());\n      }("
+         << mem.second << "_)";
     } else if (isVectorType(ty)) {
       os << delim << "\n      llvm::hash_combine_range(" << mem.second
          << "_.begin(), " << mem.second << "_.end())";
@@ -574,7 +492,7 @@ void NodeBuilder::emitVisitor(std::ostream &os) const {
   }
 
   for (const auto &op : members_) {
-    if ((op.first)->type == MemberType::VectorNodeValue) {
+    if ((op.first).type == MemberType::VectorNodeValue) {
       os << "  for (auto &I : " << op.second
          << "_) { I.getNode()->visit(this, visitor); }\n";
     }
@@ -632,12 +550,18 @@ void NodeBuilder::emitNodeClass(std::ostream &os) const {
      << "  void setNthInput(unsigned idx, NodeValue val);\n"
      << "  llvm::StringRef getOutputName(unsigned idx) const;\n"
      << "  bool hasSideEffects() const { return " << hasSideEffects_ << "; }\n"
+     << "  bool isCanonical() const { return " << !isBackendSpecific_ << "; }\n"
+     << "  bool isDataParallel() const { return " << isDataParallel_ << "; }\n"
      << "  std::string getDebugDesc() const;\n"
      << "  bool isEqual(const " << name_ << "Node &other) const;\n"
      << "  llvm::hash_code getHash() const;\n"
      << "  void visit(Node *parent, NodeWalker *visitor);\n"
      << "  Node* clone() const;\n"
      << "  bool verify() const;\n";
+
+  if (hasExtraResults_) {
+    os << "  void addExtraResult(TypeRef T) { addResult(T); }\n";
+  }
 
   if (!enum_.empty()) {
     os << "  const char *getModeStr() const { return getModeStr(mode_); }\n"
@@ -668,12 +592,142 @@ void NodeBuilder::emitCppMethods(std::ostream &os) const {
   }
 }
 
+bool NodeBuilder::hasCtorTypeParams(llvm::StringRef res) const {
+  for (const std::string &s : ctorTypeParams_) {
+    if (s == res) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void NodeBuilder::emitImportMethods(std::ostream &os) const {
+  os << "if (typeName == \"Glow_" << name_ << "\") {\n";
+
+  // Load all the inputs.
+  for (size_t i = 0, e = nodeInputs_.size(); i < e; i++) {
+    auto &op = nodeInputs_[i];
+    os << "  NodeValue " << op << ";\n";
+    os << "  ASSIGN_VALUE_OR_RETURN_ERR(" << op
+       << ", getNodeValueByName(op.input(" << i << ")));\n\n";
+  }
+
+  // Load all the output types.
+  for (size_t i = 0, e = nodeOutputs_.size(); i < e; i++) {
+    auto &op = nodeOutputs_[i];
+    if (hasCtorTypeParams(op.second)) {
+      os << "  TypeRef " << op.second << "OutTy;\n";
+      os << "  ASSIGN_VALUE_OR_RETURN_ERR(" << op.second
+         << "OutTy, loadTypeFromAttributes(" << std::to_string(i)
+         << ", dict));\n\n";
+    }
+  }
+
+  // Load the members.
+  for (const auto &op : members_) {
+    auto ty = getCtorArgTypename(&op.first);
+    os << "  " << ty << " " << op.second << ";\n";
+    os << "  ASSIGN_VALUE_OR_RETURN_ERR(" << op.second;
+    os << ", loadAttribute<" << ty << ">(dict.at(\"" << op.second
+       << "\"), *this));\n\n";
+  }
+
+  // We have all items needed to construct the node, so do so.
+  const auto nodeName = name_ + "Node";
+  os << "  " << nodeName << " *loadedNode = G_->addNode(new " << nodeName
+     << "(opName";
+  for (const auto &op : nodeOutputs_) {
+    if (hasCtorTypeParams(op.second)) {
+      os << ", " << op.second << "OutTy";
+    }
+  }
+  for (size_t i = 0, e = nodeInputs_.size(); i < e; i++) {
+    auto &op = nodeInputs_[i];
+    os << ", " << op;
+  }
+  for (const auto &op : members_) {
+    os << ", " << op.second;
+  }
+  os << "));\n\n";
+
+  // Now load a predicate if one exists.
+  os << "  if (dict.count(\"Predicate\")) {\n";
+  os << "    NodeValue Predicate;\n";
+  os << "    ASSIGN_VALUE_OR_RETURN_ERR(Predicate, "
+        "loadAttribute<NodeValue>(dict.at(\"Predicate\"), *this));\n";
+  os << "    loadedNode->setPredicate(Predicate);\n";
+  os << "  }\n\n";
+
+  // Add the node to the Function and return it.
+  os << "  RETURN_IF_ERR(addNodeAsOutput(op, loadedNode));\n";
+  os << "  return loadedNode;\n";
+  os << "}\n\n";
+}
+
+void NodeBuilder::emitExportMethods(std::ostream &os) const {
+  os << "case glow::Kinded::Kind::" << name_ << "NodeKind: {\n";
+  os << "  auto *N__ = llvm::cast<" << name_ << "Node>(node);\n";
+
+  // Add the node. Note that Glow custom ops are prefixed with "Glow_"
+  os << "  auto *opProto = graph.add_node();\n";
+  os << "  opProto->set_op_type(\"Glow_" << name_ << "\");\n";
+  os << "  opProto->set_name(N__->getName());\n";
+
+  // Add all of the node's inputs.
+  for (const auto &op : nodeInputs_) {
+    os << "  opProto->add_input(N__->get" << op
+       << "().generateNodeOutputName(/* stripResNoFor0thInput */ true));\n";
+    // Note: Add each input's type attributes so that other tools have easy
+    // visibility into types. This info may go ignored by the importer.
+    os << "  addTypeAttributes(opProto, N__, " << name_ << "Node::" << op
+       << "Idx, /* isInput */ true);\n";
+  }
+
+  // Add all of the node's outputs.
+  for (const auto &op : nodeOutputs_) {
+    os << "  opProto->add_output(N__->get" << op.second
+       << "().generateNodeOutputName(/* stripResNoFor0thInput */ true));\n";
+    // Note: export the type attributes even if not needed by the importer, so
+    // that other tools have easy visibility into types. This info may go
+    // ignored by the importer.
+    os << "  addTypeAttributes(opProto, N__, " << name_ << "Node::" << op.second
+       << "Idx, /* isInput */ false);\n";
+  }
+
+  // Add any members the node has.
+  for (const auto &op : members_) {
+    os << "  addValueAttribute(opProto, \"" << op.second << "\", N__->get"
+       << op.second << "());\n";
+
+    // If the member is a VectorNodeValue then also add the types of the NVs.
+    if (op.first.type == MemberType::VectorNodeValue) {
+      os << "  for (unsigned i = 0, e = N__->get" << op.second
+         << "().size(); i < e; i++) {\n";
+      os << "    addTypeAttributes(opProto, N__->get" << op.second
+         << "()[i], i, /* isInput */ true, \"" << op.second << "_\");\n";
+      os << "  }\n";
+    }
+  }
+
+  // Check if the node has a predicate and add it if so.
+  os << "  if (N__->hasPredicate()) {\n";
+  os << "    addValueAttribute(opProto, \"Predicate\",  "
+        "N__->getPredicate().generateNodeOutputName(/* stripResNoFor0thInput "
+        "*/ true));\n";
+  os << "  }\n";
+
+  os << "  break;\n";
+  os << "}\n\n";
+}
+
 NodeBuilder &NodeBuilder::addGradient() {
-  NodeBuilder GN(hStream, cStream, dStream, name_ + "Grad", isBackendSpecific_);
+  NodeBuilder GN(hStream, cStream, dStream, iStream, eStream, name_ + "Grad",
+                 isBackendSpecific_);
 
   // The new 'Grad' class will have all of the fields of the current class.
   GN.members_ = members_;
   GN.enum_ = enum_;
+  GN.isDataParallel_ = isDataParallel_;
 
   // Add the inputs that we'll use in the grad instruction.
   for (const std::string &in : nodeInputs_) {
@@ -696,7 +750,7 @@ NodeBuilder &NodeBuilder::addGradient() {
   std::stringstream ss;
   ss << "\n" + name_ + "GradNode *" + name_
      << "Node::getGrad(GraphGradMapper &builder) {\n"
-     << "  auto *x = new " + name_ + "GradNode(getName()";
+     << "  auto *x = new " + name_ + "GradNode(getName().str() + \"_grad\"";
 
   if (enum_.size()) {
     ss << ", (" << name_ << "GradNode::Mode)getMode()";
@@ -734,4 +788,8 @@ NodeBuilder &NodeBuilder::addGradient() {
 NodeBuilder::~NodeBuilder() {
   emitNodeClass(hStream);
   emitCppMethods(cStream);
+  if (!skipAutogenSerialization_) {
+    emitImportMethods(iStream);
+    emitExportMethods(eStream);
+  }
 }

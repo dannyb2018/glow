@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,23 +19,29 @@
 #include <iostream>
 
 int main(int argc, char **argv) {
-  if (argc != 4) {
-    std::cerr << "Usage: " << argv[0] << " output.h output.cpp output.def\n";
+  if (argc != 6) {
+    std::cerr << "Usage: " << argv[0]
+              << " output.h output.cpp output.def import.h export.h\n";
     return -1;
   }
 
   std::cout << "Writing node descriptors to:\n\t" << argv[1] << "\n\t"
-            << argv[2] << "\n\t" << argv[3] << "\n";
+            << argv[2] << "\n\t" << argv[3] << "\n\t" << argv[4] << "\n\t"
+            << argv[5] << "\n";
 
   std::ofstream hFile(argv[1]);
   std::ofstream cFile(argv[2]);
   std::ofstream dFile(argv[3]);
+  std::ofstream iFile(argv[4]);
+  std::ofstream eFile(argv[5]);
 
-  Builder BB(hFile, cFile, dFile);
+  Builder BB(hFile, cFile, dFile, iFile, eFile);
 
   //===--------------------------------------------------------------------===//
   //                    Input/Output nodes
   //===--------------------------------------------------------------------===//
+
+  BB.includeHeader("glow/Graph/Nodes.h");
 
   BB.declareNode("Storage");
   BB.declareNode("Constant");
@@ -49,6 +55,8 @@ int main(int argc, char **argv) {
                       "llvm::cast<Placeholder>(Output_.getNode()); };")
       .addOverwrittenInput("Output")
       .setHasSideEffects(true)
+      .dataParallel()
+      .skipAutogenSerialization()
       .setDocstring("Specifies a node whose Input will be copied to Output."
                     "This node prevents graph optimizations from eliminating "
                     "this node and all of its ancestor nodes. Generally "
@@ -82,11 +90,16 @@ int main(int argc, char **argv) {
       .addMember(MemberType::VectorUnsigned, "Pads")
       .addMember(MemberType::Unsigned, "Group")
       .addMember(MemberType::Unsigned, "Dilation")
+      .addMember(MEMBER_TYPE_INFO(glow::ConvolutionLayout), "Layout")
+      .addFusedActivation()
       .addResultFromCtorArg()
       .addGradient()
-      .setDocstring("Performs 2D Convolution using a given Input, Filter, and "
-                    "Bias tensors, as well as provided Kernels, Strides, Pads, "
-                    "Group and Dilation.");
+      .setDocstring(
+          "Performs 2D Convolution using a given Input, Filter, and "
+          "Bias tensors, as well as provided Kernels, Strides, Pads, "
+          "Group and Dilation. Supported Layouts are defined in the "
+          "ConvolutionLayout enum: NHWC and NCHW. Supported FusedActivations "
+          "are defined in the FusedActivation enum.");
 
   BB.newNode("ChannelwiseQuantizedConvolution")
       .addInput("Input")
@@ -98,13 +111,25 @@ int main(int argc, char **argv) {
       .addMember(MemberType::VectorUnsigned, "Strides")
       .addMember(MemberType::VectorUnsigned, "Pads")
       .addMember(MemberType::Unsigned, "Group")
-      .addMember(MemberType::Boolean, "Groupwise")
       .addResultFromCtorArg()
       .setDocstring("Performs 2D Convolution using a given Input, Filter, and "
                     "Bias tensors, as well as provided Kernels, Strides, Pads, "
                     "and Group. Quantization parameters are provided by Scales "
-                    "and Offsets. If Groupwise is true then the quantization "
-                    "is per-group otherwise it is per-channel.");
+                    "and Offsets.");
+
+  BB.newNode("ConvTranspose")
+      .addInput("Input")
+      .addInput("Filter")
+      .addInput("Bias")
+      .addMember(MemberType::VectorUnsigned, "Kernels")
+      .addMember(MemberType::VectorUnsigned, "Strides")
+      .addMember(MemberType::VectorUnsigned, "Pads")
+      .addMember(MemberType::Unsigned, "Group")
+      .addMember(MemberType::Unsigned, "Dilation")
+      .addResultFromCtorArg()
+      .setDocstring("Performs 2D Transposed Convolution using a given Input,"
+                    "Filter, and Bias tensors, as well as provided Kernels,"
+                    "Strides, Pads, and Group.");
 
   BB.newNode("Convolution3D")
       .addInput("Input")
@@ -125,20 +150,43 @@ int main(int argc, char **argv) {
       .addMember(MemberType::VectorUnsigned, "Kernels")
       .addMember(MemberType::VectorUnsigned, "Strides")
       .addMember(MemberType::VectorUnsigned, "Pads")
-      .addResultFromCtorArg()
+      .addMember(MemberType::Enum, "Layout")
+      .addResultFromCtorArg("Result")
+      .addResultFromCtorArg("Argmax")
       .addGradient()
-      .setDocstring("Performs a Max Pool operation on the Input given provided "
-                    "Kernels, Strides, and Pads.");
+      .setDocstring(
+          "Performs a Max Pool with Argmax operation on the Input "
+          "given provided Kernels, Strides, and Pads. Argmax is a flattened "
+          "index corresponding to respective max element. Supported layouts "
+          "are defined in the ConvolutionLayout enum: NHWC and NCHW.");
+
+  BB.newNode("ArgMax")
+      .addInput("Input")
+      .addMember(MemberType::Unsigned, "Axis")
+      .addMember(MemberType::Boolean, "KeepDims")
+      .addResultFromCtorArg("Argmax")
+      .setDocstring("Finds index of a maximum element along Axis."
+                    "If KeepDims is not true, the axis is removed from output");
 
   BB.newNode("AvgPool")
       .addInput("Input")
       .addMember(MemberType::VectorUnsigned, "Kernels")
       .addMember(MemberType::VectorUnsigned, "Strides")
       .addMember(MemberType::VectorUnsigned, "Pads")
+      .addMember(MemberType::Enum, "Layout")
       .addResultFromCtorArg()
       .addGradient()
-      .setDocstring("Performs an Average Pool operation on the Input given "
-                    "provided Kernels, Strides, and Pads.");
+      .setDocstring(
+          "Performs an Average Pool operation on the Input given "
+          "provided Kernels, Strides, and Pads. Supported layouts are defined "
+          "in the ConvolutionLayout enum: NHWC and NCHW.");
+
+  BB.newNode("AdaptiveAvgPool")
+      .addInput("Input")
+      .addResultFromCtorArg()
+      .addGradient()
+      .setDocstring(
+          "Performs an Adaptive Average Pool operation on the Input given");
 
   BB.newNode("FullyConnected")
       .addInput("Input")
@@ -207,6 +255,36 @@ int main(int argc, char **argv) {
                     "with the provided Scale, Bias, Mean, Var, ChannelIdx, "
                     "Epsilon, and Momentum. Similar to Caffe2 and ONNX LRN.");
 
+  BB.newNode("LayerNormalization")
+      .addInput("Input")
+      .addInput("Scale")
+      .addInput("Bias")
+      .addMember(MemberType::Float, "Epsilon")
+      .addResult("Input.getType()")
+      .setDocstring("Performs layer normalization on the Input tensor with the "
+                    "provided Scale, Bias, and Epsilon. Layer sizes are "
+                    "determined by the dimensions of Scale and Bias. Similar "
+                    "to PyTorch layer_norm.");
+
+  BB.newNode("BatchBoxCox")
+      .addInput("Input")
+      .addInput("Lambda1")
+      .addInput("Lambda2")
+      .addMember(MemberType::Float, "Epsilon")
+      .addResult("Input.getType()")
+      .setDocstring("Apply box-cox transform for each column for each column "
+                    "in NxD input tensor");
+
+  //===--------------------------------------------------------------------===//
+  //                     Bucketing
+  //===--------------------------------------------------------------------===//
+
+  BB.newNode("Bucketize")
+      .addInput("Input")
+      .addMember(MemberType::VectorFloat, "Boundaries")
+      .addResultFromCtorArg()
+      .setDocstring("Performs bucketization on the input given Boundaries");
+
   //===--------------------------------------------------------------------===//
   //                      Loss operations
   //===--------------------------------------------------------------------===//
@@ -247,6 +325,7 @@ int main(int argc, char **argv) {
       .addInput("LHS")
       .addInput("RHS")
       .addResultFromCtorArg()
+      .dataParallel()
       .addGradient()
       .setDocstring("Performs Add on the LHS and RHS operands.");
 
@@ -254,6 +333,7 @@ int main(int argc, char **argv) {
       .addInput("LHS")
       .addInput("RHS")
       .addResultFromCtorArg()
+      .dataParallel()
       .addGradient()
       .setDocstring("Performs Mul on the LHS and RHS operands.");
 
@@ -261,6 +341,7 @@ int main(int argc, char **argv) {
       .addInput("LHS")
       .addInput("RHS")
       .addResultFromCtorArg()
+      .dataParallel()
       .addGradient()
       .setDocstring("Performs Sub on the LHS and RHS operands.");
 
@@ -268,6 +349,7 @@ int main(int argc, char **argv) {
       .addInput("LHS")
       .addInput("RHS")
       .addResultFromCtorArg()
+      .dataParallel()
       .addGradient()
       .setDocstring("Performs Div on the LHS and RHS operands.");
 
@@ -275,18 +357,29 @@ int main(int argc, char **argv) {
       .addInput("LHS")
       .addInput("RHS")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Performs Max on the LHS and RHS operands.");
 
   BB.newNode("Min")
       .addInput("LHS")
       .addInput("RHS")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Performs Min on the LHS and RHS operands.");
+
+  BB.newNode("Clip")
+      .addInput("Input")
+      .addMember(MemberType::Float, "Min")
+      .addMember(MemberType::Float, "Max")
+      .addResultFromCtorArg()
+      .dataParallel()
+      .setDocstring("Clip range of inputs to lie in [Min, Max].");
 
   BB.newNode("CmpLTE")
       .addInput("LHS")
       .addInput("RHS")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Performs CmpLTE on the LHS and RHS operands. Generates a "
                     "mask that's consumed by the select instruction. The "
                     "format of the result is target- and type-specific.");
@@ -295,20 +388,39 @@ int main(int argc, char **argv) {
       .addInput("LHS")
       .addInput("RHS")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Performs an element-wise equal comparison on the LHS and "
                     "RHS operands. Inputs must be integer.");
+
+  BB.newNode("CmpLT")
+      .addInput("LHS")
+      .addInput("RHS")
+      .addResultFromCtorArg()
+      .dataParallel()
+      .setDocstring(
+          "Compares X and Y element wise sets Dest[i] true if LHS[i] < "
+          "RHS[i] otherwise false. Final result is a mask consumed by "
+          "Select, ONNX Where, operator.");
 
   BB.newNode("Pow")
       .addInput("LHS")
       .addInput("RHS")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Performs elementwise pow(LHS, RHS).");
 
   // clang-format off
   BB.newNode("Log")
       .addInput("Input")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Performs element-wise natural log to the Input.");
+
+  BB.newNode("Exp")
+      .addInput("Input")
+      .addResultFromCtorArg()
+      .dataParallel()
+      .setDocstring("Performs element-wise exponential to the Input.");
   // clang-format on
 
   BB.newNode("Select")
@@ -316,6 +428,7 @@ int main(int argc, char **argv) {
       .addInput("LHS")
       .addInput("RHS")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Selects between values on the LHS or RHS, depending on "
                     "the value of Cond. Cond is generated by the compare "
                     "instruction, and is target- and type-specific.");
@@ -357,12 +470,32 @@ int main(int argc, char **argv) {
       .setDocstring("Performs Average Mean operation on the Input given "
                     "Axes.");
 
+  BB.newNode("BatchedReduceMin")
+      .addInput("Batch")
+      .addMember(MemberType::VectorUnsigned, "Axes")
+      .addResultFromCtorArg()
+      .setDocstring("Performs Reduce Min operation on the Input given "
+                    "Axes.");
+
   BB.newNode("ChannelShuffle")
       .addInput("Input")
       .addMember(MemberType::Unsigned, "Group")
       .addMember(MemberType::Unsigned, "Kernel")
       .addResultFromCtorArg()
       .setDocstring("Performs Channel shuffle.");
+
+  BB.newNode("CumSum")
+      .addInput("Input")
+      .addMember(MemberType::Unsigned, "Exclusive")
+      .addMember(MemberType::Unsigned, "Reverse")
+      .addResultFromCtorArg()
+      .dataParallel()
+      .setDocstring("Performs a Cumulative Sum operation over a 1D vector with "
+                    "flags for working in exclusive mode and in reverse. In "
+                    "each case the output size is the same as in input size."
+                    "e.g (default) [1, 2, 3, 4] -> [1, 3, 6, 10]. "
+                    "(exclusive) [1, 2, 3, 4] -> [0, 1, 3, 6]. "
+                    "(reverse) [1, 2, 3, 4] -> [10, 9, 7, 4]. ");
 
   BB.newNode("LengthsSum")
       .addInput("Data")
@@ -374,11 +507,28 @@ int main(int argc, char **argv) {
                     "Lengths[1] slices are added together and stored in "
                     "Result[1], etc.");
 
+  BB.newNode("SparseLengthsSum")
+      .addInput("Data")
+      .addInput("Indices")
+      .addInput("Lengths")
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
+      .addResultFromCtorArg()
+      .addGradient()
+      .setDocstring("Gathers slices of the outer-most dimension of Data "
+                    "indexed by Indices vector, and then accumulates them into "
+                    "len(Lengths) entries: first Lengths[0] slices are "
+                    "aggregated to Result[0], next Lengths[1] slices are "
+                    "aggregated to Result[1], etc. I.e. sum(Lengths) must be "
+                    "equal to len(Indices).");
+
   BB.newNode("SparseLengthsWeightedSum")
       .addInput("Data")
       .addInput("Weights")
       .addInput("Indices")
       .addInput("Lengths")
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
       .addResultFromCtorArg()
       .addGradient()
       .setDocstring("Gathers slices of the outer-most dimension of Data "
@@ -391,6 +541,40 @@ int main(int argc, char **argv) {
                     "Weights[0] * Slice(0) + Weights[1] * Slice(1) + ... "
                     "It implies that len(Weights) == len(Indices).");
 
+  BB.newNode("EmbeddingBag")
+      .addInput("Data")
+      .addInput("Weights")
+      .addInput("Indices")
+      .addInput("Offsets")
+      .addMember(MemberType::Boolean, "HasEndOffset")
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
+      .addResultFromCtorArg()
+      .setDocstring(
+          "Gathers slices of the outer-most dimension of Data "
+          "indexed by Indices vector, and then accumulates them into "
+          "len(Offsets) entries: first slice between Offsets[0] and Offsets[1] "
+          "(or total length if there's only one elem in Offsets) are "
+          "aggregated to Result[0], etc. I.e. largest offset must be "
+          "less than or equal to len(Indices). Before doing aggregation, each "
+          "individual slice is scaled by its weight: Result[0] = "
+          "Weights[0] * Slice(0) + Weights[1] * Slice(1) + ... "
+          "It implies that len(Weights) == len(Indices).");
+
+  BB.newNode("EmbeddingBagByteRowwiseOffsets")
+      .addInput("Data")
+      .addInput("Weights")
+      .addInput("Indices")
+      .addInput("Offsets")
+      .addMember(MemberType::Boolean, "UseFP16Accumulation",
+                 /* addSetter */ true)
+      .addMember(MemberType::Boolean, "HasEndOffset")
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
+      .addResultFromCtorArg()
+      .setDocstring("Same as FusedRowwiseQuantizedSparseLengthsWeightedSum but "
+                    "using offsets instead of lengths.");
+
   BB.newNode("RowwiseQuantizedSparseLengthsWeightedSum")
       .addInput("Data")
       .addInput("Scales")
@@ -398,6 +582,10 @@ int main(int argc, char **argv) {
       .addInput("Weights")
       .addInput("Indices")
       .addInput("Lengths")
+      .addMember(MemberType::Boolean, "UseFP16Accumulation",
+                 /* addSetter */ true)
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
       .addResultFromCtorArg()
       .setDocstring("Gathers slices of the outer-most dimension of Data "
                     "indexed by Indices vector, and then accumulates them into "
@@ -416,6 +604,10 @@ int main(int argc, char **argv) {
       .addInput("Weights")
       .addInput("Indices")
       .addInput("Lengths")
+      .addMember(MemberType::Boolean, "UseFP16Accumulation",
+                 /* addSetter */ true)
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
       .addResultFromCtorArg()
       .setDocstring("Gathers slices of the outer-most dimension of Data "
                     "indexed by Indices vector, and then accumulates them into "
@@ -426,6 +618,25 @@ int main(int argc, char **argv) {
                     "individual slice is scaled by its weight: Result[0] = "
                     "Weights[0] * Slice(0) + Weights[1] * Slice(1) + ... "
                     "It implies that len(Weights) == len(Indices). The input "
+                    "data is fused rowwise-quantized, where the Scales and "
+                    "Offsets are appended to the end of each row. Thus, Data "
+                    "must be a two-dimensional tensor.");
+
+  BB.newNode("FusedRowwiseQuantizedSparseLengthsSum")
+      .addInput("Data")
+      .addInput("Indices")
+      .addInput("Lengths")
+      .addMember(MemberType::Boolean, "UseFP16Accumulation",
+                 /* addSetter */ true)
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
+      .addResultFromCtorArg()
+      .setDocstring("Gathers slices of the outer-most dimension of Data "
+                    "indexed by Indices vector, and then accumulates them into "
+                    "len(Lengths) entries: first Lengths[0] slices are "
+                    "aggregated to Result[0], next Lengths[1] slices are "
+                    "aggregated to Result[1], etc. I.e. sum(Lengths) must be "
+                    "equal to len(Indices). The input "
                     "data is fused rowwise-quantized, where the Scales and "
                     "Offsets are appended to the end of each row. Thus, Data "
                     "must be a two-dimensional tensor.");
@@ -462,7 +673,7 @@ int main(int argc, char **argv) {
       .addInput("Values")
       .addInput("DefaultValue")
       .addInput("Lengths")
-      .addMember(MemberType::VectorInt64, "Mask")
+      .addMember(MemberType::VectorDimT, "Mask")
       .addResultFromCtorArg()
       .setDocstring(
           "Converts the sparse representation specified by the pair "
@@ -477,6 +688,7 @@ int main(int argc, char **argv) {
   BB.newNode("IsNaN")
     .addInput("Input")
     .addResultFromCtorArg()
+    .dataParallel()
     .setDocstring("Determines whether each element of the Input is NaN and "
                   "generates a mask that can be consumed by a Select node.");
   // clang-format on
@@ -492,9 +704,23 @@ int main(int argc, char **argv) {
       .addMember(MemberType::Int64, "Divisor")
       .addMember(MemberType::Boolean, "SignFollowDivisor")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Performs elementwise modulo operation on the input where "
                     "each element in the output is the corresponding element "
                     "in the input data modulo Divisor.");
+
+  BB.newNode("BatchedPairwiseDotProduct")
+      .addMember(MemberType::VectorNodeValue, "Inputs")
+      .addResultFromCtorArg()
+      .setDocstring(
+          "Performs batched pairwise dot products of the input vectors");
+
+  BB.newNode("BatchedPairwiseDotProductGrad")
+      .addInput("OutputGrad")
+      .hasExtraResults()
+      .addMember(MemberType::VectorNodeValue, "OriginalInputs")
+      .setDocstring(
+          "Performs the gradient operation for BatchedPairwiseDotProduct");
 
   //===--------------------------------------------------------------------===//
   //                Non-linearities
@@ -503,6 +729,7 @@ int main(int argc, char **argv) {
   BB.newNode("Relu")
       .addInput("Input")
       .addResultFromCtorArg()
+      .dataParallel()
       .addGradient()
       .setDocstring(
           "Applies ReLU, max(0, x), to each element in the Input tensor.");
@@ -511,12 +738,14 @@ int main(int argc, char **argv) {
       .addInput("Input")
       .addInput("Slope")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Applies PReLU, slope * min(0, x) + max(0, x), to each "
                     "element in the Input tensor.");
 
   BB.newNode("Sigmoid")
       .addInput("Input")
       .addResultFromCtorArg()
+      .dataParallel()
       .addGradient()
       .setDocstring("Applies Sigmoid, 1 / (1 + exp(-x)), to each element in "
                     "the Input tensor.");
@@ -524,6 +753,7 @@ int main(int argc, char **argv) {
   BB.newNode("Tanh")
       .addInput("Input")
       .addResultFromCtorArg()
+      .dataParallel()
       .addGradient()
       .setDocstring("Applies hyperbolic tangent to each element in the Input "
                     "tensor.");
@@ -534,13 +764,15 @@ int main(int argc, char **argv) {
 
   BB.newNode("Reshape")
       .addInput("Input")
-      .addMember(MemberType::VectorSizeT, "Dims")
+      .addMember(MemberType::VectorDimT, "Dims")
+      .addMember(MemberType::String, "Layout")
       .addResultFromCtorArg()
       .setDocstring("Reshape the Input tensor to shape Dims.");
 
   BB.newNode("Transpose")
       .addInput("Input")
       .addMember(MemberType::VectorUnsigned, "Shuffle")
+      .addMember(MemberType::String, "Layout")
       .addResultFromCtorArg()
       .setDocstring("Transpose the Input tensor based on the vector Shuffle, "
                     "which assigns a new axis for each dimension in Input.");
@@ -555,7 +787,7 @@ int main(int argc, char **argv) {
 
   BB.newNode("Slice")
       .addInput("Input")
-      .addMember(MemberType::VectorSizeT, "Start")
+      .addMember(MemberType::VectorDimT, "Start")
       .addResultFromCtorArg()
       .setDocstring("Produces a slice of the Input tensor. The Start vector "
                     "defines the starting indices for each dimension from "
@@ -565,7 +797,7 @@ int main(int argc, char **argv) {
   BB.newNode("InsertTensor")
       .addInput("Big")
       .addInput("Small")
-      .addMember(MemberType::VectorSizeT, "Start")
+      .addMember(MemberType::VectorDimT, "Start")
       .addMember(MemberType::Unsigned, "Count")
       .addMember(MemberType::Unsigned, "Axis")
       .addResult("Big.getType()")
@@ -601,15 +833,24 @@ int main(int argc, char **argv) {
                     "lengths of the ranges gathered by each list of pairs in "
                     "Ranges.");
 
-  BB.newNode("ScatterAssign")
+  BB.newNode("ScatterData")
       .addInput("Data")
       .addInput("Indices")
       .addInput("Slices")
+      .addMember(MemberType::Boolean, "Cumulative")
       .addResult("Data.getType()")
-      .setDocstring("Copies each slice from Slices into Data at the "
-                    "corresponding index in Indices. For example, given input "
-                    "Data {{1,2},{3,4},{5,6}}, Slices {{-3,-4}}, and Indices "
-                    "{1}, the result is {{1,2},{-3,-4},{5,6}}.");
+      .setDocstring(
+          "Copies each slice from Slices into Data at the "
+          "corresponding index in Indices. For example, given input "
+          "Data {{1,2},{3,4},{5,6}}, Slices {{-3,-4}}, and Indices "
+          "{{1}}, the result is {{1,2},{-3,-4},{5,6}}. It also supports "
+          "multi-dimensional indices. For example, given input Data "
+          "{{1,2},{3,4},{5,6}}, Slices {-3,-4}, and Indices {{1,0},{1,1}} also "
+          "produces {{1,2},{-3,-4},{5,6}}. If Cumulative is true, the node "
+          "adds values from Slices to Data instead of copying. For example, "
+          "given input Data {{1,2},{3,4},{5,6}}, Slices {{-3,-4}}, and Indices "
+          "{1}, the result is {{1,2},{0,0},{5,6}}. If an index is specified "
+          "several times, its updates will be added several times as well.");
 
   BB.newNode("Tile")
       .addInput("Input")
@@ -637,6 +878,30 @@ int main(int argc, char **argv) {
                     "the width. This produces Output tensor of [N, "
                     "H/BlockSize, W/BlockSize, C * "
                     "BlockSize * BlockSize].");
+
+  BB.newNode("ResizeNearest")
+      .addInput("Input")
+      .addMember(MemberType::VectorFloat, "Scale")
+      .addResultFromCtorArg()
+      .setDocstring(
+          "Given Input tensor of [N,H,W,C], where N is the batch, C is the "
+          "channel or depth, H is the height and W is the width, Generates an "
+          "Output tensor with resized spatial dimensions using nearest "
+          "neighbor interpolation. The Output tensor is of shape "
+          "floor(input_dimension * scale)");
+
+  //===--------------------------------------------------------------------===//
+  //                Reorder transformations
+  //===--------------------------------------------------------------------===//
+
+  BB.newNode("Flip")
+      .addInput("Input")
+      .addMember(MemberType::Unsigned, "Axis")
+      .addResultFromCtorArg()
+      .setDocstring(
+          "Reverse the order of elements in a tensor along the given axis. The "
+          "shape of the tensor is preserved, but the elements are reordered. "
+          "The node is inspired from Python numpy.");
 
   //===--------------------------------------------------------------------===//
   //                Nodes used for network training
@@ -713,12 +978,14 @@ int main(int argc, char **argv) {
       .addInput("Input")
       .addInput("Mapping")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Simple mapping between quantized numbers."
                     "This can be used as quantized sigmoid or tanh functions.");
 
   BB.newNode("Quantize")
       .addInput("Input")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Quantize floating point tensor. This operation converts "
                     "floating point numbers to integers based on the given "
                     "Scale and Offset. Scale and Offset are deduced from the "
@@ -728,12 +995,14 @@ int main(int argc, char **argv) {
   BB.newNode("Dequantize")
       .addInput("Input")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Convert quantized input tensor into the float "
                     "representation. x = Scale * (x_q - Offset).");
 
   BB.newNode("RescaleQuantized")
       .addInput("Input")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring("Rescale the input quantized tensor to a new Scale and "
                     "Offset. The new Scale and Offset are specified by the "
                     "output type passed to the constructor");
@@ -759,6 +1028,7 @@ int main(int argc, char **argv) {
   BB.newNode("ConvertTo")
       .addInput("Input")
       .addResultFromCtorArg()
+      .dataParallel()
       .setDocstring(
           "Convert the input from its current type to the destination "
           "type. The input and output types must have the same shapes. "
@@ -767,17 +1037,68 @@ int main(int argc, char **argv) {
           "and Rescale nodes.");
 
   //===--------------------------------------------------------------------===//
+  //                Pre Processing
+  //===--------------------------------------------------------------------===//
+
+  BB.newNode("AudioSpectrogram")
+      .addInput("Input")
+      .addInput("Window")
+      .addInput("TwiddleFactors")
+      .addInput("BitReverseIndices")
+      .addInput("ComplexToRealWeights")
+      .addMember(MemberType::Unsigned, "WindowSize")
+      .addMember(MemberType::Unsigned, "WindowStride")
+      .addMember(MemberType::Boolean, "MagnitudeSquared")
+      .addResultFromCtorArg("Spectrogram")
+      .setDocstring("Computes the spectrogram of a mono audio signal using "
+                    "given window size and stride. The FFT length used to "
+                    "compute the spectrogram is the next power of 2 (for a "
+                    "window size of 640 the FFT length is 1024). The length "
+                    "of each spectrogram window is FFT_length / 2 + 1. "
+                    "This node is inspired from TensorFlow.");
+
+  BB.newNode("MFCC")
+      .addInput("Spectrogram")
+      .addInput("MelWeights")
+      .addInput("MelRanges")
+      .addInput("DctMat")
+      .addMember(MemberType::Float, "SampleRate")
+      .addMember(MemberType::Float, "LowerFrequency")
+      .addMember(MemberType::Float, "UpperFrequency")
+      .addMember(MemberType::Unsigned, "FilterBankCount")
+      .addMember(MemberType::Unsigned, "NumCoefficients")
+      .addResultFromCtorArg("Coefficients")
+      .setDocstring("Computes the MFCC (Mel Frequency Cepstral Coefficient) "
+                    "for the given spectrogram. This node is mostly used as "
+                    "feature extractor for voice/speech audio data in "
+                    "voice command or keyword spotting applications. The input "
+                    "is assumed to be a power spectrogram and not a magnitude."
+                    "This node is inspired from TensorFlow.");
+
+  //===--------------------------------------------------------------------===//
+  //                Post Processing
+  //===--------------------------------------------------------------------===//
+
+  BB.newNode("NonMaxSuppression")
+      .addInput("Boxes")
+      .addInput("Scores")
+      .addMember(MemberType::Unsigned, "CenterPointBox")
+      .addMember(MemberType::Unsigned, "MaxOutputBoxesPerClass")
+      .addMember(MemberType::Float, "IouThreshold")
+      .addMember(MemberType::Float, "ScoreThreshold")
+      .addMember(MemberType::Boolean, "IsTFVersion4")
+      .addResultFromCtorArg("Indices")
+      .addResultFromCtorArg("NumberOfSelectedIndices")
+      .setDocstring("This is a mix of ONNX and TF NMSv4. It supports multiple "
+                    "classes and does per class NMS. It also supports TF NMS "
+                    "V4 by outputting indices and scalar tensor with number of "
+                    "valid indices. It pads the rest with global MIN box.");
+
+  //===--------------------------------------------------------------------===//
   //                Backend-Specific Nodes
   //===--------------------------------------------------------------------===//
 
-#include "Backends/CPU/CPUSpecificNodes.h"
-#include "Backends/OpenCL/OpenCLSpecificNodes.h"
-#include "Backends/Habana/HabanaSpecificNodes.h"
-  // Add here external backend specific node headers.
-  // Example:
-  // #ifdef GLOW_WITH_<NAME>
-  // #include "<Name>/ClassGen/<Name>SpecificNodes.h"
-  // #endif
+#include "glow/NodeGenIncludes.h"
 
   return 0;
 }

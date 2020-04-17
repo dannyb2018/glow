@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -68,7 +68,7 @@ class InstrBuilder {
   /// The instruction operands.
   std::vector<std::pair<std::string, OperandKind>> operands_;
   /// A list of instruction members. Format: (type, name).
-  std::vector<std::pair<MemberType, std::string>> members_;
+  std::vector<std::pair<MemberTypeInfo, std::string>> members_;
   /// Stores the decl and body of a new public method that will be added to the
   /// class.
   std::vector<std::pair<std::string, std::string>> extraMethods_;
@@ -128,8 +128,26 @@ public:
   /// Add a member to the instruction. Format: type, name.
   /// The name should start with a capital letter.
   /// For example: "Filter".
-  InstrBuilder &addMember(const MemberType type, const std::string &name) {
-    members_.push_back({type, name});
+  InstrBuilder &addMember(const MemberType type, const std::string &name);
+
+  /// Add a member to the node. Format type, name.
+  /// The name should start with a capital letter.
+  /// For example: "Filter".
+  /// If MemberTypeInfo refers to an external user-defined type, this type T
+  /// should satisfy the following requirements:
+  ///   * There should be a hash function with a signature like `llvm::hash_code
+  ///   hash_value(const T)` which takes T by value, by reference or as a
+  ///   pointer, depending on the intended use.
+  ///   * There should be a stream output operator with a signature like
+  ///   `llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const T);`, which
+  ///   takes T by value, by reference or as a pointer, depending on the
+  ///   intended use.
+  ///   * There should be a comparison operator `bool operator==(const T LHS,
+  ///   const T RHS)` (or a custom comparator function mentioned in
+  ///   MemberTypeInfo::cmpFn), which takes T by reference or by value depending
+  ///   on the intended use.
+  InstrBuilder &addMember(MemberTypeInfo typeInfo, const std::string &name) {
+    members_.push_back({typeInfo, name});
     return *this;
   }
 
@@ -212,6 +230,9 @@ private:
   /// Emits the method that calculates the inplace property.
   void emitInplaceMethod(std::ostream &os) const;
 
+  /// Emits the property that returns true if the instruction is canonical.
+  void emitCanonicalProperty(std::ostream &os) const;
+
   /// Emits the property that returns true if the instruction is data parallel.
   void emitDataParallelProperty(std::ostream &os) const;
 
@@ -223,7 +244,7 @@ private:
                          int index) const;
 
   /// Emit the getter for a accessible class member.
-  void emitMemberGetter(std::ostream &os, MemberType type,
+  void emitMemberGetter(std::ostream &os, const MemberTypeInfo *type,
                         const std::string &name) const;
 
   /// Emit setters/getters for each accessible class member.
@@ -234,6 +255,12 @@ private:
 
   /// Emit the class definition.
   void emitClass(std::ostream &os) const;
+
+  /// Emit the clone() method.
+  void emitCloner(std::ostream &os) const;
+
+  /// Emit the getOperandName() method.
+  void emitGetOperandName(std::ostream &os) const;
 
   /// Emit the methods that go into the CPP file and implement the methods that
   /// were declared in the header file.
@@ -333,6 +360,11 @@ public:
   /// Instrs cpp file.
   void includeBackendSpecificVerification(const std::string &filename) {
     cppStream << "\n#include \"" << filename << "\"\n";
+  }
+
+  /// Include header into the auto-generated Instrs include file.
+  void includeHeader(const std::string &filename) {
+    headerStream << "\n#include \"" << filename << "\"\n";
   }
 };
 

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,13 +18,14 @@
 #include "glow/Graph/PlaceholderBindings.h"
 #include "glow/Support/Compiler.h"
 #include "glow/Support/Memory.h"
+#include "glow/Support/ThreadPool.h"
 
 using namespace glow;
 
 LLVMCompiledFunction::LLVMCompiledFunction(
     std::unique_ptr<llvm::orc::GlowJIT> JIT,
-    const runtime::RuntimeBundle &runtimeBundle)
-    : CompiledFunction(runtimeBundle), JIT_(std::move(JIT)) {}
+    runtime::RuntimeBundle &&runtimeBundle)
+    : CompiledFunction(std::move(runtimeBundle)), JIT_(std::move(JIT)) {}
 
 void LLVMCompiledFunction::collectConstants(const Module *module) {
   runtimeBundle_.collectConstants(module);
@@ -32,6 +33,9 @@ void LLVMCompiledFunction::collectConstants(const Module *module) {
 
 void LLVMCompiledFunction::loadPlaceholders(
     PlaceholderBindings *bindings, uint8_t *baseMutableWeightVarsAddress) {
+  // Make sure our inputs are on the host.
+  bindings->ensureOnHost();
+
   // Copy Placeholders into allocated memory.
   auto &symbolTable = runtimeBundle_.getSymbolTable();
   for (auto PH : bindings->pairs()) {
@@ -39,6 +43,7 @@ void LLVMCompiledFunction::loadPlaceholders(
     if (it == symbolTable.end()) {
       continue;
     }
+    assert(!PH.second->isDeviceResident());
     auto symbolInfo = it->second;
     auto payload = PH.second->getUnsafePtr();
     auto addr = symbolInfo.offset;
@@ -66,14 +71,14 @@ void LLVMCompiledFunction::updatePlaceholders(
   }
 }
 
-llvm::Error LLVMCompiledFunction::execute(ExecutionContext *context) {
+Error LLVMCompiledFunction::execute(ExecutionContext *context) {
   uint8_t *baseActivationsAddress{nullptr};
 
   /// Base address for Mutable weights memory block, Inputs and Outputs.
   uint8_t *baseMutableWeightVarsAddress{nullptr};
 
   {
-    auto ev = context->scopedEvent("allocBuffers");
+    TRACE_EVENT_SCOPE(context, TraceLevel::RUNTIME, "allocBuffers");
     if (runtimeBundle_.getActivationsSize() != 0) {
       baseActivationsAddress = (uint8_t *)alignedAlloc(
           runtimeBundle_.getActivationsSize(), TensorAlignment);
@@ -86,23 +91,39 @@ llvm::Error LLVMCompiledFunction::execute(ExecutionContext *context) {
   }
 
   {
-    auto ev = context->scopedEvent("loadPlaceholders");
+    TRACE_EVENT_SCOPE(context, TraceLevel::RUNTIME, "loadPlaceholders");
     loadPlaceholders(context->getPlaceholderBindings(),
                      baseMutableWeightVarsAddress);
   }
 
   auto *traceContext = context->getTraceContext();
-  TRACE_EVENT_SCOPE_NAMED(traceContext, "findJitmainSymbol", fjEvent);
-  auto sym = JIT_->findSymbol("jitmain");
-  DCHECK(sym) << "Unable to JIT the code!";
+  TRACE_EVENT_SCOPE_NAMED(traceContext, TraceLevel::RUNTIME,
+                          "findJitmainSymbol", fjEvent);
+  Expected<llvm::JITTargetAddress> address = NULL;
+  {
+    std::lock_guard<std::mutex> lock(JITLock_);
+    auto sym = JIT_->findSymbol("jitmain");
+
+    DCHECK(sym) << "Unable to JIT the code!";
+    // We know address is success since we just made it. Mark it as checked.
+    if (address) {
+      auto addrOrLLVMError = sym.getAddress();
+      if (addrOrLLVMError) {
+        address = addrOrLLVMError.get();
+      } else {
+        address = MAKE_ERR(
+            strFormat("Failed to get address: %s",
+                      llvm::toString(addrOrLLVMError.takeError()).data()));
+      }
+    }
+  }
   using JitFuncType =
       void (*)(uint8_t * constantWeightVars, uint8_t * mutableWeightVars,
                uint8_t * activations);
-  auto address = sym.getAddress();
   if (address) {
     JitFuncType funcPtr = reinterpret_cast<JitFuncType>(address.get());
     TRACE_EVENT_SCOPE_END_NAMED(fjEvent);
-    TRACE_EVENT_SCOPE(traceContext, "execute");
+    TRACE_EVENT_SCOPE(traceContext, TraceLevel::RUNTIME, "execute");
     funcPtr(runtimeBundle_.getConstants(), baseMutableWeightVarsAddress,
             baseActivationsAddress);
   } else {
@@ -110,23 +131,23 @@ llvm::Error LLVMCompiledFunction::execute(ExecutionContext *context) {
   }
 
   {
-    auto ev = context->scopedEvent("updatePlaceholders");
+    TRACE_EVENT_SCOPE(context, TraceLevel::RUNTIME, "updatePlaceholders");
     updatePlaceholders(context->getPlaceholderBindings(),
                        baseMutableWeightVarsAddress);
   }
 
   {
-    auto ev = context->scopedEvent("freeBuffers");
+    TRACE_EVENT_SCOPE(context, TraceLevel::RUNTIME, "freeBuffers");
     alignedFree(baseMutableWeightVarsAddress);
     alignedFree(baseActivationsAddress);
   }
 
   {
-    auto ev = context->scopedEvent("processInstrumentation");
+    TRACE_EVENT_SCOPE(context, TraceLevel::RUNTIME, "processInstrumentation");
     translateTraceEvents(context);
   }
 
-  return llvm::Error::success();
+  return Error::success();
 }
 
 void LLVMCompiledFunction::translateTraceEvents(
@@ -138,14 +159,13 @@ void LLVMCompiledFunction::translateTraceEvents(
 
   TraceContext *traceContext = context->getTraceContext();
 
-  if (traceContext->getTraceLevel() == TraceLevel::NONE ||
-      traceContext->getTraceLevel() == TraceLevel::RUNTIME) {
+  if (!traceContext->shouldLog(TraceLevel::OPERATOR)) {
     return;
   }
 
   PlaceholderBindings *bindings = context->getPlaceholderBindings();
 
-  int tid = TraceEvent::getThreadId();
+  int tid = threads::getThreadId();
   for (auto &backing : traceInfo.events) {
     Tensor *backingTensor = bindings->get(backing.first);
     DCHECK(backingTensor) << "Could not get backing tensor for Placeholder: "
@@ -164,14 +184,24 @@ void LLVMCompiledFunction::translateTraceEvents(
                backingTensor->getUnsafePtr() +
                    (event.endIndex * traceInfo.dataSize),
                traceInfo.dataSize);
-        traceEvents.push_back({event.name, start, end - start, tid});
+        traceEvents.push_back({event.name,
+                               TraceLevel::OPERATOR,
+                               start,
+                               end - start,
+                               tid,
+                               {{"kind", event.kind}}});
       } else {
         uint64_t ts{0};
         memcpy(&ts,
                backingTensor->getUnsafePtr() +
                    (event.startIndex * traceInfo.dataSize),
                traceInfo.dataSize);
-        traceEvents.push_back({event.name, ts, event.type, tid});
+        traceEvents.push_back({event.name,
+                               TraceLevel::OPERATOR,
+                               ts,
+                               event.type,
+                               tid,
+                               {{"kind", event.kind}}});
       }
     }
   }

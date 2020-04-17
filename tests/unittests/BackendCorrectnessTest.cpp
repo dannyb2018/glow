@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,14 +31,13 @@
 using namespace glow;
 using llvm::cast;
 
-class BackendCorrectnessTest : public ::testing::TestWithParam<BackendKind> {
+class BackendCorrectnessTest : public ::testing::TestWithParam<std::string> {
 protected:
-  BackendKind backendKind_{GetParam()};
+  std::string backendName_{GetParam()};
 };
 
-class CPUOnly : public BackendCorrectnessTest {};
-
 TEST_P(BackendCorrectnessTest, convTest) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
   Tensor inputs(ElemKind::FloatTy, {20, 41, 32, 6});
   Tensor kernel(ElemKind::FloatTy, {10, 5, 5, 6});
@@ -46,31 +45,33 @@ TEST_P(BackendCorrectnessTest, convTest) {
   inputs.getHandle().initXavier(1, PRNG);
   kernel.getHandle().randomize(-3.0, 3.0, PRNG);
   bias.getHandle().randomize(-0.5, 0.5, PRNG);
-  std::array<size_t, 4> S{{20, 15, 12, 10}};
-  llvm::ArrayRef<size_t> shape(S);
+  std::array<dim_t, 4> S{{20, 15, 12, 10}};
+  llvm::ArrayRef<dim_t> shape(S);
   Tensor out1(ElemKind::FloatTy, shape);
   Tensor out2(ElemKind::FloatTy, shape);
 
-  inferConvNet(&inputs, &kernel, &bias, &out1, backendKind_);
-  inferConvNet(&inputs, &kernel, &bias, &out2, BackendKind::Interpreter);
+  inferConvNet(&inputs, &kernel, &bias, &out1, backendName_);
+  inferConvNet(&inputs, &kernel, &bias, &out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
-TEST_P(CPUOnly, extract3Dtest) {
+TEST_P(BackendCorrectnessTest, extract3Dtest) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
   Tensor inputs(ElemKind::FloatTy, {5, 100, 100});
   inputs.getHandle().initXavier(1, PRNG);
   Tensor out1;
   Tensor out2;
 
-  inferExtract3D(&inputs, &out1, BackendKind::CPU);
-  inferExtract3D(&inputs, &out2, BackendKind::Interpreter);
+  inferExtract3D(&inputs, &out1, backendName_);
+  inferExtract3D(&inputs, &out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
-TEST_P(CPUOnly, quantizedConvTest) {
+TEST_P(BackendCorrectnessTest, quantizedConvTest) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
   Tensor inputs(ElemKind::Int8QTy, {20, 41, 32, 6}, 0.025, -7);
   Tensor kernel(ElemKind::Int8QTy, {10, 5, 5, 6}, 0.003, 3);
@@ -78,18 +79,19 @@ TEST_P(CPUOnly, quantizedConvTest) {
   inputs.getHandle<int8_t>().randomize(-128, 127, PRNG);
   kernel.getHandle<int8_t>().randomize(-128, 127, PRNG);
   bias.getHandle<int32_t>().randomize(-11, 8, PRNG);
-  std::array<size_t, 4> S{{20, 15, 12, 10}};
-  llvm::ArrayRef<size_t> shape(S);
+  std::array<dim_t, 4> S{{20, 15, 12, 10}};
+  llvm::ArrayRef<dim_t> shape(S);
   Tensor out1(ElemKind::Int8QTy, shape, 0.05, -17);
   Tensor out2(ElemKind::Int8QTy, shape, 0.05, -17);
 
-  inferConvNet(&inputs, &kernel, &bias, &out1, backendKind_);
-  inferConvNet(&inputs, &kernel, &bias, &out2, BackendKind::Interpreter);
+  inferConvNet(&inputs, &kernel, &bias, &out1, backendName_);
+  inferConvNet(&inputs, &kernel, &bias, &out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2, 1.0));
 }
 
 TEST_P(BackendCorrectnessTest, convGradTest) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
   Tensor inputs(ElemKind::FloatTy, {9, 8, 5, 4});
   Tensor kernel1(ElemKind::FloatTy, {3, 5, 3, 4});
@@ -106,35 +108,37 @@ TEST_P(BackendCorrectnessTest, convGradTest) {
   for (size_t i = 0; i < 9; i++) {
     selectedH.raw(i) = PRNG.nextRandInt(0, 29);
   }
-  std::array<size_t, 4> S1{{9, 6, 10, 1}};
-  llvm::ArrayRef<size_t> shape1(S1);
-  std::array<size_t, 2> S2{{9, 30}};
-  llvm::ArrayRef<size_t> shape2(S2);
+  std::array<dim_t, 4> S1{{9, 6, 10, 1}};
+  llvm::ArrayRef<dim_t> shape1(S1);
+  std::array<dim_t, 2> S2{{9, 30}};
+  llvm::ArrayRef<dim_t> shape2(S2);
   Tensor out1;
   Tensor out2;
 
   trainConvNet(&inputs, &kernel1, &bias1, &kernel2, &bias2, &selected, shape1,
-               shape2, &out1, backendKind_);
+               shape2, &out1, backendName_);
   trainConvNet(&inputs, &kernel1, &bias1, &kernel2, &bias2, &selected, shape1,
-               shape2, &out2, BackendKind::Interpreter);
+               shape2, &out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
-TEST_P(CPUOnly, localResponseNormalizationTest) {
+TEST_P(BackendCorrectnessTest, localResponseNormalizationTest) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
   Tensor inputs(ElemKind::FloatTy, {8, 15, 13, 30});
   inputs.getHandle().initXavier(1, PRNG);
   Tensor out1;
   Tensor out2;
 
-  inferLocalResponseNormalizationNet(&inputs, &out1, backendKind_);
-  inferLocalResponseNormalizationNet(&inputs, &out2, BackendKind::Interpreter);
+  inferLocalResponseNormalizationNet(&inputs, &out1, backendName_);
+  inferLocalResponseNormalizationNet(&inputs, &out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
-TEST_P(CPUOnly, localResponseNormalizationGradTest) {
+TEST_P(BackendCorrectnessTest, localResponseNormalizationGradTest) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
   Tensor inputs(ElemKind::FloatTy, {5, 4, 7, 3});
   Tensor weights(ElemKind::FloatTy, {84, 180});
@@ -147,18 +151,17 @@ TEST_P(CPUOnly, localResponseNormalizationGradTest) {
   for (size_t i = 0; i < 5; i++) {
     selectedH.raw(i) = PRNG.nextRandInt(0, 179);
   }
-  std::array<size_t, 4> S1{{5, 2, 2, 45}};
-  llvm::ArrayRef<size_t> shape1(S1);
-  std::array<size_t, 2> S2{{5, 180}};
-  llvm::ArrayRef<size_t> shape2(S2);
+  std::array<dim_t, 4> S1{{5, 2, 2, 45}};
+  llvm::ArrayRef<dim_t> shape1(S1);
+  std::array<dim_t, 2> S2{{5, 180}};
+  llvm::ArrayRef<dim_t> shape2(S2);
   Tensor out1(ElemKind::FloatTy, shape2);
   Tensor out2(ElemKind::FloatTy, shape1);
 
   trainLocalResponseNormalizationNet(&inputs, &weights, &bias, &selected,
-                                     shape1, shape2, &out1, backendKind_);
+                                     shape1, shape2, &out1, backendName_);
   trainLocalResponseNormalizationNet(&inputs, &weights, &bias, &selected,
-                                     shape1, shape2, &out2,
-                                     BackendKind::Interpreter);
+                                     shape1, shape2, &out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
@@ -171,14 +174,12 @@ class MockCPUBackend : public BackendUsingGlowIR {
 
 public:
   MockCPUBackend() {
-    backend_.reset(
-        static_cast<BackendUsingGlowIR *>(createBackend(BackendKind::CPU)));
+    backend_.reset(static_cast<BackendUsingGlowIR *>(createBackend("CPU")));
   }
 
-  BackendKind getBackendKind() const override { return BackendKind::CPU; }
-  std::string getBackendName() const override { return "MockCPUBackend"; }
+  std::string getBackendName() const override { return "CPU"; }
 
-  llvm::Expected<std::unique_ptr<CompiledFunction>>
+  Expected<std::unique_ptr<CompiledFunction>>
   compile(Function *F, const BackendOptions &opts) const override {
     return backend_->compile(F, opts);
   }
@@ -188,9 +189,15 @@ public:
     return backend_->compileIR(std::move(IR));
   }
   bool isOpSupported(const NodeInfo &NI) const override { return true; }
+
+  runtime::DeviceManager *
+  createDeviceManager(const runtime::DeviceConfig &deviceConfig) override {
+    return nullptr;
+  }
 };
 
-TEST_P(CPUOnly, dataParallelStackingTest) {
+TEST_P(BackendCorrectnessTest, dataParallelStackingTest) {
+  CHECK_IF_ENABLED();
   // Create an activation of size 3 and create two overlapping tensorviews of
   // this activation. Perform data-parallel instructions involving those
   // tensorviews. The backend's logic for the creation of stacked kernels should
@@ -200,11 +207,11 @@ TEST_P(CPUOnly, dataParallelStackingTest) {
   // buffer that is already used by other instructions in the stacked kernel.
   Module mod;
   Function *F = mod.createFunction("DataParallelStacking");
-  auto M = llvm::make_unique<IRFunction>(F);
+  auto M = glow::make_unique<IRFunction>(F);
 
   auto *var =
       mod.createPlaceholder(glow::ElemKind::FloatTy, {2}, "output", false);
-  auto ctx = llvm::make_unique<ExecutionContext>();
+  auto ctx = glow::make_unique<ExecutionContext>();
   auto *outputTensor = ctx->getPlaceholderBindings()->allocate(var);
   {
     // Scope the IRBuilder so the active allocations are properly deallocated at
@@ -251,13 +258,14 @@ TEST_P(CPUOnly, dataParallelStackingTest) {
 
   MockCPUBackend backend;
   auto function = backend.compileIR(std::move(M));
-  ASSERT_FALSE(errToBool(function->execute(ctx.get())));
+  ASSERT_FALSE(ERR_TO_BOOL(function->execute(ctx.get())));
   auto H = outputTensor->getHandle();
   EXPECT_EQ(H.at(0), 3);
   EXPECT_EQ(H.at(1), 4);
 }
 
-TEST_P(CPUOnly, AvgPoolGradTest) {
+TEST_P(BackendCorrectnessTest, AvgPoolGradTest) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
   Tensor inputs(ElemKind::FloatTy, {5, 7, 6, 3});
   Tensor weights(ElemKind::FloatTy, {126, 72});
@@ -270,22 +278,23 @@ TEST_P(CPUOnly, AvgPoolGradTest) {
   for (size_t i = 0; i < 5; i++) {
     selectedH.raw(i) = PRNG.nextRandInt(0, 17);
   }
-  std::array<size_t, 4> S1{{5, 6, 4, 3}};
-  llvm::ArrayRef<size_t> shape1(S1);
-  std::array<size_t, 2> S2{{5, 18}};
-  llvm::ArrayRef<size_t> shape2(S2);
+  std::array<dim_t, 4> S1{{5, 6, 4, 3}};
+  llvm::ArrayRef<dim_t> shape1(S1);
+  std::array<dim_t, 2> S2{{5, 18}};
+  llvm::ArrayRef<dim_t> shape2(S2);
   Tensor out1;
   Tensor out2;
 
   trainAvgPoolNet(&inputs, &weights, &bias, &selected, shape1, shape2, &out1,
-                  backendKind_);
+                  backendName_);
   trainAvgPoolNet(&inputs, &weights, &bias, &selected, shape1, shape2, &out2,
-                  BackendKind::Interpreter);
+                  "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
 TEST_P(BackendCorrectnessTest, MaxPoolGradTest) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
   Tensor inputs(ElemKind::FloatTy, {4, 8, 7, 2});
   Tensor weights(ElemKind::FloatTy, {112, 84});
@@ -298,107 +307,118 @@ TEST_P(BackendCorrectnessTest, MaxPoolGradTest) {
   for (size_t i = 0; i < 4; i++) {
     selectedH.raw(i) = PRNG.nextRandInt(0, 31);
   }
-  std::array<size_t, 4> S1{{4, 6, 7, 2}};
-  llvm::ArrayRef<size_t> shape1(S1);
-  std::array<size_t, 2> S2{{4, 32}};
-  llvm::ArrayRef<size_t> shape2(S2);
+  std::array<dim_t, 4> S1{{4, 6, 7, 2}};
+  llvm::ArrayRef<dim_t> shape1(S1);
+  std::array<dim_t, 2> S2{{4, 32}};
+  llvm::ArrayRef<dim_t> shape2(S2);
   Tensor out1;
   Tensor out2;
 
   trainMaxPoolNet(&inputs, &weights, &bias, &selected, shape1, shape2, &out1,
-                  backendKind_);
+                  backendName_);
   trainMaxPoolNet(&inputs, &weights, &bias, &selected, shape1, shape2, &out2,
-                  BackendKind::Interpreter);
+                  "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
-TEST_P(CPUOnly, intLookupTable) {
+TEST_P(BackendCorrectnessTest, intLookupTable) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
-  constexpr size_t inputSize = 100;
+  constexpr dim_t inputSize = 100;
   Tensor inputs(ElemKind::Int8QTy, {inputSize}, 0.8, 4);
   inputs.getHandle<int8_t>().randomize(-128, 127, PRNG);
   Tensor out1, out2;
 
   // Mapping i -> i.
   std::vector<int8_t> initValues(256);
-  for (size_t i = 0; i < 256; ++i) {
+  for (dim_t i = 0; i < 256; ++i) {
     initValues[i] = i - 128;
   }
 
-  inferIntLookupTableNet(&inputs, &out1, initValues, backendKind_);
-  inferIntLookupTableNet(&inputs, &out2, initValues, BackendKind::Interpreter);
+  inferIntLookupTableNet(&inputs, &out1, initValues, backendName_);
+  inferIntLookupTableNet(&inputs, &out2, initValues, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
 TEST_P(BackendCorrectnessTest, smallConv) {
+  CHECK_IF_ENABLED();
   Tensor input(ElemKind::FloatTy, {1, 3, 3, 32});
   input.getHandle().clear(0.2);
   Tensor out1;
   Tensor out2;
 
-  inferSmallConv(&input, &out1, backendKind_);
-  inferSmallConv(&input, &out2, BackendKind::Interpreter);
+  inferSmallConv(&input, &out1, backendName_);
+  inferSmallConv(&input, &out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
 /// This test targets the DKKC8 optimization.
-TEST_P(CPUOnly, groupConvTest) {
-  std::array<size_t, 4> S{{1, 2, 1, 128}};
-  llvm::ArrayRef<size_t> shape(S);
+TEST_P(BackendCorrectnessTest, groupConvTest) {
+  CHECK_IF_ENABLED();
+  std::array<dim_t, 4> S{{1, 2, 1, 128}};
+  llvm::ArrayRef<dim_t> shape(S);
   Tensor out1(ElemKind::FloatTy, shape);
   Tensor out2(ElemKind::FloatTy, shape);
-  inferGroupConv(&out1, backendKind_);
-  inferGroupConv(&out2, BackendKind::Interpreter);
+  inferGroupConv(&out1, backendName_);
+  inferGroupConv(&out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
 /// This test targets the DKKC8 optimization.
-TEST_P(CPUOnly, nonSquarePaddingConvTest) {
+TEST_P(BackendCorrectnessTest, nonSquarePaddingConvTest) {
+  CHECK_IF_ENABLED();
   Tensor out1;
   Tensor out2;
-  inferNonSquarePaddingConv(&out1, BackendKind::CPU);
-  inferNonSquarePaddingConv(&out2, BackendKind::Interpreter);
+
+  inferNonSquarePaddingConv(&out1, backendName_);
+  inferNonSquarePaddingConv(&out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
 /// This non-square kernel test targets the DKKC8 optimization.
-TEST_P(CPUOnly, nonSquareKernelConvTest) {
+TEST_P(BackendCorrectnessTest, nonSquareKernelConvTest) {
+  CHECK_IF_ENABLED();
+
   Tensor out1;
   Tensor out2;
-  inferNonSquareKernelConv(&out1, BackendKind::CPU);
-  inferNonSquareKernelConv(&out2, BackendKind::Interpreter);
+
+  inferNonSquareKernelConv(&out1, backendName_);
+  inferNonSquareKernelConv(&out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
 /// This non-square stride test targets the DKKC8 optimization.
-TEST_P(CPUOnly, nonSquareStrideConvTest) {
+TEST_P(BackendCorrectnessTest, nonSquareStrideConvTest) {
+  CHECK_IF_ENABLED();
   Tensor out1;
   Tensor out2;
-  inferNonSquareStrideConv(&out1, BackendKind::CPU);
-  inferNonSquareStrideConv(&out2, BackendKind::Interpreter);
+  inferNonSquareStrideConv(&out1, backendName_);
+  inferNonSquareStrideConv(&out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
 /// This test targets the DKKC8 opt correctionimization.
-TEST_P(CPUOnly, convDKKC8Test) {
+TEST_P(BackendCorrectnessTest, convDKKC8Test) {
+  CHECK_IF_ENABLED();
   Tensor out1;
   Tensor out2;
-  inferConvDKKC8(&out1, BackendKind::CPU);
-  inferConvDKKC8(&out2, BackendKind::Interpreter);
-  EXPECT_TRUE(out1.isEqual(out2));
+  inferConvDKKC8(&out1, backendName_);
+  inferConvDKKC8(&out2, "Interpreter");
+  EXPECT_TRUE(out1.isEqual(out2, 0.00013));
 }
 
 TEST_P(BackendCorrectnessTest, softmaxGradTest) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
-  std::array<size_t, 2> S{{8, 23}};
-  llvm::ArrayRef<size_t> shape(S);
+  std::array<dim_t, 2> S{{8, 23}};
+  llvm::ArrayRef<dim_t> shape(S);
   Tensor inputs(ElemKind::FloatTy, shape);
   Tensor weights(ElemKind::FloatTy, {23, 23});
   Tensor bias(ElemKind::FloatTy, {23});
@@ -413,14 +433,14 @@ TEST_P(BackendCorrectnessTest, softmaxGradTest) {
   Tensor out1;
   Tensor out2;
 
-  trainSoftMaxNet(&inputs, &weights, &bias, &selected, &out1, backendKind_);
-  trainSoftMaxNet(&inputs, &weights, &bias, &selected, &out2,
-                  BackendKind::Interpreter);
+  trainSoftMaxNet(&inputs, &weights, &bias, &selected, &out1, backendName_);
+  trainSoftMaxNet(&inputs, &weights, &bias, &selected, &out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
 TEST_P(BackendCorrectnessTest, convOps) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
   // Construct networks with a different convolution depth.
   for (auto depth : {4, 64, 128}) {
@@ -429,29 +449,32 @@ TEST_P(BackendCorrectnessTest, convOps) {
     Tensor out1;
     Tensor out2;
 
-    inferBasicConvNet(&inputs, &out1, backendKind_, depth);
-    inferBasicConvNet(&inputs, &out2, BackendKind::Interpreter, depth);
+    inferBasicConvNet(&inputs, &out1, backendName_, depth);
+    inferBasicConvNet(&inputs, &out2, "Interpreter", depth);
 
     EXPECT_TRUE(out1.isEqual(out2));
   }
 }
 
 TEST_P(BackendCorrectnessTest, basicFCNet) {
+  CHECK_IF_ENABLED();
   compareAgainstInterpreter(GetParam(), createAndInitBasicFCNet,
                             ElemKind::FloatTy, ElemKind::FloatTy, 0.0004f,
                             parCloneCountOpt);
 }
 
 TEST_P(BackendCorrectnessTest, basicFCNetQuantized) {
+  CHECK_IF_ENABLED();
   compareAgainstInterpreter(GetParam(), createAndInitBasicFCNet,
-                            ElemKind::Int8QTy, ElemKind::Int8QTy, 0.0001f,
+                            ElemKind::Int8QTy, ElemKind::Int8QTy, 0.f,
                             parCloneCountOpt);
 }
 
-TEST_P(CPUOnly, complexNet1) {
+TEST_P(BackendCorrectnessTest, complexNet1) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
-  std::array<size_t, 4> S{{8, 7, 14, 11}};
-  llvm::ArrayRef<size_t> shape(S);
+  std::array<dim_t, 4> S{{8, 7, 14, 11}};
+  llvm::ArrayRef<dim_t> shape(S);
   Tensor inputs1(ElemKind::FloatTy, shape);
   Tensor inputs2(ElemKind::FloatTy, {8, 4, 7, 9});
   Tensor inputs3(ElemKind::FloatTy, shape);
@@ -463,20 +486,21 @@ TEST_P(CPUOnly, complexNet1) {
   Tensor out1;
   Tensor out2;
 
-  inferComplexNet1(&inputs1, &inputs2, &inputs3, &inputs4, &out1, backendKind_);
+  inferComplexNet1(&inputs1, &inputs2, &inputs3, &inputs4, &out1, backendName_);
   inferComplexNet1(&inputs1, &inputs2, &inputs3, &inputs4, &out2,
-                   BackendKind::Interpreter);
+                   "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
 TEST_P(BackendCorrectnessTest, tinyResnet) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
   Tensor input(ElemKind::FloatTy, {1, 7, 7, 64});
   input.getHandle().randomize(0, 1.0, PRNG);
 
   std::vector<Tensor> weights;
-  using Dims = llvm::ArrayRef<size_t>;
+  using Dims = llvm::ArrayRef<dim_t>;
   weights.emplace_back(ElemKind::FloatTy, Dims{256, 1, 1, 64});
   weights.emplace_back(ElemKind::FloatTy, Dims{256});
   weights.emplace_back(ElemKind::FloatTy, Dims{64, 1, 1, 256});
@@ -491,32 +515,24 @@ TEST_P(BackendCorrectnessTest, tinyResnet) {
 
   Tensor out1;
   Tensor out2;
-  inferTinyResnet(&input, &out1, weights, BackendKind::Interpreter);
-  inferTinyResnet(&input, &out2, weights, backendKind_);
+  inferTinyResnet(&input, &out1, weights, "Interpreter");
+  inferTinyResnet(&input, &out2, weights, backendName_);
 
   EXPECT_TRUE(out1.isEqual(out2, 0.001));
 }
 
 // Test MaxSplat transformation in CPU backend.
-TEST_P(CPUOnly, maxSplatTest) {
+TEST_P(BackendCorrectnessTest, maxSplatTest) {
+  CHECK_IF_ENABLED();
   PseudoRNG PRNG;
   Tensor input(ElemKind::Int8QTy, {5, 5}, 0.001, -10);
   input.getHandle<int8_t>().randomize(-128, 127, PRNG);
   Tensor out1, out2;
 
-  inferMaxSplat(&input, &out1, backendKind_);
-  inferMaxSplat(&input, &out2, BackendKind::Interpreter);
+  inferMaxSplat(&input, &out1, backendName_);
+  inferMaxSplat(&input, &out2, "Interpreter");
 
   EXPECT_TRUE(out1.isEqual(out2));
 }
 
-#ifdef GLOW_WITH_CPU
-INSTANTIATE_TEST_CASE_P(CPU, BackendCorrectnessTest,
-                        ::testing::Values(BackendKind::CPU));
-INSTANTIATE_TEST_CASE_P(CPU, CPUOnly, ::testing::Values(BackendKind::CPU));
-#endif // GLOW_WITH_CPU
-
-#ifdef GLOW_WITH_OPENCL
-INSTANTIATE_TEST_CASE_P(OpenCL, BackendCorrectnessTest,
-                        ::testing::Values(BackendKind::OpenCL));
-#endif // GLOW_WITH_OPENCL
+INSTANTIATE_BACKEND_TEST(BackendCorrectnessTest);

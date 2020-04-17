@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,14 +14,16 @@
  * limitations under the License.
  */
 
-#include "ThreadPoolExecutor.h"
+#include "ExecutionState.h"
 
 #include "glow/Backends/DeviceManager.h"
 #include "glow/ExecutionContext/ExecutionContext.h"
+#include "glow/Runtime/Executor/ThreadPoolExecutor.h"
 
 #include <queue>
 #include <unordered_set>
 
+#include "llvm/Support/FormatVariadic.h"
 #include <glog/logging.h>
 
 namespace glow {
@@ -57,175 +59,12 @@ void InflightBarrier::wait() {
   cv_.wait(lock, [&] { return count_ == 0; });
 }
 
-ExecutionState::ExecutionState(RunIdentifierTy id, const DAGNode *root,
-                               ThreadExecutor *executor,
-                               std::unique_ptr<ExecutionContext> resultContext,
-                               ResultCBTy doneCb)
-    : runId_(id), cb_(doneCb), resultCtx_(std::move(resultContext)),
-      inflightNodes_(0), module_(root->module), root_(root),
-      executor_(executor) {}
-
-void ExecutionState::init() {
-  // Create a queue for the breadth-first traversal through the graph.
-  std::queue<const DAGNode *> bfsQueue;
-
-  // Place the root nodes in the queue.
-  for (const auto &node : root_->children) {
-    bfsQueue.push(node);
-  }
-
-  auto *resultTraceContext = resultCtx_->getTraceContext();
-
-  // Breadth-first search.
-  while (!bfsQueue.empty()) {
-    // Get the next node in the BFS queue.
-    const DAGNode *node = bfsQueue.front();
-    bfsQueue.pop();
-
-    // Make a counter for the number of node parents done.
-    nodeParentsDone_[node] = 0;
-
-    // Make an (empty) input context for the node.
-    auto nodeInputCtx = llvm::make_unique<ExecutionContext>();
-
-    if (resultTraceContext) {
-      nodeInputCtx->setTraceContext(
-          llvm::make_unique<TraceContext>(resultTraceContext->getTraceLevel()));
-    }
-
-    auto nodeInputPhBindings = nodeInputCtx->getPlaceholderBindings();
-
-    // Get the symbol table for the node.
-    const SymbolTableTy &symbolTable = node->runtimeBundle->getSymbolTable();
-
-    // Create Placeholders for the symbols of all intermediate nodes. These are
-    // not in the ExecutionContext passed to Executor::run, so they must be
-    // created by the Executor.
-    auto *resultBindings = resultCtx_->getPlaceholderBindings();
-    for (const auto &symbolPair : symbolTable) {
-      const auto &symbolName = symbolPair.first;
-      const auto &symbolInfo = symbolPair.second;
-
-      if (symbolInfo.symbolCategory == SymbolCategory::Placeholder) {
-        auto *PH = resultBindings->getPlaceholderByName(symbolName);
-        if (!PH) {
-          PH = module_->getPlaceholderByName(symbolName);
-          DCHECK(PH) << "Placeholder: " << symbolName
-                     << " is not in the module";
-
-          // allocate into the resultBindings because they have the longest
-          // lifetime.
-          resultBindings->insert(PH,
-                                 intermediateTensorPool_.get(PH->getType()));
-          intermediatePlaceholders_.push_back(PH);
-        }
-
-        nodeInputPhBindings->insert(
-            PH, resultBindings->get(PH)->getUnowned(PH->dims()));
-      }
-    }
-
-    // Insert the prepared ExecutionContext into the input contexts map.
-    inputCtxs_.insert(std::make_pair(node, std::move(nodeInputCtx)));
-
-    // Push all unvisited children onto the BFS queue.
-    for (const auto &child : node->children) {
-      // Use nodeParentsDone_ as a set of nodes that have been visited already
-      // to avoid visiting a node more than once.
-      if (!nodeParentsDone_.count(child)) {
-        bfsQueue.push(child);
-      }
-    }
-  }
-  initialized_ = true;
-}
-
-std::unique_ptr<ExecutionContext>
-ExecutionState::getUniqueNodeContextPtr(const DAGNode *node) {
-  // The input PlaceholderBindings for the node should have been created in the
-  // constructor.
-  auto ctxIt = inputCtxs_.find(node);
-
-  DCHECK(ctxIt != inputCtxs_.end())
-      << "Input bindings not found but should exist!";
-
-  return std::move(ctxIt->second);
-}
-
-void ExecutionState::incrementInflightNodes(unsigned increment) {
-  inflightNodes_ += increment;
-}
-
-bool ExecutionState::decrementInflightNodes(unsigned decrement) {
-  // fetch_sub must be used here so that the function returns true to only one
-  // caller.
-  unsigned previousValue = inflightNodes_.fetch_sub(decrement);
-
-  // The decrement should never be more than the value of the counter at the
-  // time of decrement.
-  DCHECK_GE(previousValue, decrement)
-      << "More decrements than increments to inflight nodes!";
-
-  // Return true when the counter hits zero.
-  return (previousValue == decrement);
-}
-
-bool ExecutionState::incrementNodeParentsDone(const DAGNode *node,
-                                              unsigned increment) {
-  // Get the parents done counter for the node. It should have
-  // been created in the constructor.
-  auto it = nodeParentsDone_.find(node);
-
-  DCHECK(it != nodeParentsDone_.end())
-      << "Node parents done counter should exist but not found!";
-
-  // fetch_add must be used here so that the function returns true to only
-  // one caller.
-  unsigned numParents = (node->parents).size();
-  unsigned previousValue = (it->second).fetch_add(increment);
-  unsigned newValue = previousValue + increment;
-
-  // The new value of the counter cannot exceed the number of parents that
-  // the node has.
-  DCHECK_LE(newValue, numParents)
-      << "Node parents done counter incremented beyond limit!";
-
-  // Return true only when the counter hits the total numer of parents.
-  return (newValue == numParents);
-}
-
-void ExecutionState::insertIntoTraceContext(std::vector<TraceEvent> &events) {
-  if (!resultCtx_->getTraceContext()) {
-    events.clear();
-    return;
-  }
-
-  std::move(
-      events.begin(), events.end(),
-      std::back_inserter(resultCtx_->getTraceContext()->getTraceEvents()));
-}
-
-void ExecutionState::removeIntermediatePlaceholders() {
-  for (auto &p : intermediatePlaceholders_) {
-    resultCtx_->getPlaceholderBindings()->erase(p);
-  }
-  intermediatePlaceholders_.clear();
-}
-
-std::unique_ptr<ExecutionContext> ExecutionState::getUniqueResultContextPtr() {
-  // The result PlaceholderBindings should have been been created in the
-  // constructor.
-  DCHECK_NOTNULL(resultCtx_.get());
-  return std::move(resultCtx_);
-}
-
-ExecutionContext *ExecutionState::getRawResultContextPtr() const {
-  // The result PlaceholderBindings should have been been created in the
-  // constructor and should not yet have been moved out if this function is
-  // being called.
-  DCHECK_NOTNULL(resultCtx_.get());
-  return resultCtx_.get();
-}
+ThreadPoolExecutor::ThreadPoolExecutor(const DeviceManagerMapTy &deviceManagers,
+                                       unsigned numWorkers,
+                                       const std::string &name)
+    : threadPool_(numWorkers,
+                  std::make_shared<folly::NamedThreadFactory>(name)),
+      deviceManagers_(deviceManagers) {}
 
 void ThreadPoolExecutor::shutdown() {
   // Prevent more requests from being processed.
@@ -235,17 +74,30 @@ void ThreadPoolExecutor::shutdown() {
   // processed before starting to destroy state that is used in
   // handleDeviceManagerResult().
   inflightBarrier_.wait();
+
+  threadPool_.stop();
+  threadPool_.join();
 }
 
 void ThreadPoolExecutor::run(const DAGNode *root,
                              std::unique_ptr<ExecutionContext> context,
                              RunIdentifierTy runId, ResultCBTy cb) {
-  TRACE_EVENT_SCOPE(context->getTraceContext(), "ThreadPoolExecutor::run");
+  DCHECK(cb != nullptr);
+
+  TRACE_EVENT_SCOPE(context->getTraceContext(), TraceLevel::RUNTIME,
+                    "ThreadPoolExecutor::run");
+
+  if (context->getTraceContext()) {
+    auto tid = threads::getThreadId();
+    if (!context->getTraceContext()->getThreadNames().count(tid)) {
+      context->getTraceContext()->setThreadName(tid, "ThreadPoolExecutor");
+    }
+  }
 
   // Don't process new requests if the executor is shutting down.
   if (shuttingDown_) {
     cb(runId,
-       MAKE_ERR(GlowErr::ErrorCode::RUNTIME_REQUEST_REFUSED,
+       MAKE_ERR(ErrorValue::ErrorCode::RUNTIME_REQUEST_REFUSED,
                 "ThreadPoolExecutor is shutting down"),
        std::move(context));
     return;
@@ -254,38 +106,43 @@ void ThreadPoolExecutor::run(const DAGNode *root,
   // If list of roots is empty, there is nothing to do. Give back the
   // bindings so the caller can reuse it.
   if (!root) {
-    cb(runId, llvm::Error::success(), std::move(context));
+    cb(runId, Error::success(), std::move(context));
     return;
   }
 
-  std::shared_ptr<ExecutionState> executionState =
-      std::make_shared<ExecutionState>(runId, root, threadPool_.getExecutor(),
-                                       std::move(context), std::move(cb));
-  executionState->init();
-
-  // Execute all child nodes of root.
-
-  // Mark the child nodes as "inflight" (i.e. currently executing). This must be
-  // done here instead of inside executeDAGNode() so that a node can be
-  // executed while placeholders are being propagated for the next node without
-  // the callback for that node deleting the execution state.
   auto numChildren = (root->children).size();
-  executionState->incrementInflightNodes(numChildren);
+  // Mark the child nodes as "inflight" (i.e. currently executing). This must
+  // be done here instead of inside executeDAGNode() so that a node can be
+  // executed while placeholders are being propagated for the next node
+  // without the callback for that node deleting the execution state.
   inflightBarrier_.increment(numChildren);
 
+  auto *traceContext = context->getTraceContext();
+
+  // Get and bind state.
+  auto currentState = states_[root]->getNextNetworkExecutionState();
+  TRACE_EVENT_BEGIN(traceContext, TraceLevel::RUNTIME,
+                    "bind network execution state");
+  currentState->bind(std::move(context), std::move(cb), runId);
+  TRACE_EVENT_END(traceContext, TraceLevel::RUNTIME,
+                  "bind network execution state");
+
+  currentState->incrementInflightNodes(numChildren);
+
+  // End the trace block before calling executeDAGNode() which can trigger the
+  // result cb. Once the result cb is called, it's no longer safe to access the
+  // trace context.
+  TRACE_EVENT_SCOPE_END();
   for (auto const &node : root->children) {
-    // Execute the node.
-    executeDAGNode(executionState, node);
+    // Run with cached state
+    executeDAGNode(currentState, node);
   }
 }
 
-void ThreadPoolExecutor::executeDAGNode(
-    std::shared_ptr<ExecutionState> executionState, DAGNode *node) {
+void ThreadPoolExecutor::executeDAGNode(NetworkExecutionState *executionState,
+                                        DAGNode *node) {
   TRACE_EVENT_SCOPE(executionState->getRawResultContextPtr()->getTraceContext(),
-                    "ThreadPoolExecutor::executeDAGNode");
-  DCHECK(executionState->initialized_) << "Run state must be initialized";
-  // If execution has already failed due to another node, don't bother running
-  // this one.
+                    TraceLevel::RUNTIME, "ThreadPoolExecutor::executeDAGNode");
   if (executionState->getErrorContainer().containsErr()) {
     // Mark the node as no longer executing.
     executionState->decrementInflightNodes();
@@ -293,54 +150,67 @@ void ThreadPoolExecutor::executeDAGNode(
     return;
   }
 
-  auto currentDevice = node->getNextDevice();
+  // Get the PlaceholderBindings containing all of the inputs for the node.
+  std::unique_ptr<ExecutionContext> nodeCtx =
+      executionState->getUniqueNodeContextPtr(node);
+
   // Get the DeviceManager that can run the node.
+  auto currentDevice = node->getNextDevice();
   auto deviceManagerIt = deviceManagers_.find(currentDevice);
 
   if (deviceManagerIt == deviceManagers_.end()) {
     // Mark the node as no longer executing.
     executionState->getErrorContainer().set(
-        MAKE_ERR(GlowErr::ErrorCode::RUNTIME_DEVICE_NOT_FOUND,
+        MAKE_ERR(ErrorValue::ErrorCode::RUNTIME_DEVICE_NOT_FOUND,
                  "Cannot find the DeviceManager specified."));
     executionState->decrementInflightNodes();
     inflightBarrier_.decrement();
     return;
   }
+  DeviceManager *deviceManager = deviceManagerIt->second.get();
+  // If the context has a deviceManager bound use that instead.
+  if (nodeCtx->getBoundDeviceManager()) {
+    deviceManager = nodeCtx->getBoundDeviceManager();
+  }
 
-  auto &deviceManager = deviceManagerIt->second;
-
-  // Get the PlaceholderBindings containing all of the inputs for the node.
-  std::unique_ptr<ExecutionContext> nodeCtx =
-      executionState->getUniqueNodeContextPtr(node);
-
+  // End the trace block before calling deviceManager->runFunction which can
+  // trigger the result cb in a different thread. Once the result cb is called,
+  // it's no longer safe to access the trace context.
+  TRACE_EVENT_SCOPE_END();
   // Run the node using the DeviceManager.
   deviceManager->runFunction(
-      node->name, std::move(nodeCtx),
-      [this, executionState,
-       node](RunIdentifierTy id, llvm::Error err,
+      node->getNextName(currentDevice), std::move(nodeCtx),
+      [this, executionState, currentDevice,
+       node](RunIdentifierTy id, Error err,
              std::unique_ptr<ExecutionContext> resultCtx) {
+        TRACE_EVENT_LOG_ID(resultCtx->getTraceContext(), TraceLevel::REQUEST,
+                           "handle result queuing", TraceEvent::AsyncBeginType,
+                           TraceEvent::now(), id);
+
         // Immediately move the handling of the result onto this run's executor
         // to avoid doing work on the DeviceManager thread.
-        executionState->getExecutor()->submit(
-            [this, executionState, node, err = std::move(err),
-             ctx = std::move(resultCtx)]() mutable {
-              this->handleDeviceManagerResult(executionState, std::move(err),
-                                              std::move(ctx), node);
-            });
+        threadPool_.add([this, executionState, node, err = std::move(err),
+                         currentDevice, id,
+                         ctx = std::move(resultCtx)]() mutable {
+          TRACE_EVENT_LOG_ID(ctx->getTraceContext(), TraceLevel::REQUEST,
+                             "handle result queuing", TraceEvent::AsyncEndType,
+                             TraceEvent::now(), id);
+
+          node->markFinished(currentDevice);
+          this->handleDeviceManagerResult(executionState, std::move(err),
+                                          std::move(ctx), node);
+        });
       });
 }
 
 void ThreadPoolExecutor::handleDeviceManagerResult(
-    std::shared_ptr<ExecutionState> executionState, llvm::Error err,
+    NetworkExecutionState *executionState, Error err,
     std::unique_ptr<ExecutionContext> ctx, const DAGNode *node) {
-
-  // If executionState is null, that means that the object was deleted
-  // while a node was executing. That should never happen.
-  DCHECK_NOTNULL(executionState.get());
-
   TraceContext *traceContext = ctx->getTraceContext();
-  TRACE_EVENT_SCOPE_NAMED(traceContext, "ThreadPoolExecutor::handleResult",
-                          traceEvent);
+  if (traceContext) {
+    TRACE_EVENT_BEGIN(traceContext, TraceLevel::RUNTIME,
+                      "ThreadPoolExecutor::handleResult");
+  }
 
   auto runWasSuccess = !err;
 
@@ -362,26 +232,40 @@ void ThreadPoolExecutor::handleDeviceManagerResult(
       }
     }
   }
+  // Return intermediateContext to executionState.
+  executionState->returnUniqueNodeContextPtr(node, std::move(ctx));
+
+  // This needs to happen before decrementInflightNodes(). Otherwise a race
+  // condition can happen where two threads call into this function at the same
+  // time. Once decrementInflightNodes() is called, only the thread that get
+  // noNodesInflight == true can access executionState.
+  if (traceContext) {
+    TRACE_EVENT_END(traceContext, TraceLevel::RUNTIME,
+                    "ThreadPoolExecutor::handleResult");
+    executionState->insertIntoTraceContext(traceContext);
+  }
 
   // Now, check if all nodes in the graph are done. If so, the callback can be
   // called and all state associated with the run can be erased.
   bool noNodesInflight = executionState->decrementInflightNodes();
 
-  if (traceContext) {
-    TRACE_EVENT_END(traceContext, "ThreadPoolExecutor::handleResult");
-    // Lock is not necessary as we only access on this runs executor.
-    executionState->insertIntoTraceContext(traceContext->getTraceEvents());
-  }
-
   if (noNodesInflight) {
-    // Remove the intermediate placeholders so we don't leak them to the caller.
-    executionState->removeIntermediatePlaceholders();
-
-    // If there are no nodes inflight, that means all nodes are done. Call
-    // the callback and erase the state information.
+    // If there are no nodes inflight, that means all nodes are done. Transfer
+    // the outpus. Call the callback and erase the state information.
+    // Because we are redirecting inputs and outputs to use the provided tensor
+    // we do not have to transfer outputs here. Once we have pinned memory we
+    // will transfer. //executionState->transferOutputs();
     ResultCBTy cb = executionState->getCallback();
-    cb(executionState->getRunId(), executionState->getErrorContainer().get(),
-       executionState->getUniqueResultContextPtr());
+    DCHECK(cb != nullptr);
+
+    // Get what we need from the executionState and return it to the pool.
+    auto runId = executionState->getRunId();
+    auto err = executionState->getErrorContainer().get();
+    auto resultCtx = executionState->getUniqueResultContextPtr();
+    states_[executionState->getRoot()]->returnNetworkExecutionState(
+        executionState);
+
+    cb(runId, std::move(err), std::move(resultCtx));
   }
 
   // Decrement the inflight barrier for the executor keeping track of all
@@ -392,6 +276,61 @@ void ThreadPoolExecutor::handleDeviceManagerResult(
   // run).
   inflightBarrier_.decrement();
 }
+
+void ThreadPoolExecutor::createPool(const DAGNode *root, unsigned poolSize,
+                                    bool enableP2P, bool enableDRT) {
+  std::unordered_map<DAGNode *, DeviceIDTy> assignment;
+
+  // For static assignment we need to track devices each node is assigned to.
+  std::unordered_map<DAGNode *, std::vector<DeviceIDTy>> assignments;
+  std::unordered_map<DAGNode *, unsigned> currentAssignment;
+  if (enableP2P || enableDRT) {
+    // Walk the nodes and get assignments.
+    std::queue<DAGNode *> remaining;
+    for (auto node : root->children) {
+      remaining.push(node);
+    }
+    while (remaining.size()) {
+      auto node = remaining.front();
+      remaining.pop();
+      // Add any new children to the queue.
+      for (auto child : node->children) {
+        auto it = assignments.find(child);
+        if (it == assignments.end()) {
+          remaining.push(child);
+        }
+      }
+      std::vector<DeviceIDTy> assignment;
+      for (auto dev : node->deviceRuntimeInfos) {
+        assignment.push_back(dev.first);
+      }
+      assignments[node] = assignment;
+      currentAssignment[node] = 0;
+    }
+  }
+
+  std::unique_ptr<NetworkExecutionStatePool> pool =
+      glow::make_unique<NetworkExecutionStatePool>();
+  for (unsigned i = 0; i < poolSize; i++) {
+    auto newState = glow::make_unique<NetworkExecutionState>(root);
+    // If assignStatic, calculate the device assignments for this
+    // executionState. For now we are assigning a round robin pattern per node.
+    if (enableDRT || enableP2P) {
+      for (auto it : currentAssignment) {
+        auto &nodeAssignments = assignments.at(it.first);
+        auto newAssignmentIdx = (it.second + 1) % nodeAssignments.size();
+        auto newAssignment = nodeAssignments[newAssignmentIdx];
+        assignment[it.first] = newAssignment;
+        currentAssignment[it.first] = newAssignmentIdx;
+      }
+    }
+    newState->init(deviceManagers_, assignment);
+    pool->addNewState(std::move(newState));
+  }
+  states_[root] = std::move(pool);
+}
+
+void ThreadPoolExecutor::freePool(const DAGNode *root) { states_.erase(root); }
 
 } // namespace runtime
 } // namespace glow

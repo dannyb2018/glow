@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,6 +40,9 @@ MemberTypeInfo kVectorSignedTypeInfo{MemberType::VectorSigned,
 MemberTypeInfo kVectorSizeTTypeInfo{
     MemberType::VectorSizeT, "llvm::ArrayRef<size_t>", "std::vector<size_t>",
     "std::vector<size_t>"};
+MemberTypeInfo kVectorDimTTypeInfo{MemberType::VectorDimT,
+                                   "llvm::ArrayRef<dim_t>",
+                                   "std::vector<dim_t>", "std::vector<dim_t>"};
 MemberTypeInfo kVectorNodeValueTypeInfo{
     MemberType::VectorNodeValue, "NodeValueArrayRef", "std::vector<NodeHandle>",
     "std::vector<NodeValue>"};

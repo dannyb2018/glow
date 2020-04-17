@@ -1,0 +1,19 @@
+add_library(GraphOptimizer
+              ConstantFolding.cpp
+              FunctionPassManager.cpp
+              GraphOptimizer.cpp
+              Lower.cpp
+              Quantization.cpp
+              TrainingPreparation.cpp)
+
+target_link_libraries(GraphOptimizer
+                      PRIVATE
+                        Backend
+                        Converter
+                        Graph
+                        GraphOptimizerPipeline
+                        Lower
+                        Interpreter
+                        PassManager
+                        Quantization
+                        QuantizationBase)

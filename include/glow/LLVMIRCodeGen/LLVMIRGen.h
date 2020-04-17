@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,7 +36,8 @@ class Tensor;
 class Constant;
 class Instruction;
 class WeightVar;
-struct AllocationsInfo;
+class AllocationsInfo;
+class LLVMBackendOptions;
 
 /// Different kinds of memory areas used by the emitted LLVM function.
 /// The order is important. It should match the order of base addresses
@@ -76,6 +77,26 @@ struct DebugInfo {
       baseAddressesVariables_;
 };
 
+/// Different kinds of bundle APIs.
+enum BundleApiType {
+  /// Dynamic bundle API with the following features:
+  /// - the weights are exported in a binary file which are assumed
+  ///   to be loaded dynamically at run-time.
+  /// - the memory layout information (bundle configuration) is only
+  ///   available at run-time and therefore allows ONLY dynamic memory
+  ///   allocaton.
+  Dynamic,
+  /// Static bundle API (default) with the following features:
+  /// - the weights are exported in a binary file but and also in a
+  ///   text file (C array format) suitable to include at compile-time.
+  /// - the memory layout information (bundle configuration) is available
+  ///   at compile-time through macros printed in the header file and thus
+  ///   allows also static memory allocation.
+  /// - this API is suitable for low end devices with no file system or OS
+  ///   (bare-metal).
+  Static,
+};
+
 /// This is a class containing a common logic for the generation of the LLVM IR
 /// from an IRFunction. The primary clients of this class are JITs and bundlers.
 class LLVMIRGen {
@@ -85,7 +106,7 @@ protected:
   /// \param builder IRBuilder to be used for the LLVM IR code emission.
   /// \param bundle set of instructions to be emitted as a data-parallel kernel.
   /// \param argType types of arguments for the data-parallel kernel.
-  /// \bufferToArgNum mapping from a buffer to its argument number in the
+  /// \param bufferToArgNum mapping from a buffer to its argument number in the
   /// data-parallel kernel.
   /// \param buffers buffers used by the data-parallel kernel.
   virtual void
@@ -97,6 +118,10 @@ protected:
 
   /// The IR to generate code for.
   const IRFunction *F_;
+  /// LLVM IR function corresponding to F_.
+  llvm::Function *llvmF_;
+  /// Set of emitted LLVM functions for IR functions.
+  llvm::SmallVector<llvm::Function *, 4> emittedLLVMFunctions_;
   /// The LLVM context.
   llvm::LLVMContext ctx_;
   /// The LLVM IR module.
@@ -105,6 +130,8 @@ protected:
   std::unique_ptr<llvm::TargetMachine> TM_;
   /// Information about allocations.
   AllocationsInfo &allocationsInfo_;
+  /// Name of the bundle.
+  std::string bundleName_;
   /// Name of the main entry.
   std::string mainEntryName_;
   /// Instruction number for the module.
@@ -158,7 +185,11 @@ protected:
   /// Generates LLVM IR that materializes the constant \p val.
   llvm::Value *emitConstI8(llvm::IRBuilder<> &builder, int8_t val);
   /// Generates LLVM IR that materializes the constant \p val.
+  llvm::Value *emitConstI1(llvm::IRBuilder<> &builder, bool val);
+  /// Generates LLVM IR that materializes the constant \p val.
   llvm::Value *emitConstSizeT(llvm::IRBuilder<> &builder, size_t val);
+  /// Generates LLVM IR that materializes the constant \p val.
+  llvm::Value *emitConstDimT(llvm::IRBuilder<> &builder, dim_t val);
   /// Generates LLVM IR that materializes the constant \p val as a constant of
   /// the type specified by \p kind.
   llvm::Value *emitConst(llvm::IRBuilder<> &builder, float val,
@@ -168,6 +199,17 @@ protected:
   template <typename T>
   llvm::Value *emitConstSizeTArray(llvm::IRBuilder<> &builder,
                                    llvm::ArrayRef<T> vals);
+
+  /// Generates LLVM IR that materializes the constant array \p vals. Note that
+  /// it will cast non-dim_t types T into dim_t.
+  template <typename T>
+  llvm::Value *emitConstDimTArray(llvm::IRBuilder<> &builder,
+                                  llvm::ArrayRef<T> vals);
+
+  /// Generates LLVM IR that materializes the constant array \p vals. Note that
+  /// float data type is accepted.
+  llvm::Value *emitConstFloatArray(llvm::IRBuilder<> &builder,
+                                   llvm::ArrayRef<float> vals);
 
   /// Generates LLVM IR that materializes the constant array \p vals. Elements
   /// of vals have the type \p elemTy.
@@ -203,8 +245,10 @@ protected:
   llvm::DIType *getDebugType(llvm::IRBuilder<> &builder, llvm::Type *ty);
   /// Init the generation of debug information.
   virtual void initDebugInfo();
-  /// Generate debug information.
-  virtual void generateDebugInfo();
+  /// Generate debug information for the current function.
+  virtual void generateFunctionDebugInfo();
+  /// Generate debug information for the whole module.
+  virtual void generateModuleDebugInfo();
   /// Set the debug location for the \p builder, so that it corresponds to the
   /// instruction \p I in the textual representation of the Glow IR.
   void setCurrentDebugLocation(llvm::IRBuilder<> &builder,
@@ -244,13 +288,8 @@ public:
   explicit LLVMIRGen(const IRFunction *M, AllocationsInfo &allocationsInfo,
                      std::string mainEntryName, llvm::StringRef libjitBC);
 
-  /// Init the TargetMachine using a given \p target, \p arch, \p cpu, \p
-  /// targetFeatures and code model.
-  virtual void
-  initTargetMachine(llvm::StringRef target, llvm::StringRef arch,
-                    llvm::StringRef cpu,
-                    const llvm::SmallVectorImpl<std::string> &targetFeatures,
-                    llvm::CodeModel::Model CM);
+  /// Init the TargetMachine using settings provided by \p llvmBackend.
+  virtual void initTargetMachine(const LLVMBackendOptions &opts);
 
   /// Emit LLVM-IR for the instruction \p I, using the builder \p builder.
   /// Derived classes may want to override this function to implement a
@@ -275,23 +314,35 @@ public:
   /// \returns a libjit API function by name and tensor element type.
   virtual llvm::Function *getFunction(const std::string &name,
                                       glow::ElemKind elemTy);
+  /// \returns a libjit API function by name and tensor element type.
+  virtual llvm::Function *
+  getFunction(const std::string &name,
+              llvm::ArrayRef<glow::ElemKind> elemTyArray);
+  /// \returns current LLVM function.
+  virtual llvm::Function *getLLVMFunction();
   /// Optimize the function \p F and the module that owns it. Use the target
   /// information from the \p TM target machine.
-  virtual void optimizeLLVMModule(llvm::Function *F, llvm::TargetMachine &TM);
+  virtual void optimizeLLVMModule(llvm::Module *M, llvm::TargetMachine &TM);
   /// Performs specialization of operations based on constant parameters.
   virtual void performSpecialization();
   /// \returns allocations info.
   virtual AllocationsInfo &getAllocationsInfo() { return allocationsInfo_; }
+  /// \returns the name of the bundle, to be used for filename when saving.
+  llvm::StringRef getBundleName() const;
+  /// Set the name of the bundle (name is automatically legalized).
+  void setBundleName(const std::string &name);
   /// \returns the name of the main entry point.
   /// When JITting, it will be "main". In case of bundling it will be the name
   /// of the bundle.
   std::string getMainEntryName() const;
-  /// Set the name of the main entry point.
+  /// Set the name of the main entry point (name is automatically legalized).
   void setMainEntryName(std::string name);
   /// Creates an LLVM module, the entry function, etc.
   virtual void initCodeGen();
   /// Emits the code of the entry function, performs optimizations, etc.
   virtual void performCodeGen();
+  /// Finish the LLVM IR code generation.
+  virtual void finishCodeGen();
   /// \returns the current builder.
   llvm::IRBuilder<> &getBuilder() { return *builder_; }
   /// \returns the target machine description.
@@ -305,6 +356,8 @@ public:
   llvm::Module &getModule() const { return *llmodule_; }
   /// \returns the IR function.
   const IRFunction *getIRFunction() { return F_; }
+  /// Set IRFunction to be processed next.
+  void setIRFunction(const IRFunction *F) { F_ = F; }
   /// Set output directory for bundles, debug info files, etc.
   void setOutputDir(llvm::StringRef outputDir) { outputDir_ = outputDir; }
   /// Get output directory for bundles, debug info files, etc.
@@ -330,6 +383,12 @@ public:
   /// \returns true if a global symbol \p GV needs to be preserved in the module
   /// and not interalized during optimizations.
   virtual bool preserveSymbol(const llvm::GlobalValue &GV);
+  /// \returns inlining mode to be used for a function \p F.
+  virtual llvm::Attribute::AttrKind
+  getInlinineAttr(const llvm::Function *F) const;
+  /// Update inline attributes of functions in the module \p M using a
+  /// backend-specific logic.
+  virtual void updateInlineAttributes(llvm::Module *M);
   /// \returns true if an instruction \p I can be part of a data parallel
   /// kernel. This gives backends a possibility to provide a custom logic to
   /// decide on a per-instruction basis what can be part of data parallel

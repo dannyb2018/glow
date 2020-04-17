@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,16 +23,18 @@ namespace glow {
 
 /// Base factory interface which needs to be implemented
 /// for static registration of arbitrary classes.
-/// For example, CPUFactory : BaseFactory<BackendKind, Backend>
-/// would be responsible for creating CPU backends registred
-/// with BackendKind::CPU key.
+/// For example, CPUFactory would be responsible for creating CPU backends
+/// registred with "CPU" key.
 template <class Key, class Base> class BaseFactory {
 public:
-  virtual ~BaseFactory() = default;
+  virtual ~BaseFactory();
+
   /// Create an object of Base type.
   virtual Base *create() = 0;
   /// Key used for a registered factory.
   virtual Key getRegistrationKey() const = 0;
+  /// Number of devices available for the registered factory.
+  virtual unsigned numDevices() const = 0;
 };
 
 /// General registry for implementation factories.
@@ -45,9 +47,19 @@ public:
   /// Register \p factory in a static map.
   static void registerFactory(BaseFactory<Key, Base> &factory) {
     Key registrationKey = factory.getRegistrationKey();
+    assert(findRegistration(factory) == factories().end() &&
+           "Double registration of base factory");
     auto inserted = factories().emplace(registrationKey, &factory);
-    assert(inserted.second && "Double registration of base factory");
+    assert(inserted.second &&
+           "Double registration of a factory with the same key");
     (void)inserted;
+  }
+
+  static void unregisterFactory(BaseFactory<Key, Base> &factory) {
+    auto registration = findRegistration(factory);
+    assert(registration != factories().end() &&
+           "Could not unregister a base factory");
+    factories().erase(registration);
   }
 
   /// \returns newly created object from factory keyed by \p key.
@@ -62,12 +74,35 @@ public:
     return it->second->create();
   }
 
-private:
+  /// \returns all registered factories.
   static FactoryMap &factories() {
     static FactoryMap *factories = new FactoryMap();
     return *factories;
   }
+
+private:
+  /// Find a registration of the given factory.
+  /// \returns iterator referring to the found registration or factories::end()
+  /// if nothing was found.
+  static typename FactoryMap::iterator
+  findRegistration(BaseFactory<Key, Base> &factory) {
+    // Unfortunately, factory.getRegistrationKey() cannot be used here as it is
+    // a virtual function and findRegistration could be invoked from
+    // destructors, which are not supposed to invoke any virtual functions.
+    // Therefore find the factory registration using the address of the factory.
+    for (auto it = factories().begin(), e = factories().end(); it != e; ++it) {
+      if (it->second != &factory) {
+        continue;
+      }
+      return it;
+    }
+    return factories().end();
+  }
 };
+
+template <class Key, class Base> BaseFactory<Key, Base>::~BaseFactory() {
+  FactoryRegistry<Key, Base>::unregisterFactory(*this);
+}
 
 /// Factory registration template, all static registration should be done
 /// via RegisterFactory. It allows to register specific implementation factory

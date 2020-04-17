@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -100,4 +100,25 @@ void ExtractTensorInst::verify() const {
       getSrc()->getType()->dims().size() == getOffsets().size() &&
       "ExtractTensor offsets should have the same number of dims as Src type "
       "shape");
+}
+
+static void verifyRelu(TypeRef srcTy, TypeRef destTy) {
+  if (srcTy->isQuantizedType()) {
+    assert(srcTy->isQuantizedType() == destTy->isQuantizedType() &&
+           "Mismatching isQuantized");
+    assert(srcTy->dims() == destTy->dims() && "Mismatching dimensions");
+    assert(srcTy->getElementType() == destTy->getElementType() &&
+           "Mismatching element type");
+    return;
+  }
+  assert(destTy->isEqual(*srcTy) && "Mismatching types");
+}
+
+void ReluInst::verify() const {
+  verifyRelu(getSrc()->getType(), getDest()->getType());
+}
+
+void ReluGradInst::verify() const {
+  verifyRelu(getSrcGrad()->getType(), getDest()->getType());
+  verifyRelu(getSrcGrad()->getType(), getDestGrad()->getType());
 }

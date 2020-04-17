@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,7 +24,8 @@
 using namespace glow;
 
 bool PlaceholderBindings::compare(const PlaceholderBindings *A,
-                                  const PlaceholderBindings *B) {
+                                  const PlaceholderBindings *B,
+                                  float allowedError) {
   // Trivial cases.
   if (!A && !B) {
     return true;
@@ -51,8 +52,8 @@ bool PlaceholderBindings::compare(const PlaceholderBindings *A,
         B->get(B->getPlaceholderByName(placeholder->getName()));
 
     if (!tensorA || !tensorB ||
-        !tensorA->isEqual(*tensorB, /* allowedError */ 0.0001,
-                          /* verbose */ false)) {
+        !tensorA->isEqual(*tensorB, allowedError,
+                          /* verbose */ true)) {
       return false;
     }
   }
@@ -97,6 +98,38 @@ void PlaceholderBindings::insert(Placeholder *P, Tensor *T) {
                          << "\" already registered";
   map_[P] = T;
   nameMap_[P->getName()] = P;
+}
+
+void PlaceholderBindings::update(Placeholder *P, Tensor &&T) {
+  DCHECK(map_.count(P)) << "Placeholder with name \"" << P->getName().str()
+                        << "\" is missing";
+  auto *tensor = map_[P];
+  if (auto *tensorPool = tensor->getOwningPool()) {
+    tensorPool->reclaim(tensor);
+  } else {
+    delete tensor;
+  }
+
+  // Take ownership over the tensor.
+  map_[P] = new Tensor(std::move(T));
+}
+
+void PlaceholderBindings::copyToTarget(llvm::StringRef name,
+                                       PlaceholderBindings &dst) {
+  auto *srcPH = this->getPlaceholderByName(name);
+  DCHECK(srcPH) << name.str() << " does not exist in source";
+  auto *dstPH = dst.getPlaceholderByName(name);
+  DCHECK(dstPH) << name.str() << " does not exist in destination";
+  dst.erase(dstPH);
+  dst.insert(dstPH, this->get(srcPH)->clone());
+}
+
+void PlaceholderBindings::copyTrainableWeightsTo(PlaceholderBindings &dst) {
+  for (auto &PH : pairs()) {
+    if (PH.first->isTraining()) {
+      copyToTarget(PH.first->getName(), dst);
+    }
+  }
 }
 
 size_t PlaceholderBindings::count(Placeholder *P) const {
@@ -150,12 +183,18 @@ Tensor *PlaceholderBindings::allocate(Placeholder *P) {
   DCHECK(!map_.count(P)) << "Placeholder with name \"" << P->getName().str()
                          << "\" already registered";
   Tensor *T = new Tensor(P->getType());
+
+  // If this Tensor needs to start zeroed, then zero it.
+  if (P->allocZero()) {
+    T->zero();
+  }
+
   map_[P] = T;
   nameMap_[P->getName()] = P;
   return T;
 }
 
-unsigned PlaceholderBindings::allocate(std::list<Placeholder *> &lst) {
+unsigned PlaceholderBindings::allocate(const std::list<Placeholder *> &lst) {
   unsigned allocated = 0;
   // For each placeholder in the list:
   for (Placeholder *P : lst) {
@@ -171,8 +210,8 @@ unsigned PlaceholderBindings::allocate(std::list<Placeholder *> &lst) {
   return allocated;
 }
 
-Placeholder *
-PlaceholderBindings::getFirstUnallocated(std::list<Placeholder *> &lst) const {
+Placeholder *PlaceholderBindings::getFirstUnallocated(
+    const std::list<Placeholder *> &lst) const {
   // For each placeholder in the list:
   for (Placeholder *P : lst) {
     // If we found an unallocated placeholder then return it.
@@ -202,7 +241,7 @@ PlaceholderBindings::PlaceholderBindings(
     auto *orig = inputs[i];
     /// Create a reference to the original tensor and hand it to the
     /// PlaceholderBindings.
-    Tensor ptrT = orig->getUnowned(orig->dims());
+    Tensor ptrT = orig->getUnowned();
     insert(placeholders[i], std::move(ptrT));
   }
 }

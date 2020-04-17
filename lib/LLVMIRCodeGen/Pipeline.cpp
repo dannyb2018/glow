@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -63,9 +63,45 @@ bool LLVMIRGen::preserveSymbol(const llvm::GlobalValue &GV) {
   return true;
 }
 
-void LLVMIRGen::optimizeLLVMModule(llvm::Function *F, llvm::TargetMachine &TM) {
-  auto *M = F->getParent();
+llvm::Attribute::AttrKind
+LLVMIRGen::getInlinineAttr(const llvm::Function *F) const {
+  return llvm::Attribute::AttrKind::None;
+}
 
+void LLVMIRGen::updateInlineAttributes(llvm::Module *M) {
+  // An empty attribute set to replace the target-specific machine code
+  // attributes that were attached by the frontend.
+  llvm::AttributeList AL;
+  for (auto &FF : *M) {
+    if (FF.isDeclaration()) {
+      continue;
+    }
+    // Check for no-inline attribute.
+    bool dontInline = FF.hasFnAttribute(llvm::Attribute::AttrKind::NoInline);
+    bool alwaysInline =
+        FF.hasFnAttribute(llvm::Attribute::AttrKind::AlwaysInline);
+    auto inlineAttr = getInlinineAttr(&FF);
+    if (inlineAttr != llvm::Attribute::AttrKind::None) {
+      DCHECK(inlineAttr == llvm::Attribute::AttrKind::AlwaysInline ||
+             inlineAttr == llvm::Attribute::AttrKind::NoInline)
+          << "Unknown inlining attribute returned by getInlinineAttr";
+      dontInline = (inlineAttr == llvm::Attribute::AttrKind::NoInline);
+    }
+    // Clear all attributes.
+    FF.setAttributes(AL);
+    // Force inline all non-no-inline functions.
+    if (!dontInline || alwaysInline) {
+      FF.addFnAttr(llvm::Attribute::AttrKind::AlwaysInline);
+      continue;
+    }
+    if (dontInline) {
+      FF.addFnAttr(llvm::Attribute::AttrKind::NoInline);
+      continue;
+    }
+  }
+}
+
+void LLVMIRGen::optimizeLLVMModule(llvm::Module *M, llvm::TargetMachine &TM) {
   // Make all of the definitions from libjit and unnamed symbols internal and
   // optimizable. Everything else should be preserved as is.
   auto preserveSymbolCallback = [&](const llvm::GlobalValue &GV) -> bool {
@@ -94,6 +130,13 @@ void LLVMIRGen::optimizeLLVMModule(llvm::Function *F, llvm::TargetMachine &TM) {
     }
 
     FF.removeFnAttr(llvm::Attribute::AttrKind::NoInline);
+
+    // LinkOnce linkage seems to cause problems to OrcJIT on some OS platforms.
+    // In particular, ORCJit doesn't like linkonce_odr linkage which is used for
+    // almost all templatized C++ functions in the LLVM module.
+    if (!FF.isDeclaration() && FF.isLinkOnceLinkage(FF.getLinkage())) {
+      FF.setLinkage(llvm::GlobalValue::LinkageTypes::InternalLinkage);
+    }
   }
 
   // Perform specialization of functions for constant arguments before anything
@@ -110,26 +153,15 @@ void LLVMIRGen::optimizeLLVMModule(llvm::Function *F, llvm::TargetMachine &TM) {
   M->setTargetTriple(TM.getTargetTriple().normalize());
   M->setDataLayout(TM.createDataLayout());
 
-  // Replace the target-specific machine code attributes that were attached by
-  // the frontend.
-  llvm::AttributeList AL;
+  // Properly set inline attributes.
+  updateInlineAttributes(M);
+
+  // Add no-frame-pointer-elim=true attribute. It helps with profiling and
+  // debugging the produced code.
   for (auto &FF : *M) {
     if (FF.isDeclaration()) {
       continue;
     }
-    // Check for no-inline attribute.
-    bool dontInline = FF.hasFnAttribute(llvm::Attribute::AttrKind::NoInline);
-    // Clear all attributes.
-    FF.setAttributes(AL);
-    // Force inline all non-no-inline functions.
-    if (!dontInline) {
-      FF.addFnAttr(llvm::Attribute::AttrKind::AlwaysInline);
-    }
-    if (dontInline) {
-      FF.addFnAttr(llvm::Attribute::AttrKind::NoInline);
-    }
-    // Add no-frame-pointer-elim=true attribute. It helps with profiling and
-    // debugging the produced code.
     FF.addFnAttr("no-frame-pointer-elim", "true");
   }
 
@@ -137,7 +169,7 @@ void LLVMIRGen::optimizeLLVMModule(llvm::Function *F, llvm::TargetMachine &TM) {
   // and it is always invoked from either the "jitmain" function or the AOT
   // entry point. To enable better LLVM optimizations "main" should always be
   // inlined.
-  M->getFunction("main")->addFnAttr(llvm::Attribute::AttrKind::AlwaysInline);
+  getLLVMFunction()->addFnAttr(llvm::Attribute::AttrKind::AlwaysInline);
 
   llvm::legacy::FunctionPassManager FPM(M);
   llvm::legacy::PassManager PM;

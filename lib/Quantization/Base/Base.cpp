@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 
 #include "glow/Quantization/Base/Base.h"
 #include "glow/Base/Tensor.h"
+#include "glow/Quantization/Base/Calibration.h"
+#include "glow/Quantization/Base/Profile.h"
 
 #include <cmath>
 
@@ -114,6 +116,30 @@ Tensor dequantizeTensor(const Tensor &tensor, ElemKind floatKind) {
   return tmp;
 }
 
+Tensor tensor4BitsFusedRowwiseDequantization(const Tensor &input) {
+  assert(input.dims().size() == 2 && "Input must be 2 dimensional.");
+  // The output tensor should have the same raw as input tensor. Since the
+  // quantized tensor is in the following format: | 4bit quantized data |
+  // float16_t scale | float16_t offset| The columns of dequantized float data
+  // should be (input.dims()[1] - 2*sizeof(float16_t)) * 2.
+  Tensor output(
+      ElemKind::FloatTy,
+      {input.dims()[0], (dim_t)(input.dims()[1] - 2 * sizeof(float16_t)) * 2});
+  auto srcH = input.getHandle<uint8_t>();
+  auto destH = output.getHandle<float>();
+  for (dim_t i = 0; i < input.dims()[0]; i++) {
+    float16_t scale, offset;
+    std::tie(scale, offset) = srcH.getFusedScaleOffsetFromRow<float16_t>(i);
+    for (dim_t j = 0; j < output.dims()[1]; j++) {
+      bool isMSB = (j % 2 == 1);
+      destH.at({i, j}) = dequantize4BitWithFloatOffset(
+          srcH.at({i, j / 2}), static_cast<float>(scale),
+          static_cast<float>(offset), isMSB);
+    }
+  }
+  return output;
+}
+
 QuantizationTransform32To8 quantizeScaleOffset32To8(float scale,
                                                     int32_t offset) {
   // In this function we compute an efficient way to convert signed 32-bit
@@ -201,6 +227,27 @@ QuantizationTransform32To8 quantizeScaleOffset32To8(float scale,
   int preShift = 0;
   int postShift = 0;
 
+  // We treat first the particular case when scale is a power of 2 (2 ^ exp,
+  // where exp is a signed integer exponent). The operation is specialized as:
+  // - for positive 2's exponent:
+  //     x * scale + offset (pre = 0, post = 0, scale = (int)scale).
+  // - for negative 2's exponent:
+  //     x >> post + offset (pre = 0, post = -exp, scale = 1).
+  if (isFloatPowerOf2(scale)) {
+    int exp = getFloat2Exp(scale);
+    if (exp > 0) {
+      return QuantizationTransform32To8(0,                       // pre
+                                        0,                       // post
+                                        static_cast<int>(scale), // scale
+                                        offset);                 // offset
+    } else {
+      return QuantizationTransform32To8(0,       // pre
+                                        -exp,    // post
+                                        1,       // scale
+                                        offset); // offset
+    }
+  }
+
   // Calculate the post-shift value. It's always safe to increase scale as long
   // as it's below one, and it's always legal to shift at least 15 bits for
   // small scale values.
@@ -220,11 +267,7 @@ QuantizationTransform32To8 quantizeScaleOffset32To8(float scale,
                                     offset);
 }
 
-TensorQuantizationParams chooseQuantizationParams(float min, float max,
-                                                  Schema schema, ElemKind qTy) {
-  assert(min <= max && "min must not be bigger than max");
-
-  // Compute the quantized int range.
+QuantizedRange getQuantizedRange(ElemKind qTy) {
   // Pick int64_t in order to cover the uint32_t range.
   int64_t qmin;
   int64_t qmax;
@@ -246,13 +289,67 @@ TensorQuantizationParams chooseQuantizationParams(float min, float max,
     break;
   }
   case ElemKind::Int32QTy: {
-    qmin = std::numeric_limits<int32_t>::min();
-    qmax = std::numeric_limits<int32_t>::max();
+    // A corner case is when quantizing the bias tensor which is later used in
+    // arithmetic computations as (int32)(bias[idx] - biasOffset) (e.g. in the
+    // LIBJIT function "libjit_scale_i32i8"). To avoid overflow we must restrict
+    // the quantization range such that the subtraction result fits int32. Since
+    // both bias[idx] and biasOffset are within the range [qmin, qmax] we will
+    // impose: min(int32) <= qmin - qmax and qmax - qmin <= max(int32). In other
+    // words we will restrict the quantized dynamic range to int31. Furthermore,
+    // since scale is computed as scale = (max - min) / (qmax - qmin) where
+    // (qmax - qmin) is large (~2^31) the scale computation has large errors.
+    // We will further limit the quantized range to int30 (one extra bit) in
+    // order for the computed scale to provide safe quantization within the
+    // intended range.
+    qmin = std::numeric_limits<int32_t>::min() >> 2;
+    qmax = std::numeric_limits<int32_t>::max() >> 2;
     break;
   }
   default:
     llvm_unreachable("Quantized type not supported");
   }
+  return QuantizedRange(qmin, qmax);
+}
+
+void validateQuantizationParams(TensorQuantizationParams qParams, Schema schema,
+                                ElemKind qTy) {
+
+  // Get the quantized range.
+  auto minMaxPair = getQuantizedRange(qTy);
+  int64_t qmin = minMaxPair.first;
+  int64_t qmax = minMaxPair.second;
+
+  // Validate params.
+  (void)(qmin);
+  (void)(qmax);
+  assert((qmin <= qParams.offset) && (qParams.offset <= qmax) &&
+         "The offset must be within the quantized range");
+  if (schema == quantization::Schema::Symmetric) {
+    assert((qParams.offset == 0) &&
+           "Symmetric quantization should have offset 0");
+  } else if (schema == quantization::Schema::SymmetricWithUnsigned) {
+    assert((qParams.offset == qmin || qParams.offset == 0) &&
+           "SymmetricWithUnsigned quantization should have offset 0 or qmin");
+  } else if (schema == quantization::Schema::SymmetricWithPower2Scale) {
+    assert((qParams.offset == 0) &&
+           "SymmetricWithPower2Scale quantization should have offset 0");
+    assert(isFloatPowerOf2(qParams.scale) &&
+           "SymmetricWithPower2Scale quantization parameter should be a power "
+           "of 2");
+  }
+}
+
+TensorQuantizationParams
+chooseQuantizationParams(TensorProfilingParams profParams, Schema schema,
+                         ElemKind qTy, Calibration calibration) {
+  float min = profParams.min;
+  float max = profParams.max;
+  assert(min <= max && "min must not be bigger than max");
+
+  // Get the quantized range.
+  auto minMaxPair = getQuantizedRange(qTy);
+  int64_t qmin = minMaxPair.first;
+  int64_t qmax = minMaxPair.second;
 
   // We extend the [min, max] interval to ensure that it contains 0.
   // Otherwise, we would not meet the requirement that 0 be an exactly
@@ -277,9 +374,11 @@ TensorQuantizationParams chooseQuantizationParams(float min, float max,
       schema = quantization::Schema::Symmetric;
     }
   }
-  if (schema == quantization::Schema::Symmetric) {
+  if (schema == quantization::Schema::Symmetric ||
+      schema == quantization::Schema::SymmetricWithPower2Scale) {
     // Check which end saturates the output dynamic range earlier
     // and extend the other end to map the zero-point to quantized 0.
+    assert(qmin < 0 && "Symmetric schema incompatible with unsigned range");
     double rmin = min / (double)qmin;
     double rmax = max / (double)qmax;
     if (rmin > rmax) {
@@ -292,6 +391,30 @@ TensorQuantizationParams chooseQuantizationParams(float min, float max,
   min = std::max(min, std::numeric_limits<float>::lowest());
   max = std::min(max, std::numeric_limits<float>::max());
 
+  // Calibrate the min/max range (for non-zero ranges only).
+  if ((profParams.min != profParams.max) && (min != max) &&
+      (calibration == Calibration::KLMinimization)) {
+
+    // Rescale the profiled histogram with the new constrained min/max range.
+    auto histRescaled = rescaleHistogram(profParams.histogram, profParams.min,
+                                         profParams.max, min, max);
+
+    // Number of quantized bins. Default value from TVM / MXNet.
+    const size_t numQuantizedBins = 255;
+
+    // Check symmetric schema.
+    const bool symmetric = (schema != Asymmetric);
+
+    // Optimize the range.
+    FloatRange rangeOpt =
+        optimizeKL(histRescaled, min, max, numQuantizedBins, symmetric);
+
+    // Update the min/max range with the optimized range.
+    min = rangeOpt.first;
+    max = rangeOpt.second;
+  }
+
+  // Compute scale.
   double scale = ((double)max - min) / ((double)qmax - qmin);
 
   // Dequantization uses the following formula scale * (X - offset), so
@@ -338,17 +461,13 @@ TensorQuantizationParams chooseQuantizationParams(float min, float max,
     nudgedZeroPoint = static_cast<int32_t>(round(initialZeroPoint));
   }
 
-  TensorQuantizationParams result{static_cast<float>(scale), nudgedZeroPoint};
-  // The only valid offset for symmetric quantization is 0.
-  assert((result.offset == 0 || schema != quantization::Schema::Symmetric) &&
-         "Symmetric quantization should be centered on 0");
+  // For SymmetricWithPower2Scale, round scale to nearest higher power of 2.
+  if (schema == quantization::Schema::SymmetricWithPower2Scale) {
+    scale = std::exp2(std::ceil(std::log2(scale)));
+  }
 
-  // The only valid offsets for symmetric quantization with unsigned support are
-  // 0 and qmin.
-  assert((result.offset == qmin || result.offset == 0 ||
-          schema != quantization::Schema::SymmetricWithUnsigned) &&
-         "Symmetric quantization with unsigned should be centered on 0 or on "
-         "-qmin");
+  TensorQuantizationParams result{static_cast<float>(scale), nudgedZeroPoint};
+  validateQuantizationParams(result, schema, qTy);
   return result;
 }
 
@@ -377,50 +496,13 @@ std::vector<int8_t> createMapping(TypeRef inTy, TypeRef outTy,
   return mapping;
 }
 
-void tensorFusedRowwiseQuantization(const Tensor &input, Tensor &output) {
-  // We are fusing the float scale and int32_t offset onto the end of each
-  // row. Thus input and output must both be 2 dimensional, with output having 8
-  // extra columns for 4 bytes for float scale, and 4 bytes for int32_t offset.
-  assert(input.dims().size() == 2 && output.dims().size() == 2 &&
-         "Input and output must be 2 dimensional.");
-  assert(input.dims()[1] + 8 == output.dims()[1] &&
-         "Output must have 8 more columns than input.");
-
-  const size_t outWidth = output.dims()[1];
-  char *dataBasePtr = output.getUnsafePtr();
-
-  auto srcH = input.getHandle<float>();
-  auto destH = output.getHandle<uint8_t>();
-  for (size_t i = 0, e = input.dims()[0]; i < e; i++) {
-    auto slice = srcH.extractSlice(i);
-    auto rSrc = slice.getHandle<float>();
-    auto res = rSrc.minMaxArg();
-    float min = rSrc.raw(res.first);
-    float max = rSrc.raw(res.second);
-
-    min = std::min(min, 0.0f);
-    max = std::max(max, 0.0f);
-
-    // This matches the Caffe2 implementation for FloatToRowwiseQuantized8BitsOp
-    // found in operators/lengths_reducer_rowwise_8bit_ops.h.
-    constexpr float kEqualityThreshold = 1e-10f;
-    const float scale = ((max - min) < kEqualityThreshold)
-                            ? 1.0
-                            : ((double)max - (double)min) / 255.0;
-    const float offset = min;
-
-    for (size_t j = 0, f = input.dims()[1]; j < f; j++) {
-      destH.at({i, j}) = quantization::quantizeWithFloatOffset<uint8_t>(
-          srcH.at({i, j}), scale, offset);
-    }
-
-    // Now set the scale/offset at the end of each row.
-    char *currRowScaleOffsetPtr =
-        dataBasePtr + (i + 1) * outWidth - 2 * sizeof(float);
-    memcpy(currRowScaleOffsetPtr, &scale, sizeof(float));
-    memcpy(currRowScaleOffsetPtr + sizeof(float), &offset, sizeof(float));
-  }
+bool isFloatPowerOf2(float val) {
+  // frexp returns mantissa normalized in [0.5,1) so compare with 0.5.
+  int exp;
+  return (std::abs(std::frexp(val, &exp)) == 0.5);
 }
+
+int getFloat2Exp(float val) { return std::ilogb(val); }
 
 } // namespace quantization
 } // namespace glow

@@ -18,7 +18,9 @@ target_link_libraries(LLVMIRCodeGen
                         CodeGen
                         Graph
                         IR
-                        Optimizer
+                        IROptimizer
+                        IROptimizerPipeline
+                        GraphOptimizerPipeline
                         QuantizationBase
                         ${LLVM_TARGET_LIBRARIES}
                         LLVMAnalysis

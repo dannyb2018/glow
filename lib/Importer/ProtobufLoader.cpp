@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,16 +15,62 @@
  */
 
 #include "glow/Importer/ProtobufLoader.h"
-
+#include "llvm/Support/CommandLine.h"
 #include <string>
 
 namespace glow {
+
+llvm::cl::OptionCategory loaderOptCat("Model Loader Options");
+
+static llvm::cl::opt<bool> isConstFoldLoaderOps(
+    "const-fold-ops",
+    llvm::cl::desc(
+        "Performs constant folding on ONNX and Caffe Operators while loading."),
+    llvm::cl::init(true), llvm::cl::cat(loaderOptCat));
 
 bool isArrayConstant(llvm::ArrayRef<size_t> a) {
   for (size_t i = 1; i < a.size(); i++)
     if (a[0] != a[i])
       return false;
   return true;
+}
+
+void setConstantFoldLoaderOpsFlag(bool flag) { isConstFoldLoaderOps = flag; }
+
+bool getConstantFoldLoaderOpsFlag() { return isConstFoldLoaderOps; }
+
+bool ProtobufLoader::isConstantFoldable(llvm::ArrayRef<NodeValue> inputs,
+                                        std::string typeName) const {
+  int numInputs = inputs.size();
+  if (!getConstantFoldLoaderOpsFlag()) {
+    return false;
+  }
+  // foldUnsupportedTypes: List of typenames unsupported for folding.
+  std::string foldUnsupportedTypes[] = {"Constant"};
+  std::string *findType = std::find(std::begin(foldUnsupportedTypes),
+                                    std::end(foldUnsupportedTypes), typeName);
+  // Early exit if folding is not supported for current operator.
+  if (findType != std::end(foldUnsupportedTypes)) {
+    return false;
+  }
+
+  // If all the inputs to the operator are constant this op can be folded.
+  for (int i = 0; i < numInputs; i++) {
+    if (inputs[i].getNode()->getKind() != Kinded::Kind::ConstantKind) {
+      return false;
+    }
+  }
+  return true;
+}
+
+Placeholder *
+ProtobufLoader::getStaticPlaceholderByNameOrNull(llvm::StringRef name) const {
+  auto it = nodeValueByName_.find(name);
+  if (it == nodeValueByName_.end()) {
+    return nullptr;
+  }
+  auto *res = llvm::dyn_cast<Placeholder>(it->second.getNode());
+  return (res && res->isStatic()) ? res : nullptr;
 }
 
 Constant *ProtobufLoader::getConstantByNameOrNull(llvm::StringRef name) const {
@@ -36,7 +82,7 @@ Constant *ProtobufLoader::getConstantByNameOrNull(llvm::StringRef name) const {
   return res ? res : nullptr;
 }
 
-llvm::Expected<Constant *>
+Expected<Constant *>
 ProtobufLoader::getConstantByName(llvm::StringRef name) const {
   auto *ptr = getConstantByNameOrNull(name);
   RETURN_ERR_IF_NOT(
@@ -48,7 +94,19 @@ bool ProtobufLoader::hasConstantByName(llvm::StringRef name) const {
   return getConstantByNameOrNull(name) != nullptr;
 }
 
-llvm::Expected<Placeholder *>
+Expected<Placeholder *> ProtobufLoader::getSingleOutput() const {
+  RETURN_ERR_IF_NOT(outputVarsByName_.size() == 1,
+                    "There must be only one output.");
+  return outputVarsByName_.begin()->second;
+}
+
+Expected<Placeholder *> ProtobufLoader::getSingleInput() const {
+  RETURN_ERR_IF_NOT(inputVarsByName_.size() == 1,
+                    "There must be only one input.");
+  return inputVarsByName_.begin()->second;
+}
+
+Expected<Placeholder *>
 ProtobufLoader::getOutputByName(llvm::StringRef name) const {
   auto it = outputVarsByName_.find(name);
   RETURN_ERR_IF_NOT(
@@ -58,39 +116,83 @@ ProtobufLoader::getOutputByName(llvm::StringRef name) const {
   return it->second;
 }
 
-NodeValue
-ProtobufLoader::getNodeValueByNameOrNullNodeValue(llvm::StringRef name) const {
-  auto it = nodeValueByName_.find(name);
-  if (it != nodeValueByName_.end()) {
-    return it->second;
-  }
-
-  return NodeValue(nullptr);
+Expected<Placeholder *>
+ProtobufLoader::getInputByName(llvm::StringRef name) const {
+  auto it = inputVarsByName_.find(name);
+  RETURN_ERR_IF_NOT(
+      it != inputVarsByName_.end(),
+      llvm::Twine("No external input Variable was registered with name ", name)
+          .str());
+  return it->second;
 }
 
-llvm::Expected<NodeValue>
-ProtobufLoader::getNodeValueByName(llvm::StringRef name) const {
+NodeValue
+ProtobufLoader::getNodeValueByNameOrNullNodeValue(llvm::StringRef name,
+                                                  bool ignoreSrcFun) {
+  auto it = nodeValueByName_.find(name);
+  if (it == nodeValueByName_.end()) {
+    return NodeValue(nullptr);
+  }
+
+  // Always return the NV of a storage Node since Storage lives in the Module
+  // and is accessible to any Node.
+  NodeValue NV = it->second;
+  if (llvm::isa<Storage>(NV)) {
+    return NV;
+  }
+
+  // Check if the current Function G_ we are loading into is the same as the
+  // Function of the NV we found; if so then return it.
+  Function *srcF = NV.getNode()->getParent();
+  if (srcF == G_ || ignoreSrcFun) {
+    return NV;
+  }
+
+  // Otherwise we must be looking up a NV from a different Function in the
+  // Module, so look for an intermediate Placeholder linking the two if it
+  // exists, or otherwise create one and remember it.
+  assert(partNameToFun_.size() > 0 &&
+         "Must be loading a pre-partitioned model.");
+  auto itPH = intermediatePHsByName_.find(name);
+  Placeholder *intermedPH = nullptr;
+  // Create the intermediate PH and SaveNode if it does not yet exist. Note that
+  // we store these intermediate PHs separately from nodeValueByName_ because we
+  // want future users from the same Function as the NV to still use the Node
+  // directly through nodeValueByName_.
+  if (itPH == intermediatePHsByName_.end()) {
+    auto *save = srcF->createSave("tmp_" + NV.getNode()->getName().str(), NV);
+    intermedPH = save->getPlaceholder();
+    intermediatePHsByName_[name] = intermedPH;
+  } else {
+    intermedPH = itPH->second;
+  }
+  return intermedPH->getOutput();
+}
+
+Expected<NodeValue> ProtobufLoader::getNodeValueByName(llvm::StringRef name,
+                                                       bool ignoreSrcFun) {
   RETURN_ERR_IF_NOT(hasNodeByName(name),
                     llvm::Twine("No node under name ", name).str());
-  auto node = getNodeValueByNameOrNullNodeValue(name);
+  auto node = getNodeValueByNameOrNullNodeValue(name, ignoreSrcFun);
   RETURN_ERR_IF_NOT(node.getNode(), "Null is under that name??");
   return node;
 }
 
-llvm::Error ProtobufLoader::createAndRegisterConstant(llvm::StringRef name,
-                                                      Tensor &&tensor) {
+Error ProtobufLoader::createAndRegisterConstant(llvm::StringRef name,
+                                                Tensor &&tensor,
+                                                const std::string &layout) {
   auto it = nodeValueByName_.find(name);
   if (it != nodeValueByName_.end()) {
     if (llvm::dyn_cast<Placeholder>(it->second.getNode())) {
       // Placeholders take precedence over Constants.
-      return llvm::Error::success();
+      return Error::success();
     }
   }
   // Note: We do not support training from models loaded from protos, so
   // trainable is always set to false here.
-  Constant *node = G_.getParent()->createConstant(name, std::move(tensor));
+  Constant *node = mod_.createConstant(name, std::move(tensor), layout);
   nodeValueByName_[name] = node->getOutput();
-  return llvm::Error::success();
+  return Error::success();
 }
 
 void ProtobufLoader::deleteUnusedConstants() {
@@ -109,29 +211,44 @@ void ProtobufLoader::deleteUnusedConstants() {
     auto *c = llvm::dyn_cast<Constant>(it->second.getNode());
     DCHECK(c) << "NodeValue with name " << name
               << " was expected to have been a Constant";
-    G_.getParent()->eraseConstant(c);
+    mod_.eraseConstant(c);
     nodeValueByName_.erase(it);
   }
 }
 
-llvm::Expected<Placeholder *>
-ProtobufLoader::createAndRegisterPlaceholder(llvm::StringRef name, TypeRef T) {
+Expected<Placeholder *>
+ProtobufLoader::createAndRegisterPlaceholder(llvm::StringRef name, TypeRef T,
+                                             bool isStatic, bool isTrainable,
+                                             const std::string &layout) {
   RETURN_ERR_IF_NOT(
       !hasNodeByName(name),
       llvm::Twine("Creating an already existing node ", name).str());
-  Placeholder *node = G_.getParent()->createPlaceholder(T, name, false);
+  Placeholder *node = mod_.createPlaceholder(T, name, isTrainable, layout);
+  node->setStatic(isStatic);
   nodeValueByName_[name] = node->getOutput();
   return node;
 }
 
 bool ProtobufLoader::hasNodeByName(llvm::StringRef name) const {
-  return getNodeValueByNameOrNullNodeValue(name).getNode() != nullptr;
+  return nodeValueByName_.find(name) != nodeValueByName_.end();
 }
 
 ProtobufLoader::ProtobufLoader(llvm::ArrayRef<const char *> tensorNames,
-                               llvm::ArrayRef<TypeRef> types, Function &F,
-                               llvm::Error *errPtr)
-    : G_(F) {
+                               llvm::ArrayRef<TypeRef> types, Module &mod,
+                               Error *errPtr)
+    : G_(nullptr), mod_(mod) {
+  setupLoader(tensorNames, types, errPtr);
+}
+
+ProtobufLoader::ProtobufLoader(llvm::ArrayRef<const char *> tensorNames,
+                               llvm::ArrayRef<TypeRef> types, Function *F,
+                               Error *errPtr)
+    : G_(F), mod_(*F->getParent()) {
+  setupLoader(tensorNames, types, errPtr);
+}
+
+void ProtobufLoader::setupLoader(llvm::ArrayRef<const char *> tensorNames,
+                                 llvm::ArrayRef<TypeRef> types, Error *errPtr) {
   // Verify that the version of the library that we linked against is
   // compatible with the version of the headers we compiled against.
   GOOGLE_PROTOBUF_VERIFY_VERSION;
@@ -141,21 +258,24 @@ ProtobufLoader::ProtobufLoader(llvm::ArrayRef<const char *> tensorNames,
     return;
   }
 
-  // Lambda to setup the ProtobufLoader and return any llvm::Errors that were
+  // Use the global flag as default. This may be overridden by instantiations of
+  // the loader later on.
+  constFoldInLoader_ = getConstantFoldLoaderOpsFlag();
+
+  // Lambda to setup the ProtobufLoader and return any Errors that were
   // raised.
-  auto setup = [&]() -> llvm::Error {
+  auto setup = [&]() -> Error {
     RETURN_ERR_IF_NOT(tensorNames.size() == types.size(),
                       "Invalid initialization list");
     for (size_t i = 0, e = tensorNames.size(); i < e; i++) {
       RETURN_ERR_IF_NOT(!hasNodeByName(tensorNames[i]),
                         "Input names have duplicate");
-      auto placeholderOrErr =
-          createAndRegisterPlaceholder(tensorNames[i], types[i]);
-      if (!placeholderOrErr) {
-        return placeholderOrErr.takeError();
-      }
+      Placeholder *placeholder;
+      ASSIGN_VALUE_OR_RETURN_ERR(
+          placeholder, createAndRegisterPlaceholder(tensorNames[i], types[i]));
+      inputVarsByName_.try_emplace(tensorNames[i], placeholder);
     }
-    return llvm::Error::success();
+    return Error::success();
   };
 
   if (errPtr) {

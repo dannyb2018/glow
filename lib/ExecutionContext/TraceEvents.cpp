@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,10 @@
  */
 
 #include "glow/ExecutionContext/TraceEvents.h"
+#include "glow/ExecutionContext/ExecutionContext.h"
+#include "glow/Support/ThreadPool.h"
 
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <atomic>
@@ -23,93 +26,158 @@
 
 namespace glow {
 
+void writeMetadataHelper(llvm::raw_fd_ostream &file, llvm::StringRef type,
+                         int id, llvm::StringRef name) {
+  file << "{\"cat\": \"__metadata\", \"ph\":\"" << TraceEvent::MetadataType
+       << "\", \"ts\":0, \"pid\":0, \"tid\":" << id << ", \"name\":\""
+       << type.str() << "\", \"args\": {\"name\":\"" << name.str()
+       << "\"} },\n";
+}
+
 void TraceEvent::dumpTraceEvents(
-    std::vector<TraceEvent> &events, llvm::StringRef filename,
+    std::list<TraceEvent> &events, llvm::StringRef filename,
     const std::string &processName,
     const std::map<int, std::string> &threadNames) {
   llvm::errs() << "dumping " << events.size() << " trace events to "
                << filename.str() << ".\n";
 
   auto process = processName.empty() ? "glow" : processName;
+  std::error_code EC;
+  llvm::raw_fd_ostream file(filename, EC);
 
-  std::ofstream file(filename);
+  // Print an error message if the output stream can't be created.
+  if (EC) {
+    llvm::errs() << "Unable to open file " << filename << "\n";
+    return;
+  }
+
   file << "[\n";
+  /// Set up process name metadata.
+  writeMetadataHelper(file, "process_name", 0,
+                      processName.empty() ? "glow" : processName);
+
+  /// And thread name metadata.
+  for (const auto &nameMap : threadNames) {
+    // Put thread name ahead of thread ID so chrome will group thread with the
+    // same prefix together.
+    writeMetadataHelper(
+        file, "thread_name", nameMap.first,
+        llvm::formatv("{1}: {0}", nameMap.first, nameMap.second).str());
+  }
+
+  bool first{true};
   for (const auto &event : events) {
+    file << (first ? "" : ",\n");
+    first = false;
+
     file << "{\"name\": \"" << event.name;
-    file << "\", \"cat\": \"glow\",";
+    file << "\", \"cat\": \"" << traceLevelToString(event.level) << "\",";
     file << "\"ph\": \"" << event.type;
     file << "\", \"ts\": " << event.timestamp;
-    file << ", \"pid\": \"" << process << "\"";
-
-    auto nameIt = threadNames.find(event.tid);
-    if (nameIt != threadNames.end()) {
-      file << ", \"tid\": \"" << nameIt->second << "\"";
-    } else {
-      file << ", \"tid\": " << event.tid;
-    }
+    file << ", \"pid\": 0";
+    file << ", \"tid\": " << event.tid;
 
     if (event.type == CompleteType) {
       file << ", \"dur\": " << event.duration;
     }
 
+    if (event.id != -1) {
+      file << ", \"id\": \"" << event.id << "\"";
+    }
+
     if (!event.args.empty()) {
       file << ", \"args\": {";
-      bool first{true};
+      bool firstArg{true};
       for (auto &pair : event.args) {
         // Start with a comma unless it's the first item in the list.
-        file << (first ? "" : ", ");
-        first = false;
+        file << (firstArg ? "" : ", ");
+        firstArg = false;
         file << "\"" << pair.first << "\" : \"" << pair.second << "\"";
       }
       file << "}";
     }
-    file << "},\n";
+    file << "}";
   }
-  // Skip the ending bracket since that is allowed.
+  file << "\n]";
   file.close();
 }
 
 uint64_t TraceEvent::now() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
-             std::chrono::system_clock::now().time_since_epoch())
+             std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
 
-size_t TraceEvent::getThreadId() {
-  static std::atomic<std::size_t> thread_idx{0};
-  thread_local std::size_t id = thread_idx++;
-  return id;
+llvm::StringRef TraceEvent::traceLevelToString(TraceLevel level) {
+  switch (level) {
+  case NONE:
+    return "None";
+  case REQUEST:
+    return "Request";
+  case RUNTIME:
+    return "Runtime";
+  case COPY:
+    return "Copy";
+  case OPERATOR:
+    return "Operator";
+  case DEBUG:
+    return "Debug";
+  case STANDARD:
+    return "Standard";
+  }
+
+  return "Unknown";
 }
 
 void TraceContext::logTraceEvent(
-    llvm::StringRef name, llvm::StringRef type,
-    std::map<std::string, std::string> additionalAttributes) {
-  logTraceEvent(name, type, TraceEvent::now(), std::move(additionalAttributes));
+    llvm::StringRef name, TraceLevel level, char type,
+    std::map<std::string, std::string> additionalAttributes, size_t tid,
+    int id) {
+  logTraceEvent(name, level, type, TraceEvent::now(),
+                std::move(additionalAttributes), tid, id);
 }
 
 void TraceContext::logTraceEvent(
-    llvm::StringRef name, llvm::StringRef type, uint64_t timestamp,
-    std::map<std::string, std::string> additionalAttributes) {
-  if (traceLevel_ == TraceLevel::NONE || traceLevel_ == TraceLevel::OPERATOR) {
+    llvm::StringRef name, TraceLevel level, char type, uint64_t timestamp,
+    std::map<std::string, std::string> additionalAttributes, size_t tid,
+    int id) {
+  if (!shouldLog(level)) {
     return;
   }
-  TraceEvent ev(name, timestamp, type, TraceEvent::getThreadId(),
-                std::move(additionalAttributes));
+
+  TraceEvent ev(name, level, timestamp, type, tid,
+                std::move(additionalAttributes), id);
   {
     std::lock_guard<std::mutex> l(lock_);
     traceEvents_.push_back(std::move(ev));
   }
 }
 
+void TraceContext::logTraceEvent(TraceEvent &&ev) {
+  if (!shouldLog(ev.level)) {
+    return;
+  }
+  std::lock_guard<std::mutex> l(lock_);
+  traceEvents_.push_back(std::move(ev));
+}
+
 void TraceContext::logCompleteTraceEvent(
-    llvm::StringRef name, uint64_t startTimestamp,
+    llvm::StringRef name, TraceLevel level, uint64_t startTimestamp,
     std::map<std::string, std::string> additionalAttributes) {
-  if (traceLevel_ == TraceLevel::NONE || traceLevel_ == TraceLevel::OPERATOR) {
+  this->logCompleteTraceEvent(name, level, startTimestamp,
+                              std::move(additionalAttributes),
+                              threads::getThreadId());
+}
+
+void TraceContext::logCompleteTraceEvent(
+    llvm::StringRef name, TraceLevel level, uint64_t startTimestamp,
+    std::map<std::string, std::string> additionalAttributes, size_t tid) {
+  if (!shouldLog(level)) {
     return;
   }
 
-  TraceEvent ev(name, startTimestamp, TraceEvent::now() - startTimestamp,
-                TraceEvent::getThreadId(), std::move(additionalAttributes));
+  TraceEvent ev(name, level, startTimestamp, TraceEvent::now() - startTimestamp,
+                tid, std::move(additionalAttributes));
   {
     std::lock_guard<std::mutex> l(lock_);
     traceEvents_.push_back(std::move(ev));
@@ -117,7 +185,12 @@ void TraceContext::logCompleteTraceEvent(
 }
 
 void TraceContext::setThreadName(int tid, llvm::StringRef name) {
+  std::lock_guard<std::mutex> l(lock_);
   threadNames_[tid] = name;
+}
+
+void TraceContext::setThreadName(llvm::StringRef name) {
+  setThreadName(threads::getThreadId(), name);
 }
 
 void TraceContext::dump(llvm::StringRef filename,
@@ -131,19 +204,26 @@ void TraceContext::merge(TraceContext *other) {
   auto &newEvents = other->getTraceEvents();
   std::move(newEvents.begin(), newEvents.end(),
             std::back_inserter(getTraceEvents()));
+  newEvents.clear();
   auto &names = other->getThreadNames();
   threadNames_.insert(names.begin(), names.end());
   names.clear();
 }
 
-ScopedTraceBlock::ScopedTraceBlock(TraceContext *context, llvm::StringRef name)
-    : context_(context), name_(name) {
+ScopedTraceBlock::ScopedTraceBlock(TraceContext *context, TraceLevel level,
+                                   llvm::StringRef name)
+    : context_(context), level_(level), name_(name) {
   startTimestamp_ = TraceEvent::now();
 
   // A local memory fence to prevent the compiler reordering instructions to
   // before taking the start timestamp.
   std::atomic_signal_fence(std::memory_order_seq_cst);
 }
+
+ScopedTraceBlock::ScopedTraceBlock(ExecutionContext *context, TraceLevel level,
+                                   llvm::StringRef name)
+    : ScopedTraceBlock(context ? context->getTraceContext() : nullptr, level,
+                       name) {}
 
 ScopedTraceBlock::~ScopedTraceBlock() { end(); }
 
@@ -159,7 +239,8 @@ void ScopedTraceBlock::end() {
   std::atomic_signal_fence(std::memory_order_seq_cst);
 
   if (!end_ && context_) {
-    context_->logCompleteTraceEvent(name_, startTimestamp_, std::move(args_));
+    context_->logCompleteTraceEvent(name_, level_, startTimestamp_,
+                                    std::move(args_));
   }
   end_ = true;
 }

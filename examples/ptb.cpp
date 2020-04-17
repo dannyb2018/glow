@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,13 +36,10 @@ using llvm::format;
 
 namespace {
 llvm::cl::OptionCategory ptbCat("PTB Options");
-llvm::cl::opt<BackendKind> executionBackend(
-    llvm::cl::desc("Backend to use:"), llvm::cl::Optional,
-    llvm::cl::values(clEnumValN(BackendKind::Interpreter, "interpreter",
-                                "Use interpreter (default option)"),
-                     clEnumValN(BackendKind::CPU, "cpu", "Use CPU"),
-                     clEnumValN(BackendKind::OpenCL, "opencl", "Use OpenCL")),
-    llvm::cl::init(BackendKind::Interpreter), llvm::cl::cat(ptbCat));
+llvm::cl::opt<std::string> executionBackend(
+    "backend",
+    llvm::cl::desc("Backend to use, e.g., Interpreter, CPU, OpenCL:"),
+    llvm::cl::Optional, llvm::cl::init("Interpreter"), llvm::cl::cat(ptbCat));
 
 llvm::cl::opt<std::string> dumpInitialGraphDAGFileOpt(
     "dumpInitialGraphDAG",
@@ -58,8 +55,8 @@ llvm::cl::opt<std::string> dumpTrainingGraphDAGFileOpt(
 
 } // namespace
 
-unsigned loadPTB(Tensor &inputWords, Tensor &targetWords, size_t numSteps,
-                 size_t vocabSize, size_t minibatchSize, size_t maxNumWords) {
+unsigned loadPTB(Tensor &inputWords, Tensor &targetWords, dim_t numSteps,
+                 dim_t vocabSize, dim_t minibatchSize, dim_t maxNumWords) {
 
   std::ifstream ptbInput("ptb/simple-examples/data/ptb.train.txt");
   CHECK(ptbInput.is_open()) << "Error loading ptb.train.txt";
@@ -115,9 +112,9 @@ unsigned loadPTB(Tensor &inputWords, Tensor &targetWords, size_t numSteps,
   }
 
   // Load the PTB database into two 3d tensors for word inputs and targets.
-  size_t batchLength = numWords / minibatchSize;
-  size_t numBatches = (batchLength - 1) / numSteps;
-  size_t numSequences = minibatchSize * numBatches;
+  dim_t batchLength = numWords / minibatchSize;
+  dim_t numBatches = (batchLength - 1) / numSteps;
+  dim_t numSequences = minibatchSize * numBatches;
 
   // While we dont have embedding, we are using one-hot encoding to represent
   // input words. To limit the size of the data we use an upper bound on the
@@ -128,7 +125,7 @@ unsigned loadPTB(Tensor &inputWords, Tensor &targetWords, size_t numSteps,
   auto TIH = targetWords.getHandle<int64_t>();
   for (unsigned batch = 0; batch < minibatchSize; batch++) {
     for (unsigned iter = 0; iter < numBatches; iter++) {
-      size_t sequence = batch + iter * minibatchSize;
+      dim_t sequence = batch + iter * minibatchSize;
       for (unsigned step = 0; step < numSteps; step++) {
         int wordCounterId = step + iter * numSteps + batch * batchLength;
         const std::string word1 = words[wordCounterId];
@@ -172,13 +169,13 @@ void testPTB() {
   Tensor inputWords;
   Tensor targetWords;
 
-  const size_t minibatchSize = 10;
-  const size_t numSteps = 10;
-  const size_t numEpochs = 20;
+  const dim_t minibatchSize = 10;
+  const dim_t numSteps = 10;
+  const dim_t numEpochs = 20;
 
-  const size_t hiddenSize = 20;
-  const size_t vocabSize = 500;
-  const size_t maxNumWords = 10000;
+  const dim_t hiddenSize = 20;
+  const dim_t vocabSize = 500;
+  const dim_t maxNumWords = 10000;
 
   float learningRate = .1;
 
@@ -234,8 +231,10 @@ void testPTB() {
   }
 
   Function *TF = glow::differentiate(F, TC);
+  auto tfName = TF->getName();
 
-  EE.compile(CompilationMode::Train, TF);
+  EE.compile(CompilationMode::Train);
+  bindings.allocate(mod.getPlaceholders());
 
   if (!dumpTrainingGraphDAGFileOpt.empty()) {
     LOG(INFO) << "Dumping training graph";
@@ -272,12 +271,12 @@ void testPTB() {
                                              minibatchSize * batch);
 
       runBatch(EE, bindings, 1, sampleCounter, {X, Y},
-               {&inputWordsBatch, &targetWordsBatch});
-      for (size_t step = 0; step < numSteps; step++) {
+               {&inputWordsBatch, &targetWordsBatch}, tfName);
+      for (dim_t step = 0; step < numSteps; step++) {
         for (unsigned int i = 0; i < minibatchSize; i++) {
           auto T =
               result->getHandle<float>().extractSlice(step * minibatchSize + i);
-          size_t correct = targetWords.getHandle<int64_t>().at(
+          dim_t correct = targetWords.getHandle<dim_t>().at(
               {minibatchSize * batch + i, step});
           float soft_guess = -std::log(T.getHandle<float>().at({correct}));
           perplexity += soft_guess;

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright (c) 2017-present, Facebook, Inc.
+# Copyright (c) Glow Contributors. See CONTRIBUTORS file.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,4 +17,4 @@
 set -euxo pipefail
 
 # CHECK: ich liebe Musik \.$
-$BIN/text-translator -m "${MODELS_DIR}/en2gr" -cpu -cpu-memory=500000 -num-devices=2 <<< "I love music ."
+$BIN/text-translator -m "${MODELS_DIR}/en2gr" -backend=CPU -cpu-memory=500000 -num-devices=2 <<< "I love music ."

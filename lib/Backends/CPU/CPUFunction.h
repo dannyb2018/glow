@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,17 +28,15 @@ namespace glow {
 class CPUFunction final : public LLVMCompiledFunction {
 public:
   CPUFunction(std::unique_ptr<llvm::orc::GlowJIT> JIT,
-              const runtime::RuntimeBundle &runtimeBundle);
+              runtime::RuntimeBundle &&runtimeBundle);
 
   /// \name CompiledFunction interface
   ///@{
   ~CPUFunction() override = default;
-  llvm::Error execute(ExecutionContext *context) override;
+  Error execute(ExecutionContext *context) override;
 
-  /// \returns the Kind of Backend used to compile this function.
-  virtual BackendKind getCompileBackendKind() const override {
-    return BackendKind::CPU;
-  }
+  /// \returns the backend used to compile this function.
+  virtual std::string getCompileBackendName() const override { return "CPU"; }
   ///@}
   //
 };

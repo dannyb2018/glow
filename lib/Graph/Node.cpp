@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,14 +27,18 @@ void Node::setPredicate(const NodeValue &P) { predicate_ = P; }
 bool Node::hasPredicate() const { return predicate_.getNode(); }
 
 TypeRef Node::getType(unsigned idx) const {
-  assert(idx < numRes_ && "Result number does not exist.");
+  assert(idx < getNumResults() && "Result number does not exist.");
   return types_[idx];
 }
 
 void Node::setType(unsigned idx, TypeRef ty) {
-  assert(idx < numRes_ && "Result number does not exist.");
   assert(types_[idx]->dims() == ty->dims() &&
          "Better create a new node at this point");
+  setTypeUnsafe(idx, ty);
+}
+
+void Node::setTypeUnsafe(unsigned idx, TypeRef ty) {
+  assert(idx < getNumResults() && "Result number does not exist.");
   types_[idx] = ty;
 }
 
@@ -43,15 +47,12 @@ ElemKind Node::getElementType(unsigned resNo) const {
   return TR->getElementType();
 }
 
-llvm::ArrayRef<size_t> Node::dims(unsigned resNo) const {
+llvm::ArrayRef<dim_t> Node::dims(unsigned resNo) const {
   TypeRef TR = getType(resNo);
   return TR->dims();
 }
 
-void Node::addResult(TypeRef T) {
-  assert(numRes_ < maxNodeResno_ && "Too many results");
-  types_[numRes_++] = T;
-}
+void Node::addResult(TypeRef T) { types_.push_back(T); }
 
 bool Node::isEqual(const Node &other) const {
   if (this == &other)
@@ -167,6 +168,8 @@ void Node::setNthInput(unsigned idx, NodeValue val) {
   switch (getKind()) {
 #define DEF_NODE(CLASS, NAME)                                                  \
   case glow::Kinded::Kind::CLASS##Kind:                                        \
+    getParent()->getLogContext()->logNodeInputChange(                          \
+        *this, this->getNthInput(idx), val);                                   \
     return static_cast<CLASS *>(this)->setNthInput(idx, val);
 #include "glow/AutoGenNodes.def"
   default:
@@ -200,6 +203,28 @@ bool Node::hasSideEffects() const {
 #define DEF_NODE(CLASS, NAME)                                                  \
   case glow::Kinded::Kind::CLASS##Kind:                                        \
     return static_cast<const CLASS *>(this)->hasSideEffects();
+#include "glow/AutoGenNodes.def"
+  default:
+    llvm_unreachable("Unhandled node");
+  }
+}
+
+bool Node::isCanonical() const {
+  switch (getKind()) {
+#define DEF_NODE(CLASS, NAME)                                                  \
+  case glow::Kinded::Kind::CLASS##Kind:                                        \
+    return static_cast<const CLASS *>(this)->isCanonical();
+#include "glow/AutoGenNodes.def"
+  default:
+    llvm_unreachable("Unhandled node");
+  }
+}
+
+bool Node::isDataParallel() const {
+  switch (getKind()) {
+#define DEF_NODE(CLASS, NAME)                                                  \
+  case glow::Kinded::Kind::CLASS##Kind:                                        \
+    return static_cast<const CLASS *>(this)->isDataParallel();
 #include "glow/AutoGenNodes.def"
   default:
     llvm_unreachable("Unhandled node");

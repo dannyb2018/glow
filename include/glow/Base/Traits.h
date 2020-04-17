@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,6 +46,13 @@ public:
   }
 };
 
+/// Use to sort named classes by their name.
+struct SortNamed {
+  inline bool operator()(const Named *named1, const Named *named2) const {
+    return named1->compareByName(*named2);
+  }
+};
+
 /// Subclasses of this class have a type associated with them.
 class Typed {
 private:
@@ -56,7 +63,7 @@ public:
 
   TypeRef getType() const { return Ty_; }
 
-  llvm::ArrayRef<size_t> dims() const { return Ty_->dims(); }
+  llvm::ArrayRef<dim_t> dims() const { return Ty_->dims(); }
 
   size_t size() const { return Ty_->size(); }
 
@@ -106,6 +113,13 @@ public:
 };
 
 using KindSet = llvm::SmallSet<Kinded::Kind, 4>;
+
+/// Subclasses of this class represent an IR container, e.g. a function or a
+/// module.
+class IRContainer : public Named {
+public:
+  IRContainer(llvm::StringRef name) : Named(name) {}
+};
 
 } // namespace glow
 

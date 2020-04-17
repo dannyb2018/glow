@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 #include "glow/ExecutionEngine/ExecutionEngine.h"
 #include "glow/Graph/Graph.h"
+#include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
 #include "glow/Quantization/Quantization.h"
 #include "glow/Quantization/Serialization.h"
 
@@ -60,13 +61,10 @@ llvm::cl::opt<bool>
                            "the file directly."),
             llvm::cl::Optional, llvm::cl::cat(fr2enCat));
 
-llvm::cl::opt<BackendKind> ExecutionBackend(
-    llvm::cl::desc("Backend to use:"), llvm::cl::Optional,
-    llvm::cl::values(clEnumValN(BackendKind::Interpreter, "interpreter",
-                                "Use interpreter"),
-                     clEnumValN(BackendKind::CPU, "cpu", "Use CPU"),
-                     clEnumValN(BackendKind::OpenCL, "opencl", "Use OpenCL")),
-    llvm::cl::init(BackendKind::Interpreter), llvm::cl::cat(fr2enCat));
+llvm::cl::opt<std::string> ExecutionBackend(
+    "backend",
+    llvm::cl::desc("Backend to use, e.g., Interpreter, CPU, OpenCL:"),
+    llvm::cl::Optional, llvm::cl::init("Interpreter"), llvm::cl::cat(fr2enCat));
 
 /// Quantization options.
 llvm::cl::OptionCategory quantizationCat("Quantization Options");
@@ -162,18 +160,23 @@ struct Model {
     // Load the quantization profile and transform the graph.
     if (!loadProfileFileOpt.empty()) {
       precConfig.quantMode = QuantizationMode::Quantize;
-      precConfig.quantConfig.infos = deserializeFromYaml(loadProfileFileOpt);
+      precConfig.quantConfig.infos =
+          deserializeProfilingInfosFromYaml(loadProfileFileOpt);
       precConfig.quantConfig.assertAllNodesQuantized = true;
     }
 
-    EE_.compile(F_, cctx);
+    EE_.compile(cctx);
+
+    // After compilation, the original function may be removed/replaced. Need to
+    // update F_.
+    F_ = EE_.getModule().getFunctions().front();
   }
 
 private:
   Placeholder *embedding_fr_, *embedding_en_;
   Node *encoderHiddenOutput_;
 
-  Placeholder *loadEmbedding(llvm::StringRef langPrefix, size_t langSize) {
+  Placeholder *loadEmbedding(llvm::StringRef langPrefix, dim_t langSize) {
     auto &mod = EE_.getModule();
     auto *result =
         mod.createPlaceholder(ElemKind::FloatTy, {langSize, EMBEDDING_SIZE},
@@ -275,14 +278,15 @@ void Model::loadEncoder() {
         {0, step, 0}, {batchSize_, step + 1, EMBEDDING_SIZE});
     Node *reshape =
         F_->createReshape("encoder." + std::to_string(step) + ".reshape",
-                          inputSlice, {batchSize_, EMBEDDING_SIZE});
+                          inputSlice, {batchSize_, EMBEDDING_SIZE}, ANY_LAYOUT);
     hidden = createPyTorchGRUCell(F_, reshape, hidden, wIh, bIh, wHh, bHh);
     outputs.push_back(hidden);
   }
 
   Node *output = F_->createConcat("encoder.output", outputs, 1);
-  Node *r2 = F_->createReshape("encoder.output.r2", output,
-                               {MAX_LENGTH * batchSize_, EMBEDDING_SIZE});
+  Node *r2 =
+      F_->createReshape("encoder.output.r2", output,
+                        {MAX_LENGTH * batchSize_, EMBEDDING_SIZE}, ANY_LAYOUT);
 
   encoderHiddenOutput_ = F_->createGather("encoder.outputNth", r2, seqLength_);
 }
@@ -295,7 +299,7 @@ void Model::loadDecoder() {
   auto *input = mod.createPlaceholder(ElemKind::Int64ITy, {batchSize_},
                                       "decoder.input", false);
   auto *inputTensor = bindings.allocate(input);
-  for (size_t i = 0; i < batchSize_; i++) {
+  for (dim_t i = 0; i < batchSize_; i++) {
     inputTensor->getHandle<int64_t>().at({i}) = en_.word2index_["SOS"];
   }
 
@@ -307,11 +311,12 @@ void Model::loadDecoder() {
       ElemKind::FloatTy, {EMBEDDING_SIZE, HIDDEN_SIZE}, "decoder.w_hh", false);
   auto *bHh = mod.createPlaceholder(ElemKind::FloatTy, {HIDDEN_SIZE},
                                     "decoder.b_hh", false);
-  auto *outW = mod.createPlaceholder(ElemKind::FloatTy,
-                                     {EMBEDDING_SIZE, en_.index2word_.size()},
-                                     "decoder.out_w", false);
-  auto *outB = mod.createPlaceholder(
-      ElemKind::FloatTy, {en_.index2word_.size()}, "decoder.out_b", false);
+  auto *outW = mod.createPlaceholder(
+      ElemKind::FloatTy, {EMBEDDING_SIZE, (dim_t)en_.index2word_.size()},
+      "decoder.out_w", false);
+  auto *outB =
+      mod.createPlaceholder(ElemKind::FloatTy, {(dim_t)en_.index2word_.size()},
+                            "decoder.out_b", false);
   loadMatrixFromFile("fr2en/decoder_w_ih.bin", *bindings.allocate(wIh));
   loadMatrixFromFile("fr2en/decoder_b_ih.bin", *bindings.allocate(bIh));
   loadMatrixFromFile("fr2en/decoder_w_hh.bin", *bindings.allocate(wHh));
@@ -337,14 +342,14 @@ void Model::loadDecoder() {
     Node *FC = F_->createFullyConnected("decoder.outFC", hidden, outW, outB);
     auto *topK = F_->createTopK("decoder.topK", FC, 1);
 
-    lastWordIdx =
-        F_->createReshape("decoder.reshape", topK->getIndices(), {batchSize_});
+    lastWordIdx = F_->createReshape("decoder.reshape", topK->getIndices(),
+                                    {batchSize_}, "N");
     outputs.push_back(lastWordIdx);
   }
 
   Node *concat = F_->createConcat("decoder.output.concat", outputs, 0);
   Node *reshape = F_->createReshape("decoder.output.reshape", concat,
-                                    {MAX_LENGTH, batchSize_});
+                                    {MAX_LENGTH, batchSize_}, ANY_LAYOUT);
   auto *save = F_->createSave("decoder.output", reshape);
   output_ = save->getPlaceholder();
   bindings.allocate(output_);
@@ -359,7 +364,7 @@ void Model::translate(const std::vector<std::string> &batch) {
   Tensor seqLength(ElemKind::Int64ITy, {batchSize_});
   input.zero();
 
-  for (size_t j = 0; j < batch.size(); j++) {
+  for (dim_t j = 0; j < batch.size(); j++) {
     std::istringstream iss(batch[j]);
     std::vector<std::string> words;
     std::string word;
@@ -369,7 +374,7 @@ void Model::translate(const std::vector<std::string> &batch) {
 
     CHECK_LE(words.size(), MAX_LENGTH) << "sentence is too long.";
 
-    for (size_t i = 0; i < words.size(); i++) {
+    for (dim_t i = 0; i < words.size(); i++) {
       auto iter = fr_.word2index_.find(words[i]);
       CHECK(iter != fr_.word2index_.end()) << "Unknown word: " << words[i];
       input.getHandle<int64_t>().at({j, i}) = iter->second;
@@ -384,21 +389,24 @@ void Model::translate(const std::vector<std::string> &batch) {
   auto OH = bindings.get(output_)->getHandle<int64_t>();
   for (unsigned j = 0; j < batch.size(); j++) {
     for (unsigned i = 0; i < MAX_LENGTH; i++) {
-      int64_t wordIdx = OH.at({i, j});
+      dim_t wordIdx = OH.at({i, j});
       if (wordIdx == en_.word2index_["EOS"])
         break;
 
       if (i)
         std::cout << ' ';
-      std::cout << en_.index2word_[wordIdx];
+      if (en_.index2word_.size() > (wordIdx))
+        std::cout << en_.index2word_[wordIdx];
+      else
+        std::cout << "[" << wordIdx << "]";
     }
     std::cout << "\n\n";
   }
 
   if (!dumpProfileFileOpt.empty()) {
-    std::vector<NodeQuantizationInfo> QI =
-        quantization::generateNodeQuantizationInfos(bindings, F_, loweredMap_);
-    serializeToYaml(dumpProfileFileOpt, QI);
+    std::vector<NodeProfilingInfo> PI =
+        quantization::generateNodeProfilingInfos(bindings, F_, loweredMap_);
+    serializeProfilingInfosToYaml(dumpProfileFileOpt, PI);
   }
 }
 

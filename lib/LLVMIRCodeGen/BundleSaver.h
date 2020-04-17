@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,36 +25,71 @@ namespace glow {
 class LLVMBackend;
 
 class BundleSaver final {
-  /// The IR to be compiled.
-  const IRFunction *F_;
-  /// Information about allocations.
-  AllocationsInfo allocationsInfo_;
-  /// The LLVM IR code generator.
-  std::unique_ptr<LLVMIRGen> irgen_;
+public:
+  /// Information about a saved IR function.
+  struct SavedIRFunction {
+    /// Entry name for the IR function.
+    std::string entryName;
+    /// Saved IRFunction.
+    const IRFunction *savedF{nullptr};
+    /// LLVM IR function created for this IR function.
+    llvm::Function *llvmF{nullptr};
+  };
+  /// WeightInfo represents a constant weight and a constant it is produced
+  /// from.
+  using WeightInfo = std::pair<const WeightVar *, const Constant *>;
+  /// Comparator for WeightInfo objects, sorting them by their allocated
+  /// address.
+  class WeightAddrComparator {
+  public:
+    WeightAddrComparator(BundleSaver &bundleSaver)
+        : bundleSaver_(&bundleSaver) {}
+    bool operator()(const WeightInfo &LHS, const WeightInfo &RHS) const;
 
+  private:
+    const BundleSaver *bundleSaver_;
+  };
+  /// Ctor.
+  explicit BundleSaver(const LLVMBackend &llvmBackend,
+                       llvm::StringRef outputDir, llvm::StringRef bundleName);
+  void save(llvm::StringRef mainEntryName, const IRFunction *F);
+  /// Produce a bundle.
+  void produceBundle();
+
+private:
   /// Perform memory allocation for a bundle.
   void performBundleMemoryAllocation();
   /// Save weights for the bundle.
   void saveWeights(llvm::StringRef weightsFileName);
-  /// Produce a bundle.
-  void produceBundle(llvm::StringRef outputDir);
+  /// Save header file for the bundle.
+  void saveHeader(llvm::StringRef headerFileName);
   /// Emit config for a bundle.
   void emitBundleConfig();
   /// Emit the symbol table for a bundle.
   void emitSymbolTable();
-  /// Emit the entry function for the bundle.
-  void emitBundleEntryFunction();
-
-public:
-  /// Ctor.
-  explicit BundleSaver(const IRFunction *F, const LLVMBackend &llvmBackend);
-  /// Save code bundle built for \p target, \p arch, \p cpu and \p
-  /// targetFeatures to \p outputDir. Make \p networkName the function name for
-  /// the entry point of the network and prepend all generated
-  /// files with this name.
-  void save(llvm::StringRef target, llvm::StringRef arch, llvm::StringRef cpu,
-            const llvm::SmallVectorImpl<std::string> &targetFeatures,
-            llvm::StringRef outputDir, llvm::StringRef networkName);
+  /// Emit the entry function for the saved function \p savedF.
+  void emitBundleEntryFunction(SavedIRFunction &savedF);
+  /// Set current IRFunction.
+  void setIRFunction(llvm::StringRef mainEntryName, const IRFunction *F);
+  /// Returns a set of placeholders associated with IR functions inside this
+  /// bundle.
+  std::set<const Placeholder *> findPlaceholders() const;
+  /// Returns a set of constant weights associated with IR functions inside this
+  /// bundle.
+  std::set<WeightInfo, WeightAddrComparator> findConstantWeights() const;
+  /// \returns the weight that the variable \p v is lowered into in one of the
+  /// IR functions inside this bundle, or null if the variable is unknown.
+  Value *getWeightForNode(const Storage *V) const;
+  /// Information about allocations.
+  AllocationsInfo allocationsInfo_;
+  /// The LLVM IR code generator.
+  std::unique_ptr<LLVMIRGen> irgen_;
+  /// Information about IR functions inside this bundle.
+  std::vector<SavedIRFunction> savedIRFunctions_;
+  /// Bundle API to use.
+  BundleApiType bundleAPI_;
+  /// Indicates if this bundle was saved already.
+  bool isSaved_{false};
 };
 
 } // namespace glow

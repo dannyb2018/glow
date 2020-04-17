@@ -1,8 +1,12 @@
 add_library(Partitioner
-	      PartitionerUtils.cpp
-	      Partitioner.cpp)
+              PartitionerBase.cpp
+              PartitionerUtils.cpp
+              PartitionerOptimizer.cpp
+              PartitionerValidation.cpp
+              Partitioner.cpp)
 
 target_link_libraries(Partitioner
                       PRIVATE
                         Backends
-                        Graph)
+                        Graph
+                        GraphOptimizer)

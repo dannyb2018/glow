@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,6 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifndef GLOW_TESTS_IMPORTERTESTUTILS_H
+#define GLOW_TESTS_IMPORTERTESTUTILS_H
+
 #include "glow/Base/Tensor.h"
 #include "glow/Graph/Graph.h"
 
@@ -30,7 +33,7 @@ namespace glow {
 ///         +---+---+---+
 ///         | 6 | 7 | 8 |
 ///         +---+---+---+
-void getNCHWData(Tensor *result, size_t n, size_t c, size_t h, size_t w) {
+void getNCHWData(Tensor *result, dim_t n, dim_t c, dim_t h, dim_t w) {
   result->reset(ElemKind::FloatTy, {n, c, h, w});
   auto RH = result->getHandle<>();
   for (size_t i = 0, e = n * c * h * w; i < e; i++)
@@ -59,3 +62,5 @@ SaveNode *getSaveNodeFromDest(Storage *var) {
 }
 
 } // namespace glow
+
+#endif // GLOW_TESTS_IMPORTERTESTUTILS_H

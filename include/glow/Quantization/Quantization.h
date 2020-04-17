@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,17 +30,27 @@ class Backend;
 
 namespace quantization {
 
-/// Generate NodeQuantizationInfo for all required nodes from function \p F
-/// using the method specified by \p schema and target quantization precision \p
-/// quantizationPrecision. Profiling values will be written into context \p
-/// bindings. \p loweredMap maps from the NodeOutputName of a NodeValue which
-/// was lowered to a vector of the original NodeOutputNames which it replaced;
-/// this map is used to generate infos for the original unlowered NodeValues
-/// which no longer exist in \p F.
-std::vector<NodeQuantizationInfo> generateNodeQuantizationInfos(
-    PlaceholderBindings &bindings, const Function *F,
-    const LoweredInfoMap &loweredMap = {}, Schema schema = Schema::Asymmetric,
-    ElemKind quantizationPrecision = ElemKind::Int8QTy);
+/// Generate NodeProfilingInfo for all the required nodes from function \p F
+/// using the profiling information stored in \p bindings obtained after
+/// running the network in profiling mode. During the profiling phase all the
+/// nodes are lowered. The map \p loweredMap maps the vector of NodeOutputNames
+/// obtained after lowering a NodeValue to the NodeOutputName of the lowered
+/// NodeValue. This map is used to replicate the profiling information for the
+/// unlowered NodeValues such that during the actual quantization, depending
+/// on the backend decision to lower some nodes or not, a profile will be found
+/// for any NodeValue.
+std::vector<NodeProfilingInfo>
+generateNodeProfilingInfos(PlaceholderBindings &bindings, const Function *F,
+                           const LoweredInfoMap &loweredMap = {});
+
+/// Generate NodeQuantizationInfo for all the required nodes from function \p F
+/// using the profiling information and the parameters from \p quantConfig. The
+/// map \p loweredMap is the lowering map obtained during the quantization phase
+/// and is used to find lowering patterns for the bias operands.
+std::vector<NodeQuantizationInfo>
+generateNodeQuantizationInfos(Function *F,
+                              const QuantizationConfiguration &quantConfig,
+                              const LoweredInfoMap &loweredMap = {});
 
 /// Quantizes the function \p F into an unoptimized partially quantized function
 /// based on configuration from \p quantConfig. This method converts to integer

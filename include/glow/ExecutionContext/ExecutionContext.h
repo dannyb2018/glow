@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,23 +22,22 @@
 #include "llvm/ADT/STLExtras.h"
 
 namespace glow {
-
-enum class BackendKind;
+namespace runtime {
+class DeviceManager;
+}
 
 /// Sub-classed per backend, this holds Device specific per-function information
 /// if that is necessary on that particular backend.
 class DeviceBindings {
-  const glow::BackendKind backend_;
+  const std::string backend_;
 
 public:
-  DeviceBindings(BackendKind kind) : backend_{kind} {}
+  DeviceBindings(llvm::StringRef backend) : backend_{backend} {}
   virtual ~DeviceBindings() {}
 
   virtual std::unique_ptr<DeviceBindings> clone() {
-    return llvm::make_unique<DeviceBindings>(backend_);
+    return glow::make_unique<DeviceBindings>(backend_);
   }
-
-  BackendKind getBackendKind() { return backend_; }
 };
 
 /// The runtime context for a single execution (Inferance or Training) in the
@@ -49,13 +48,18 @@ public:
 class ExecutionContext {
   std::unique_ptr<PlaceholderBindings> placeholderBindings_;
   std::unique_ptr<DeviceBindings> deviceBindings_;
+
+  /// Pointer to DeviceManager this context is bound to, use for P2P/DRT
+  /// enablement. Unused otherwise.
+  runtime::DeviceManager *boundDeviceManager_{nullptr};
+
   std::unique_ptr<TraceContext> traceContext_;
 
   /// Trace Events recorded during this run.
 
 public:
   ExecutionContext()
-      : placeholderBindings_(llvm::make_unique<PlaceholderBindings>()) {}
+      : placeholderBindings_(glow::make_unique<PlaceholderBindings>()) {}
 
   ExecutionContext(std::unique_ptr<PlaceholderBindings> bindings)
       : placeholderBindings_(std::move(bindings)) {}
@@ -88,6 +92,19 @@ public:
     return deviceBindings_.get();
   }
 
+  /// \returns a non-owning pointer the the deviceManager this context is bound
+  /// to.
+  runtime::DeviceManager *getBoundDeviceManager() {
+    return boundDeviceManager_;
+  }
+
+  /// Sets which device this context is bound to. NOTE this should not be
+  /// changed once set.
+  void setBoundDeviceManager(runtime::DeviceManager *device) {
+    DCHECK(boundDeviceManager_ == nullptr);
+    boundDeviceManager_ = device;
+  }
+
   /// Sets the DeviceBindings and \returns the existing value.
   std::unique_ptr<DeviceBindings>
   setDeviceBindings(std::unique_ptr<DeviceBindings> bindings) {
@@ -112,10 +129,10 @@ public:
   ExecutionContext clone() {
     if (deviceBindings_) {
       return ExecutionContext(
-          llvm::make_unique<PlaceholderBindings>(placeholderBindings_->clone()),
+          glow::make_unique<PlaceholderBindings>(placeholderBindings_->clone()),
           deviceBindings_->clone());
     } else {
-      return ExecutionContext(llvm::make_unique<PlaceholderBindings>(
+      return ExecutionContext(glow::make_unique<PlaceholderBindings>(
           placeholderBindings_->clone()));
     }
   }
@@ -123,17 +140,18 @@ public:
   /// A helper function to create a scoped TraceEvent builder.
   /// If there is no TraceContext, this will still create an object, but it will
   /// do nothing.
-  ScopedTraceBlock scopedEvent(llvm::StringRef name) {
-    return ScopedTraceBlock(getTraceContext(), name);
+  ScopedTraceBlock scopedEvent(llvm::StringRef name, TraceLevel level) {
+    return ScopedTraceBlock(getTraceContext(), level, name);
   }
 
   /// A helper function to log a TraceEvent at the current time, if there is a
   /// TraceContext available.
-  void logTraceEvent(llvm::StringRef name, llvm::StringRef type = "i",
+  void logTraceEvent(llvm::StringRef name, TraceLevel level,
+                     char type = TraceEvent::InstantType,
                      std::map<std::string, std::string> args = {}) {
     TraceContext *traceContext = getTraceContext();
     if (traceContext) {
-      traceContext->logTraceEvent(name, type, std::move(args));
+      traceContext->logTraceEvent(name, level, type, std::move(args));
     }
   }
 };

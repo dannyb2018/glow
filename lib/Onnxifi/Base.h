@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,16 +36,17 @@ namespace onnxifi {
 
 class Graph;
 
-/// BackendId associated with the Glow backend.
-class BackendId {
+/// Backend associated with the Glow backend.
+class Backend {
 public:
   /// Create Glow ONNXIFI backend identifier with the
-  /// given Glow backend \p kind, whether to use onnx or caffe2 for models
+  /// given Glow backend \p backendName, whether to use onnx or caffe2 for
+  /// models
   /// (\p useOnnx)
-  BackendId(glow::BackendKind kind, bool useOnnx)
-      : useOnnx_(useOnnx), glowBackend_(createBackend(kind)) {}
+  Backend(llvm::StringRef backendName, bool useOnnx)
+      : useOnnx_(useOnnx), glowBackend_(createBackend(backendName)) {}
 
-  virtual ~BackendId() = default;
+  virtual ~Backend() = default;
 
   /// Verify that a given onnx graph is supported by the backend by importing
   /// the onnx graph to a glow function, lowering this function, and checking
@@ -57,9 +58,13 @@ public:
   /// \returns the whether use onnx or not.
   bool getUseOnnx() const { return useOnnx_; }
 
+  /// \returns a reference to the backend.
+  const glow::Backend &getBackend() const { return *glowBackend_; }
+
   virtual void runNetwork(const Graph *graph,
                           std::unique_ptr<ExecutionContext> context,
-                          runtime::ResultCBTy callback) {}
+                          runtime::ResultCBTy callback, uint64_t priority = 0) {
+  }
 
   virtual onnxStatus removeNetwork(const Graph *graph) {
     return ONNXIFI_STATUS_SUCCESS;
@@ -70,31 +75,22 @@ protected:
   std::unique_ptr<glow::Backend> glowBackend_;
 };
 
-typedef BackendId *BackendIdPtr;
-
-class Backend {
-public:
-  explicit Backend(BackendIdPtr backendId) : backendIdPtr_(backendId) {}
-
-  /// Whether this backend uses ONNX proto or Caffe2 proto.
-  bool getUseOnnx() const { return backendIdPtr_->getUseOnnx(); }
-
-  BackendId *getBackendId() { return backendIdPtr_; }
-
-private:
-  BackendIdPtr backendIdPtr_;
-};
-
 typedef Backend *BackendPtr;
 
 class Event {
 public:
   Event() : fired_{false} {}
   /// Signal the event.
-  bool signal();
+  bool signal(onnxStatus status);
 
   /// Wait until the event is signalled.
-  void wait();
+  onnxStatus wait();
+
+  /// Wait until the event is signalled or until at least \p timeoutMs
+  /// milliseconds have elapsed. \returns a pair with the first value being a
+  /// boolean that is true if the event was signalled (no timeout occurred) and
+  /// the second is the value of the event's status.
+  std::pair<bool, onnxStatus> waitFor(size_t timeoutMs);
 
   /// Check if event was signalled.
   bool isSignalled() { return fired_; }
@@ -103,6 +99,9 @@ private:
   std::atomic<bool> fired_;
   std::mutex mutex_;
   std::condition_variable cond_;
+  /// Used to hold an onnxStatus that will be passed for the signaller of the
+  /// event to a waiter. Should only be accessed while holding mutex_.
+  onnxStatus status_ = ONNXIFI_STATUS_SUCCESS;
 };
 
 typedef Event *EventPtr;
@@ -128,10 +127,13 @@ public:
                          EventPtr outputEvent, onnxTraceEventList *traceEvents);
 
   /// Init Glow graph based on the ONNX model \p onnxModel and
-  /// static trained weights \p weightDescriptors.
-  virtual onnxStatus
-  initGraph(const void *onnxModel, size_t onnxModelSize, uint32_t weightCount,
-            const onnxTensorDescriptorV1 *weightDescriptors) = 0;
+  /// static trained weights \p weightDescriptors. Weights can be read in later
+  /// by a \p deferedBlobReader.
+  virtual onnxStatus initGraph(const void *onnxModel, size_t onnxModelSize,
+                               uint32_t weightCount,
+                               const onnxTensorDescriptorV1 *weightDescriptors,
+                               uint32_t maxSeqLength,
+                               void *deferedBlobReader) = 0;
 
   virtual onnxStatus run(std::unique_ptr<ExecutionContext> ctx,
                          EventPtr outputEvent,
@@ -157,11 +159,48 @@ protected:
   /// placeholder for output.
   llvm::StringMap<Placeholder *> onnxOutputToPlaceholder_;
 
+  /// A list of input names ordered by their position in ONNXIFI input
+  /// descriptor array.
+  std::vector<std::string> onnxInputNames_;
+
+  /// A list of input placeholders ordered by their position in ONNXIFI input
+  /// descriptor array.
+  std::vector<Placeholder *> onnxInputPlaceholders_;
+
+  /// A list of output names ordered by their position in ONNXIFI output
+  /// descriptor array.
+  std::vector<std::string> onnxOutputNames_;
+
+  /// A list of output placeholders ordered by their position in ONNXIFI output
+  /// descriptor array.
+  std::vector<Placeholder *> onnxOutputPlaceholders_;
+
   /// An object pool for tensors, to share allocations.
   TensorPool tensorPool_;
+
+  /// An anchor tensor specialized for zero length indices
+  Tensor zeroLengthSequence_;
+
+  /// Set the zero length tensor
+  void setZeroLengthSequence(dim_t maxSeqLength);
+
+  /// Bind input/output placeholders
+  void bindPlaceholders(const ONNXIFIModelLoader &loader);
+
+private:
+  /// inference dump counter
+  std::atomic<size_t> ioDumpCounter_{0};
+
+  /// Setup input mapping and adjust inputs if necessary
+  onnxStatus adjustInputs(uint32_t inputsCount,
+                          const onnxTensorDescriptorV1 *inputDescriptors,
+                          ExecutionContext *ctx);
 };
 
 typedef Graph *GraphPtr;
+
+/// Save the Function from ONNXIFI to a file
+void saveOnnxifiModel(Function *F);
 
 } // namespace onnxifi
 } // namespace glow

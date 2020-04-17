@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@
 #include "glow/Base/Traits.h"
 #include "glow/Graph/Graph.h"
 #include "glow/Graph/PlaceholderBindings.h"
-#include "glow/Optimizer/Optimizer.h"
+#include "glow/Runtime/HostManager/HostManager.h"
 
 #include "llvm/ADT/ArrayRef.h"
 
@@ -32,94 +32,99 @@
 
 namespace glow {
 
-/// This is the ExecutionEngine. It owns the Graph, the backend, and the
-/// compiled function.  The Graph, etc in this class are defined as pointers, in
-/// order to erase the type and prevent the internal types from leaking out to
-/// the users of this class.
+/// This is the ExecutionEngine. It encapsulates the Glow Runtime.  It handles
+/// compilation and execution of a network.
 class ExecutionEngine final {
-  /// The Module that represents the high-level program.
-  Module M_;
+  /// Module containing the function and supporting information. This is reset
+  /// if the backend type is changed.
+  std::unique_ptr<Module> module_;
 
-  /// The network execution backend.
-  Backend *backend_ = nullptr;
+  /// Raw pointer to module_ this is to support module access after the module
+  /// has been added to hostManager_.
+  Module *rawModule_;
 
-  /// Whether or not the ExecutionEngine owns the backend or is just using
-  /// a backend provided from elsewhere. If ownsBackend is true,
-  /// ~ExecutionEngine will delete the backend_.
-  bool ownsBackend_ = false;
+  /// Name of the backend being used for compilation and execution. Changing
+  /// this resets the ExecutionEngine.
+  std::string backendName_ = "";
 
-  /// The device manager for executing compiled funtions.
-  std::unique_ptr<runtime::DeviceManager> device_;
+  /// Size of device memory in bytes, if 0 device default is used.
+  uint64_t deviceMemory_{0};
+
+  /// Whether to ignore the user-specified DeviceConfig.
+  bool ignoreUserDeviceConfig_{false};
+
+  /// The HostManager for executing the compiled functions.
+  std::unique_ptr<runtime::HostManager> hostManager_;
 
   /// Glow functions compiled for this ExecutionEngine's backend.
-  llvm::StringMap<std::unique_ptr<CompiledFunction>> compiledFunctions_;
+  std::set<std::string> compiledFunctions_;
 
-  /// Single execution of the given \compiledFunction with the given context
+  /// Whether to move all Device Resident Tensors on to the host at the end of
+  /// the run.
+  bool ensureOutputsOnHost_{true};
+
+  /// Whether to override the cctx's skipModuleStrip setting and skip stripping
+  /// the module. Used for testing purposes.
+  bool skipModuleStrip_{false};
+
+  /// Whether to allow multiple functions when running. This is usually due to
+  /// running a pre-partitioned model.
+  bool allowMultiFunction_{false};
+
+  /// Single execution of the given function, \p name with the given context
   /// \bindings.
-  void runInternal(ExecutionContext &context, llvm::StringRef name,
-                   CompiledFunction &compiledFunction);
+  void runInternal(ExecutionContext &context, llvm::StringRef name);
 
 public:
-  ExecutionEngine(BackendKind backendKind = BackendKind::Interpreter);
+  /// Constructor for an ExecutionEngine with \p backend and memory \p
+  /// deviceMemory in bytes. If \p ignoreUserDeviceConfig then user device
+  /// configs will be ignored. \p numDevices controls how many devices to create
+  /// for the EE.
+  ExecutionEngine(llvm::StringRef backend = "Interpreter",
+                  uint64_t deviceMemory = 0,
+                  bool ignoreUserDeviceConfig = false, unsigned numDevices = 1);
 
   ~ExecutionEngine();
 
-  /// Set the code generator kind to \p backendKind. New code will be generated
-  /// using this backend.
-  void setBackend(BackendKind backendKind);
+  /// Set the code generator to \p backend. New code will be generated
+  /// using this backend. This clears all previously loaded functions and resets
+  /// the Module. \p numDevices controls how many devices to create for the EE.
+  void setBackendName(llvm::StringRef backend, size_t numDevices = 1);
 
-  /// Set the code generator to a custom \p backend. If \p ownsBackend is false
-  /// then ExecutionEngine will use the given backend without owning it which
-  /// means that ~ExecutionEngine will not delete it.
-  void setBackend(Backend *backend, bool ownsBackend = true);
-
-  /// Get a pointer to the backend.
-  const Backend *getBackend() const;
-
-  /// \returns the internal graph.
-  Module &getModule() { return M_; }
-
-  /// Clears the DeviceManager and all CompiledFunctions.
-  void clear();
-
-  /// \returns the compiled function. If more than one function
-  /// has been compiled by this ExecutionEngine then a name must be supplied
-  /// to specify which function to return.
-  CompiledFunction &getCompiledFunction();
-
-  /// \returns the compiled function with the given \p name.
-  CompiledFunction &getCompiledFunction(llvm::StringRef name);
-
-  /// Stores \p func in the CompiledFunction map, enabling it to be run.
-  void insertCompiledFunction(llvm::StringRef name,
-                              std::unique_ptr<CompiledFunction> func);
-
-  /// \returns whether a node with the provided \p NI is supported by the
-  /// underlying backend.
-  bool isOpSupported(const NodeInfo &NI) const {
-    return backend_->isOpSupported(NI);
+  /// Set the device memory to \p mem. This will reset the existing device,
+  /// clearing all existing functions and resetting the module.
+  void setDeviceMemory(uint64_t mem) {
+    deviceMemory_ = mem;
+    setBackendName(backendName_);
   }
 
-  /// Optimize the Function \p f and pass it to the backend to compile it for a
-  /// specific target, all given \p cctx. If \p clearOtherFunctions is false
-  /// then the function will be added to the collection of previously compiled
-  /// functions otherwise any previously compiled functions will be removed
-  /// first. This method should be invoked before the run method.
-  void compile(Function *F, CompilationContext &cctx,
-               bool clearOtherFunctions = true);
+  // Set whether or not to ensure outputs are in host memory.
+  void ensureOutputsOnHost(bool should) { ensureOutputsOnHost_ = should; }
 
-  /// A convenience function for the most common type of compile.
-  void compile(CompilationMode mode, Function *F,
-               bool clearOtherFunctions = true);
+  /// Get the name of the current backend in use.
+  llvm::StringRef getBackendName() const;
 
-  /// Save a bundle for a standalone execution given \p cctx. This method takes
-  /// care of everything when preparing the bundle for saving. There is no need
-  /// to invoke the compile method before it.
-  /// Make \p networkName the function name for
-  /// the entry point of the network and prepend all generated
-  /// files with this name.
-  void save(Function *F, CompilationContext &cctx, llvm::StringRef outputDir,
-            llvm::StringRef networkName);
+  /// \returns the internal graph. Note: After compilation the contents of the
+  /// module will have been altered and raw pointers to elements of the graph
+  /// may no longer be valid.
+  Module &getModule() const { return *rawModule_; }
+
+  /// Clears the ExecutionEngine and all CompiledFunctions.
+  void clear();
+
+  /// \returns the DAG for the specified \p network.
+  Expected<runtime::DAG *> getDAG(llvm::StringRef network) {
+    return hostManager_->getNetworkDAG(network);
+  }
+
+  /// Compiles all functions in the Module with the given \p cctx.  This method
+  /// should be invoked before the run method and can only be called once
+  /// without resetting the backend.
+  void compile(CompilationContext &cctx);
+
+  /// A convenience function for the most common type of compile. Can only be
+  /// called once without resetting the backend.
+  void compile(CompilationMode mode);
 
   /// Context aware single execution of a function. If more than one
   /// function has been compiled by this ExecutionEngine then a name must be
@@ -138,6 +143,21 @@ public:
   /// Context aware single execution of a function with the given \p
   /// name.
   void run(PlaceholderBindings &bindings, llvm::StringRef name);
+
+  /// \returns a reference to the backend with name \p backendName owned by the
+  /// Provisioner inside of \ref hostManager_.
+  Backend &getBackend(llvm::StringRef backendName) const;
+
+  /// \returns a reference to the backend with name of the current backend in
+  /// use by the EE.
+  Backend &getBackend() const;
+
+  /// \returns the single Function contained in this Module.
+  /// \pre Must be a single Function in the Module.
+  Function *getSingleFunctionFromModule() const;
+
+  /// Setter for \ref skipModuleStrip_ to \p b.
+  void setSkipModuleStrip(bool b) { skipModuleStrip_ = b; }
 };
 
 //===----------------------------------------------------------------------===//
@@ -168,12 +188,23 @@ void updateInputPlaceholdersByName(PlaceholderBindings &bindings, Module *mod,
 /// The variable \p sampleCounter is consumed and updated by the function. This
 /// variable records the number of samples that were consumed by the network in
 /// previous iterations. The next input to be loaded is
-/// (sampleCounter % batchsize).
+/// (sampleCounter % batchsize). If there is more than one compiledFunction \p
+/// name must be provided to specify the desired function.
 void runBatch(ExecutionEngine &EE, PlaceholderBindings &bindings,
               size_t iterations, size_t &sampleCounter,
-              llvm::ArrayRef<Placeholder *> ph,
-              llvm::ArrayRef<Tensor *> inputs);
+              llvm::ArrayRef<Placeholder *> ph, llvm::ArrayRef<Tensor *> inputs,
+              llvm::StringRef name = "");
 
+/// Runs \p numMinibatchRuns iterations of the compiled function called \p name.
+/// The method updates a global counter and future invocations of this method
+/// continue running iterations of the batch at the next available slice.
+/// The provided callback function \p cb is invoked on each sample.
+void evalBatch(
+    ExecutionEngine &EE, PlaceholderBindings &bindings, size_t numMinibatchRuns,
+    size_t &sampleCounter, Placeholder *inputPH, Placeholder *outputPH,
+    Tensor &samplesInput, Tensor &labelsInput, llvm::StringRef name,
+    std::function<void(const Tensor &sampleIn, const Tensor &sampleOut,
+                       const Tensor &label, size_t sampleIndex)> &&cb);
 } // namespace glow
 
 #endif // GLOW_EXECUTIONENGINE_EXECUTIONENGINE_H

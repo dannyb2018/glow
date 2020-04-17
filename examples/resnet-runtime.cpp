@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,14 +53,16 @@ llvm::cl::opt<std::string> tracePath("trace-path",
                                      llvm::cl::desc("Write trace logs to disk"),
                                      llvm::cl::init(""),
                                      llvm::cl::cat(category));
-llvm::cl::opt<BackendKind> backend(
-    llvm::cl::desc("Backend to use:"), llvm::cl::Optional,
-    llvm::cl::values(clEnumValN(BackendKind::Interpreter, "interpreter",
-                                "Use interpreter (default option)"),
-                     clEnumValN(BackendKind::CPU, "cpu", "Use CPU"),
-                     clEnumValN(BackendKind::OpenCL, "opencl", "Use OpenCL"),
-                     clEnumValN(BackendKind::Habana, "habana", "Use Habana")),
-    llvm::cl::init(BackendKind::CPU), llvm::cl::cat(category));
+llvm::cl::opt<std::string>
+    backend("backend",
+            llvm::cl::desc("Backend to use, e.g., Interpreter, CPU, OpenCL:"),
+            llvm::cl::Optional, llvm::cl::init("CPU"), llvm::cl::cat(category));
+
+llvm::cl::opt<bool>
+    autoInstrument("auto-instrument",
+                   llvm::cl::desc("Add instrumentation for operator tracing"),
+                   llvm::cl::Optional, llvm::cl::init(false),
+                   llvm::cl::cat(category));
 
 std::mutex eventLock;
 std::unique_ptr<TraceContext> traceContext;
@@ -94,19 +96,18 @@ void dispatchClassify(unsigned int id, HostManager *hostManager,
                       std::promise<void> &finished) {
   auto runid = hostManager->runNetwork(
       "resnet50" + std::to_string(id), std::move(context),
-      [id, path, &returned,
-       &finished](RunIdentifierTy, llvm::Error err,
-                  std::unique_ptr<ExecutionContext> context) {
+      [path, &returned, &finished](RunIdentifierTy runid, Error err,
+                                   std::unique_ptr<ExecutionContext> context) {
         EXIT_ON_ERR(std::move(err));
         auto *bindings = context->getPlaceholderBindings();
         size_t maxIdx =
-            bindings->get(bindings->getPlaceholderByName("save_gpu_0_softmax"))
+            bindings->get(bindings->getPlaceholderByName("gpu_0_softmax"))
                 ->getHandle()
                 .minMaxArg()
                 .second;
         // This output is verified by OutputCheck in tests so must be written to
         // stdout.
-        llvm::outs() << "(" << id << ") " << path << ": " << maxIdx << "\n";
+        llvm::outs() << "(" << runid << ") " << path << ": " << maxIdx << "\n";
 
         if (!tracePath.empty()) {
           std::lock_guard<std::mutex> l(eventLock);
@@ -121,42 +122,44 @@ void dispatchClassify(unsigned int id, HostManager *hostManager,
   LOG(INFO) << "Started run ID: " << runid;
 }
 
-/// Run ResNet concurrently on the number CPU Devices provided by the user.
+/// Run ResNet concurrently on the number of devices provided by the user.
 int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(
-      argc, argv, "Run ResNet concurrently on a fixed number of CPU devices");
+      argc, argv, "Run ResNet concurrently on a fixed number of devices");
 
-  LOG(INFO) << "Initializing " << numDevices << " CPU Devices on HostManager.";
+  LOG(INFO) << "Initializing " << numDevices << " " << backend
+            << " devices on HostManager.";
 
   std::vector<std::unique_ptr<DeviceConfig>> configs;
   for (unsigned int i = 0; i < numDevices; ++i) {
-    auto config = llvm::make_unique<DeviceConfig>(backend);
+    auto config = glow::make_unique<DeviceConfig>(backend);
     configs.push_back(std::move(config));
   }
 
   std::unique_ptr<HostManager> hostManager =
-      llvm::make_unique<HostManager>(std::move(configs));
+      glow::make_unique<HostManager>(std::move(configs));
 
   // If tracing is enabled, create a TraceContext to merge each runs events
   // into.
   if (!tracePath.empty()) {
-    traceContext = llvm::make_unique<TraceContext>(TraceLevel::STANDARD);
+    traceContext = glow::make_unique<TraceContext>(TraceLevel::STANDARD);
   }
 
   // Load model, create a context, and add to HostManager.
 
-  std::vector<size_t> inputShape{1, 3, 224, 224};
+  std::vector<dim_t> inputShape{1, 3, 224, 224};
 
   Placeholder *input;
   PlaceholderList phList;
 
-  std::unique_ptr<Module> module = llvm::make_unique<Module>();
+  std::unique_ptr<Module> module = glow::make_unique<Module>();
   TypeRef inputType = module->uniqueType(ElemKind::FloatTy, inputShape);
   input = loadResnet50Model(inputType, module.get(), 0);
   phList = module->getPlaceholders();
   CompilationContext cctx;
-  EXIT_ON_ERR(hostManager->addNetwork(std::move(module), cctx,
-                                      /*saturateHost*/ true));
+  cctx.backendOpts.autoInstrument = autoInstrument;
+  cctx.saturateHost = true;
+  EXIT_ON_ERR(hostManager->addNetwork(std::move(module), cctx));
 
   LOG(INFO) << "Loading files from " << inputDirectory;
   std::error_code code;
@@ -191,9 +194,9 @@ int main(int argc, char **argv) {
         path, ImageNormalizationMode::k0to1, ImageChannelOrder::BGR,
         ImageLayout::NCHW, imagenetNormMean, imagenetNormStd);
     std::unique_ptr<ExecutionContext> context =
-        llvm::make_unique<ExecutionContext>();
+        glow::make_unique<ExecutionContext>();
     context->setTraceContext(
-        llvm::make_unique<TraceContext>(TraceLevel::STANDARD));
+        glow::make_unique<TraceContext>(TraceLevel::STANDARD));
 
     context->getPlaceholderBindings()->allocate(phList);
     Tensor batch = image.getUnowned(inputShape);

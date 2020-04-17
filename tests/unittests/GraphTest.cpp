@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include "glow/Graph/Utils.h"
 #include "glow/IR/IR.h"
 #include "glow/IR/Instrs.h"
+#include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
 
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/FileSystem.h"
@@ -30,6 +31,27 @@
 #include "gtest/gtest.h"
 
 using namespace glow;
+
+// Helper to find a node in the Function by name
+static const Node *nodeByName(const Function *F, const std::string &name) {
+  for (auto &n : F->getNodes()) {
+    if (n.getName().str() == name) {
+      return &n;
+    }
+  }
+  return nullptr;
+}
+
+/// Mock backend that does lower FC nodes.
+class MockBackendNoLowerConv3D : public MockBackend {
+  bool shouldLower(const Node *N) const override {
+    if (N->getKind() == Kinded::Kind::Convolution3DNodeKind) {
+      return false;
+    } else {
+      return true;
+    }
+  }
+};
 
 TEST(Graph, testVariableErasure) {
   Module MD;
@@ -72,8 +94,64 @@ TEST(Graph, clear) {
   EXPECT_EQ(M.getFunctions().size(), 0);
 }
 
-/// Check that a createConv can be run.
-TEST(Graph, simpleTestConv) {
+/// Test the graph nodes names and utilities.
+TEST(Graph, testGraphNames) {
+  Module MD;
+  Function *F = MD.createFunction("F");
+
+  Node *op1 = MD.createPlaceholder(ElemKind::FloatTy, {1, 10}, "op1",
+                                   false /*isTrainable*/);
+  Node *op2 = MD.createConstant(ElemKind::FloatTy, {1, 10}, "op2");
+  Node *add = F->createAdd("add", op1, op2);
+  auto *top = F->createTopK("top", add, 5);
+  Node *save = F->createSave("out", top->getValues());
+
+  EXPECT_TRUE(MD.getPlaceholderByName("op1"));
+  EXPECT_TRUE(MD.getConstantByName("op2"));
+  EXPECT_TRUE(F->getNodeByName("add"));
+  EXPECT_TRUE(F->getNodeByName("top"));
+  EXPECT_TRUE(F->getNodeByName("out_save"));
+
+  NodeValue op1Res = op1->getNthResult(0);
+  NodeValue op2Res = op2->getNthResult(0);
+  NodeValue addRes = add->getNthResult(0);
+  EXPECT_TRUE(top->getNumResults() == 2);
+  NodeValue topValRes = top->getNthResult(0);
+  NodeValue topIndRes = top->getNthResult(1);
+
+  auto op1ResName =
+      op1Res.generateNodeOutputName(false /*stripResNoFor0thInput*/);
+  auto op2ResName =
+      op2Res.generateNodeOutputName(false /*stripResNoFor0thInput*/);
+  auto addResName =
+      addRes.generateNodeOutputName(true /*stripResNoFor0thInput*/);
+  auto topValResName =
+      topValRes.generateNodeOutputName(false /*stripResNoFor0thInput*/);
+  auto topIndResName =
+      topIndRes.generateNodeOutputName(false /*stripResNoFor0thInput*/);
+
+  EXPECT_EQ(op1ResName, "op1:0");
+  EXPECT_EQ(op2ResName, "op2:0");
+  EXPECT_EQ(addResName, "add");
+  EXPECT_EQ(topValResName, "top:0");
+  EXPECT_EQ(topIndResName, "top:1");
+
+  EXPECT_EQ(F->getNodeValueByName(op1ResName), op1Res);
+  EXPECT_EQ(F->getNodeValueByName(op2ResName), op2Res);
+  EXPECT_EQ(F->getNodeValueByName(addResName), addRes);
+  EXPECT_EQ(F->getNodeValueByName(topValResName), topValRes);
+  EXPECT_EQ(F->getNodeValueByName(topIndResName), topIndRes);
+
+  EXPECT_EQ(F->getNodeValueByName("op1"), op1Res);
+  EXPECT_EQ(F->getNodeValueByName("op2"), op2Res);
+  EXPECT_EQ(F->getNodeValueByName("add:0"), addRes);
+
+  // Verify the node value is invalid for the SaveNode which has no outputs.
+  EXPECT_EQ(F->getNodeValueByName(save->getName()).getNode(), nullptr);
+}
+
+/// Check node names.
+TEST(Graph, testNodeNames) {
   Module MD;
   Function *F = MD.createFunction("F");
   IRFunction M(F);
@@ -192,7 +270,7 @@ TEST(Graph, float16Conv) {
 }
 
 /// Check that we can create conv3D with float16.
-TEST(Graph, float16Conv3D) {
+TEST(Graph, float16Conv3DLower) {
   Module MD;
   Function *F = MD.createFunction("F");
   PlaceholderBindings bindings;
@@ -207,6 +285,36 @@ TEST(Graph, float16Conv3D) {
   EXPECT_EQ(conv->getBias().getElementType(), ElemKind::Float16Ty);
 
   auto backend = MockBackend();
+  CompilationContext cctx;
+  lower(F, cctx, &backend);
+
+  IRFunction M(F);
+
+  M.generateIR(backend);
+  EXPECT_GT(M.getInstrs().size(), 0);
+  auto convIt = std::find_if(M.getInstrs().begin(), M.getInstrs().end(),
+                             [](const Instruction &inst) -> bool {
+                               return llvm::isa<Convolution3DInst>(inst);
+                             });
+  ASSERT_TRUE(convIt == M.getInstrs().end());
+}
+
+/// Check that we can create conv3D with float16.
+TEST(Graph, float16Conv3DNoLower) {
+  Module MD;
+  Function *F = MD.createFunction("F");
+  PlaceholderBindings bindings;
+  Node *K =
+      MD.createConstant(ElemKind::Float16Ty, {4, 320, 200, 200, 3}, "input");
+
+  auto *conv = F->createConv3D(bindings, "Conv3D", K, 16, 3, 2, 3, 1);
+  F->createSave("Save", conv);
+  EXPECT_TRUE(conv->verify());
+  EXPECT_EQ(conv->getResult().getElementType(), ElemKind::Float16Ty);
+  EXPECT_EQ(conv->getFilter().getElementType(), ElemKind::Float16Ty);
+  EXPECT_EQ(conv->getBias().getElementType(), ElemKind::Float16Ty);
+
+  auto backend = MockBackendNoLowerConv3D();
   CompilationContext cctx;
   lower(F, cctx, &backend);
 
@@ -419,7 +527,7 @@ TEST(Graph, QuantizationProfileNodes) {
   LoweredInfoMap loweredMapForProf;
   CompilationContext cctx{&bindings, &loweredMapForProf};
   cctx.precisionConfig.quantMode = QuantizationMode::Profile;
-  std::unique_ptr<Backend> backend(createBackend(BackendKind::Interpreter));
+  std::unique_ptr<Backend> backend(createBackend("Interpreter"));
   EXIT_ON_ERR(::optimizeFunction(F, *backend, cctx));
 
   size_t numberOfProfileNodes =
@@ -430,8 +538,7 @@ TEST(Graph, QuantizationProfileNodes) {
   // 1 from A
   // 8 from two lowered FCs: MM, BA, weight PH, bias PH
   // 2 from RELU (lowered to Max+Splat)
-  // 2 from float saves (just profile their output PH)
-  EXPECT_EQ(13, numberOfProfileNodes);
+  EXPECT_EQ(11, numberOfProfileNodes);
 }
 
 TEST(Graph, simpleQuant) {
@@ -449,7 +556,7 @@ TEST(Graph, simpleQuant) {
                                      0.4, 2, "Input", true);
 
   // Calculate the size and allocate the output buffer.
-  std::array<size_t, 4> filterDim = {{depth, kernels[0], kernels[1], 3}};
+  std::array<dim_t, 4> filterDim = {{depth, kernels[0], kernels[1], 3}};
   auto *filter =
       MD.createPlaceholder(ElemKind::Int8QTy, filterDim, 3.3, 4, "F", true);
   auto *bias =
@@ -457,7 +564,7 @@ TEST(Graph, simpleQuant) {
 
   // Calculate the size and allocate the output buffer.
   auto outSz = calculateConvPoolOutputDims(width, width, kernels, steps, pads);
-  std::array<size_t, 4> outDims = {{1, outSz.first, outSz.second, 16}};
+  std::array<dim_t, 4> outDims = {{1, outSz.first, outSz.second, 16}};
   auto t = F->getParent()->uniqueType(glow::ElemKind::Int8QTy, outDims, 1.5, 6);
 
   auto *conv =
@@ -471,7 +578,7 @@ TEST(Graph, simpleQuant) {
   Node *O = F->createFullyConnected("fc1", conv, fcFilter, fcBias);
   PlaceholderBindings bindings;
   F->createSave("ret", O);
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 }
 
 TEST(Graph, quantizeDequantizeNodes) {
@@ -491,7 +598,7 @@ TEST(Graph, quantizeDequantizeNodes) {
   auto *D = F->createDequantize("dequantize", A);
   PlaceholderBindings bindings;
   F->createSave("ret", D);
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 }
 
 TEST(Graph, quantizeGather) {
@@ -504,7 +611,7 @@ TEST(Graph, quantizeGather) {
   auto *gather = F->createGather("gather", input, indices);
   PlaceholderBindings bindings;
   F->createSave("ret", gather);
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 }
 
 TEST(Graph, cloneTest) {
@@ -564,7 +671,7 @@ TEST(Graph, functionDependenciesTest) {
   M.dumpDAG();
 }
 
-TEST(Graph, cloneTest2) {
+TEST(Graph, functionCloneTest) {
   Module M;
   PlaceholderBindings bindings;
 
@@ -572,20 +679,138 @@ TEST(Graph, cloneTest2) {
   Node *K =
       M.createPlaceholder(ElemKind::FloatTy, {4, 320, 200, 3}, "input", true);
   Node *S = M.createPlaceholder(ElemKind::Int64ITy, {4, 1}, "select", true);
-  Node *conv = F->createConv(bindings, "Conv1", K, 16, 3, 2, 3, 1);
+  Node *conv = F->createConv(bindings, "Conv", K, 16, 3, 2, 3, 1);
   Node *relu = F->createRELU("Relu", conv);
   Node *concat = F->createConcat("concat", {relu, relu, relu}, 0);
-
   Node *SM = F->createSoftMax("SoftMax", concat, S);
   F->createSave("Save", SM);
 
   auto *newF = F->clone("new_main");
+
   EXPECT_TRUE(newF->verify());
-  F->dump();
-  newF->dump();
 
   EXPECT_EQ(newF->getNodes().size(), F->getNodes().size());
   EXPECT_EQ(newF->getParent(), F->getParent());
+}
+
+/// Compile the module \p M inside the execution engine \p EE and then run it
+/// using the provided \p bindings. Use the provided \p inputName and \p
+/// outputName.
+static void compileAndRun(ExecutionEngine &EE, PlaceholderBindings &bindings,
+                          Module &M, llvm::StringRef inputName,
+                          llvm::StringRef outputName) {
+  EE.compile(glow::CompilationMode::Infer);
+  // Allocate stprage for placeholders and initialize inputs.
+  bindings.allocate(M.getPlaceholderByName(inputName))->getHandle().clear(2.0);
+  bindings.allocate(M.getPlaceholderByName(outputName));
+  EE.run(bindings);
+}
+
+/// Check the module cloning functionality.
+TEST(Graph, moduleCloneTest) {
+  // State related to the cloned module and its execution.
+  ExecutionEngine clonedEE("Interpreter");
+  Module &clonedM = clonedEE.getModule();
+  PlaceholderBindings clonedBindings;
+  Tensor clonedResult;
+  // State related to the original module and its execution.
+  PlaceholderBindings originalBindings;
+  Tensor originalResult;
+  // Name of the placeholder holding the results of executions.
+  std::string resultName;
+  {
+    // Define the original execution engine and module.
+    ExecutionEngine originalEE("Interpreter");
+    Module &originalM = originalEE.getModule();
+
+    // Create a function.
+    auto *F = originalM.createFunction("main");
+    auto *input1 = originalM.createPlaceholder(ElemKind::FloatTy,
+                                               {4, 10, 10, 3}, "input", true);
+
+    auto *add = F->createAdd("add", input1, input1);
+    auto *relu = F->createRELU("Relu", add);
+    auto *concat = F->createConcat("concat", {relu, relu, relu}, 0);
+    auto *C = originalM.createConstant(concat->getResult().getType(), "C");
+    C->getPayloadMutable().getHandle().clear(1.0f);
+    auto *SM = F->createAdd("add", concat, C);
+    auto *SN = F->createSave("Save", SM);
+    resultName = SN->getPlaceholder()->getName();
+
+    // Clone the original module into the cloned module.
+    originalM.clone(&clonedM);
+    // The cloned module should have the same numer of types, functions,
+    // constants and placeholders.
+    EXPECT_EQ(originalM.getFunctions().size(), clonedM.getFunctions().size());
+    EXPECT_EQ(originalM.getPlaceholders().size(),
+              clonedM.getPlaceholders().size());
+    EXPECT_EQ(originalM.getConstants().size(), clonedM.getConstants().size());
+    EXPECT_EQ(originalM.getTypes().size(), clonedM.getTypes().size());
+    // String representations of the original and cloned modules should be the
+    // same.
+    EXPECT_EQ(originalM.toString(), clonedM.toString());
+    for (auto *originalF : originalM.getFunctions()) {
+      EXPECT_EQ(originalF->toString(),
+                clonedM.getFunction(originalF->getName())->toString());
+    }
+
+    // Compile and run the original module.
+    compileAndRun(originalEE, originalBindings, originalM, "input", resultName);
+    // Store the result of running the original module.
+    originalResult.assign(originalBindings.get(
+        originalBindings.getPlaceholderByName(resultName)));
+    // The old module should be removed when this scope ends. Thus, if the
+    // cloned module newM refers to any deleted nodes from the original module,
+    // it would result in a dangling reference and most likely in a crash.
+  }
+  // Check that the cloned module is still alive and valid after the original
+  // module was deleted.
+  EXPECT_TRUE(clonedM.verify());
+  // Compile and run the cloned model.
+  compileAndRun(clonedEE, clonedBindings, clonedM, "input", resultName);
+  // Store the result of running the cloned module.
+  clonedResult.assign(
+      clonedBindings.get(clonedBindings.getPlaceholderByName(resultName)));
+  // The results of execution should be exactly the same in both cases.
+  EXPECT_TRUE(originalResult.isEqual(clonedResult, 0));
+}
+
+TEST(Graph, cloneWithPredicates) {
+  Module M;
+  PlaceholderBindings bindings;
+
+  auto *F = M.createFunction("main");
+  auto *input =
+      M.createPlaceholder(ElemKind::FloatTy, {4, 320, 200, 3}, "input", false);
+  auto *counters =
+      M.createPlaceholder(ElemKind::FloatTy, {10}, "counters", false);
+  auto *reluExt = F->createRELU("reluExt", input);
+  auto *reluInt = F->createRELU("reluInt", input);
+  auto *externalPredicate =
+      M.createPlaceholder(ElemKind::Int64ITy, {1}, "predicate", false);
+  auto *C10 = F->createSplat("C10", counters->getType(), 10.0);
+  auto *internalPredicate = F->createCmpLTE("lte", C10, counters);
+
+  reluExt->setPredicate(externalPredicate);
+  reluInt->setPredicate(internalPredicate);
+
+  auto *newF = F->clone("new_main");
+
+  EXPECT_TRUE(newF->verify());
+  EXPECT_EQ(newF->getNodes().size(), F->getNodes().size());
+  EXPECT_EQ(newF->getParent(), F->getParent());
+
+  // Original predicates are not changed
+  EXPECT_EQ(reluExt->getPredicate().getNode(), externalPredicate);
+  EXPECT_EQ(reluInt->getPredicate().getNode(), internalPredicate);
+  // Clone of predicate that points to a node outside the graph
+  // points to the same node (predicate is shared)
+  EXPECT_EQ(nodeByName(newF, "reluExt")->getPredicate().getNode(),
+            externalPredicate);
+  // Clone of predicate that points to a node that belongs to the graph
+  // points to the predicate clone
+  EXPECT_EQ(nodeByName(newF, "reluInt")->getPredicate().getNode(),
+            nodeByName(newF, "lte"));
 }
 
 TEST(Graph, NodeValue) {
@@ -603,7 +828,7 @@ TEST(Graph, NodeValue) {
   auto *S = F->createSave("Save", a);
   auto *res = bindings.allocate(S->getPlaceholder());
 
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 
   EE.run(bindings);
 
@@ -655,20 +880,20 @@ TEST(Graph, nodesWithPredicates) {
   RL0->setPredicate(pred);
   MP0->setPredicate(pred);
 
-  auto *FCL1 = F->createFullyConnected(bindings, "fc", MP0, 10);
+  auto *FCL1 = F->createFullyConnected(bindings, "fc", MP0->getResult(), 10);
   auto *RL3 = F->createRELU("relu4", FCL1);
   auto *SM = F->createSoftMax("sm", RL3, ex);
   auto *save = F->createSave("ret", SM);
   bindings.allocate(save->getPlaceholder());
 
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 
   updateInputPlaceholders(bindings, {input}, {&inputs});
   EE.run(bindings);
 }
 
 // Return the number of ConvolutionNode after lower.
-unsigned getConvNodeSize(BackendKind kind) {
+unsigned getConvNodeSize(llvm::StringRef kind) {
   Module mod;
   Function *F = mod.createFunction("main");
   IRFunction M(F);
@@ -689,7 +914,7 @@ unsigned getConvNodeSize(BackendKind kind) {
     }
   }
 
-  if (kind == BackendKind::Interpreter) {
+  if (kind == "Interpreter") {
     EXPECT_EQ(count, 1);
   }
 
@@ -699,16 +924,16 @@ unsigned getConvNodeSize(BackendKind kind) {
 // Check the unrolling grouped convolution opt status:
 // -- disabled for Interpreter, CPU and OpenCL backend,
 TEST(Graph, disableUnrollingGroupConv) {
-  unsigned numberOfNodesInterpreter = getConvNodeSize(BackendKind::Interpreter);
+  unsigned numberOfNodesInterpreter = getConvNodeSize("Interpreter");
   (void)numberOfNodesInterpreter;
 
 #ifdef GLOW_WITH_CPU
-  unsigned numberOfNodesCPU = getConvNodeSize(BackendKind::CPU);
+  unsigned numberOfNodesCPU = getConvNodeSize("CPU");
   EXPECT_EQ(numberOfNodesCPU, numberOfNodesInterpreter);
 #endif // GLOW_WITH_CPU
 
 #ifdef GLOW_WITH_OPENCL
-  unsigned numberOfNodesOpenCL = getConvNodeSize(BackendKind::OpenCL);
+  unsigned numberOfNodesOpenCL = getConvNodeSize("OpenCL");
   EXPECT_EQ(numberOfNodesOpenCL, numberOfNodesInterpreter);
 #endif // GLOW_WITH_OPENCL
 }
@@ -734,16 +959,17 @@ TEST(Graph, schedulingOfSavesOrderProvided) {
   auto *addAB = F->createAdd("addAB", A, B);
 
   auto *saveNode = F->createSave("ret", addAB);
-  bindings.allocate(saveNode->getPlaceholder());
+  auto *savePH = saveNode->getPlaceholder();
+  bindings.allocate(savePH);
   F->createSave("resetA", zero, A);
 
   // Copy the value of A.
   Tensor AOrig = bindings.get(A)->clone();
 
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 
   EE.run(bindings);
-  auto *ret = bindings.get(saveNode->getPlaceholder());
+  auto *ret = bindings.get(savePH);
   auto handleAOrig = AOrig.getHandle<>();
   auto handleB = bindings.get(B)->getHandle<>();
   auto handleRet = ret->getHandle<>();
@@ -785,11 +1011,11 @@ TEST(Graph, schedulingOfSaves) {
 
   // Copy the value of A.
   Tensor AOrig = bindings.get(A)->clone();
-
-  EE.compile(CompilationMode::Infer, F);
+  auto *ret = saveNode->getPlaceholder();
+  EE.compile(CompilationMode::Infer);
 
   EE.run(bindings);
-  auto *ret = saveNode->getPlaceholder();
+
   auto handleAOrig = AOrig.getHandle<>();
   auto handleB = bindings.get(B)->getHandle<>();
   auto handleRet = bindings.get(ret)->getHandle<>();
@@ -810,16 +1036,14 @@ TEST(Graph, parentLink) {
   ExecutionEngine EE;
 
   auto &mod = EE.getModule();
-  Constant *V = new Constant("V", mod.uniqueType(ElemKind::FloatTy, {3, 32}));
+  Constant *V =
+      new Constant("V", mod.uniqueType(ElemKind::FloatTy, {3, 32}), ANY_LAYOUT);
 
   // Variables don't belong to any function...
   EXPECT_EQ(V->getParent(), nullptr);
   // Even when we create them from a module...
   Constant *V2 = mod.createConstant(V->getType(), "V2");
   EXPECT_EQ(V2->getParent(), nullptr);
-  // Or add them to a module.
-  mod.addConstant(V);
-  EXPECT_EQ(V->getParent(), nullptr);
 
   Function *F = mod.createFunction("main");
 
@@ -849,6 +1073,35 @@ TEST(Graph, parentLink) {
   // cleaned at the end of the test.
   F->addNode(clonedAddNode);
   EXPECT_EQ(clonedAddNode->getParent(), F);
+
+  delete V;
+}
+
+/// Check that verification can detect that Storage nodes are being used by
+/// Functions in a Module that doesn't own the Storage nodes.
+TEST(Graph, moduleLink) {
+  ExecutionEngine EEA, EEB;
+
+  auto &modA = EEA.getModule();
+  auto &modB = EEB.getModule();
+
+  auto *FA = modA.createFunction("FA");
+  auto *FB = modB.createFunction("FB");
+
+  auto *C = modA.createConstant(ElemKind::FloatTy, {1}, "C");
+  auto *P = modA.createPlaceholder(ElemKind::FloatTy, {1}, "P", false);
+
+  auto *AA = FA->createAdd("AA", C, P);
+  FA->createSave("SA", AA);
+
+  // These nodes use Storage nodes that reside in modA
+  auto *AB = FB->createAdd("AB", C, P);
+  FB->createSave("SB", AB);
+
+  EXPECT_TRUE(modA.verify());
+  EXPECT_FALSE(
+      modB.verify()); // Module::verify calls Function::verify on all functions
+                      // within the module, so this should fail
 }
 
 /// Check that Cmp nodes are created with proper output types.
@@ -1134,8 +1387,8 @@ TEST(Graph, setType) {
   Module M;
   auto *F = M.createFunction("main");
 
-  const size_t inputDims[] = {4, 10};
-  const size_t top5Dims[] = {4, 5};
+  const dim_t inputDims[] = {4, 10};
+  const dim_t top5Dims[] = {4, 5};
   auto *input =
       M.createPlaceholder(ElemKind::FloatTy, inputDims, "input", true);
   TopKNode *topK = F->createTopK("add", input, 5);
@@ -1251,6 +1504,19 @@ TEST(Graph, verifyConstantNoWriters) {
   NodeValue(outputPH).replaceAllUsesOfWith(outputC);
 
   EXPECT_FALSE(M.verify());
+}
+
+TEST(Graph, typeUnsafeReplaceAllUsesOfWith) {
+  Module M;
+  auto *F = M.createFunction("main");
+
+  auto *LHS = M.createPlaceholder(ElemKind::FloatTy, {3, 4}, "A", false);
+  auto *RHS = M.createPlaceholder(ElemKind::FloatTy, {4, 5}, "B", false);
+  auto *FC = F->createMatMul("fc", LHS, RHS);
+  F->createSave("save", FC);
+
+  auto newLHS = M.createPlaceholder(ElemKind::FloatTy, {10, 10}, "A", false);
+  LHS->getOutput().typeUnsafeReplaceAllUsesOfWith(newLHS);
 }
 
 /// Check that the verifier will complain if a constant and its
@@ -1376,11 +1642,11 @@ TEST(Graph, hookTest) {
   EXPECT_EQ(mod.getPlaceholders().size(), 2);
 
   // Hook the first relu and verify that the hooked graph looks right.
-  auto hooked = glow::hookOutput(F, relu1);
+  auto hooked = glow::hookNode(F, relu1);
   auto const &nodes = hooked.function->getNodes();
   ASSERT_EQ(mod.getPlaceholders().size(), 3);
   ASSERT_EQ(nodes.size(), 2);
-  auto const *hookSave = hooked.save;
+  auto const *hookSave = *hooked.outputSaves.begin();
   ASSERT_TRUE(hookSave);
   auto *inp = llvm::dyn_cast<ReluNode>(hookSave->getInput());
   ASSERT_TRUE(inp);
@@ -1480,11 +1746,12 @@ TEST(Graph, clonePlaceholderBindingsRuns) {
   auto *FCL1 = F->createFullyConnected(bindings, "fc", input, 10);
   auto *RL3 = F->createRELU("relu4", FCL1);
   auto *save = F->createSave("ret", RL3);
+  auto *savePH = save->getPlaceholder();
 
   bindings.allocate(save->getPlaceholder());
 
   // Compile once.
-  EE.compile(CompilationMode::Infer, F);
+  EE.compile(CompilationMode::Infer);
 
   // Run with random inputs.
   inputs.getHandle<>().randomize(-3.0, 3.0, PRNG);
@@ -1496,8 +1763,8 @@ TEST(Graph, clonePlaceholderBindingsRuns) {
 
   // PlaceholderBindingss are identical.
   Tensor *saveBacking1, *saveBacking2;
-  saveBacking1 = bindings.get(save->getPlaceholder());
-  saveBacking2 = bindings2.get(save->getPlaceholder());
+  saveBacking1 = bindings.get(savePH);
+  saveBacking2 = bindings2.get(savePH);
   EXPECT_NE(saveBacking1, saveBacking2);
   EXPECT_EQ(saveBacking1->size(), saveBacking2->size());
   EXPECT_TRUE(saveBacking1->isEqual(*saveBacking2));
@@ -1697,9 +1964,10 @@ TEST(Graph, testDumpStructure) {
   std::string mesN = K->toString();
   std::string expectMes = R"(Placeholder
 name : "input"
+layout : *
 output : float<4 x 320 x 200 x 100 x 3>
-users : 0
 trainable : 1
+users : 0
 )";
   EXPECT_EQ(mesN, expectMes);
   EXPECT_EQ(mesN, osN1.str());
@@ -1724,6 +1992,12 @@ K : 3
 users : 0
 Values : float<10 x 3>
 Indices : index64<10 x 3>
+Placeholder
+name : "input__1"
+layout : *
+output : float<10 x 10>
+trainable : 1
+users : 1
 )";
   EXPECT_EQ(mesF, expectMesF);
   EXPECT_EQ(mesF, osF1.str());
@@ -1731,6 +2005,25 @@ Indices : index64<10 x 3>
   llvm::raw_string_ostream osF2(storageF2);
   osF2 << F2;
   EXPECT_EQ(mesF, osF2.str());
+  storageF1.clear();
+  F2->dump(osF1, /* skipUsersForStorage */ true);
+  mesF = F2->toString(/* skipUsersForStorage */ true);
+  expectMesF = R"(Graph structure F2:
+TopK
+name : topk
+Input : float<10 x 10>
+K : 3
+users : 0
+Values : float<10 x 3>
+Indices : index64<10 x 3>
+Placeholder
+name : "input__1"
+layout : *
+output : float<10 x 10>
+trainable : 1
+)";
+  EXPECT_EQ(mesF, expectMesF);
+  EXPECT_EQ(mesF, osF1.str());
   // Test Module
   MD.createConstant(ElemKind::FloatTy, {1, 1}, "dummy");
   std::string storageM1;
@@ -1740,11 +2033,26 @@ Indices : index64<10 x 3>
   std::string expectMesM = R"(Module structure:
 Constant
 name : "dummy"
+layout : *
 output : float<1 x 1>
 users : 0
 
-Function:F
-Function:F2
+Placeholder
+name : "input__1"
+layout : *
+output : float<10 x 10>
+trainable : 1
+users : 1
+
+Placeholder
+name : "input"
+layout : *
+output : float<4 x 320 x 200 x 100 x 3>
+trainable : 1
+users : 0
+
+Function : F2
+Function : F
 )";
   EXPECT_EQ(mesM, expectMesM);
   EXPECT_EQ(mesM, osM1.str());

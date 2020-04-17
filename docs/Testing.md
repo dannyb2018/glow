@@ -13,7 +13,7 @@ when we fix bugs.  Both regression tests and feature tests are found under the
 
 We rely on external test suites to test the compiler. We use the data sets
 CIFAR10 and MNIST (located in the "example/" directory) to test the correctness
-of the whole system.  The script under 'utils/' download and extract the data
+of the whole system.  The script under 'utils/' downloads and extracts the data
 set.
 
 ## Model Loader
@@ -23,7 +23,7 @@ models and executing them end-to-end.
 
 ### Image Classification
 
-The program `image-classifier` loads a model, a png file, and runs a single pass
+The program `image-classifier` loads a model, a PNG file, and runs a single pass
 of inference. If everything goes right the output of the program is identical to
 the output of the original (Caffe2 or ONNX) model. Unfortunately, the models do
 not usually describe what the input format should be. Should the pixels be
@@ -45,7 +45,7 @@ can be used to calculate Top-1 and Top-5 accuracy. It can be run via a command
 like the following:
 
 ```
-python utils/imagenet_topk_accuracy_driver.py --batch-size=10 --validation-images-dir=${PATH_TO_IMAGES} --image-classifier-cmd="${PATH_TO_IMAGE_CLASSIFIER_BINARY} -image-mode=0to1 -m=${PATH_TO_RESNET50_PROTOS_DIR} -model-input-name=gpu_0/data -cpu -topk=5 -"
+python utils/imagenet_topk_accuracy_driver.py --batch-size=10 --validation-images-dir=${PATH_TO_IMAGES} --image-classifier-cmd="${PATH_TO_IMAGE_CLASSIFIER_BINARY} -image-mode=0to1 -m=${PATH_TO_RESNET50_PROTOS_DIR} -model-input-name=gpu_0/data -backend=CPU -topk=5 -"
 ```
 
 Note that the `--image-classifier-cmd` must include `-topk=5` for printing the
@@ -74,7 +74,7 @@ for the model. A backend can be optionally specified, just like for the
 `image-classifier`.
 
 ```
-$ ./bin/text-translator -m en2gr -cpu
+$ ./bin/text-translator -m en2gr -backend=CPU
 
 Enter a sentence in English to translate to German: My favorite sport is basketball .
 mein Lieblingssport ist Basketball .

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 #ifndef GLOW_GRAPH_NODEVALUE_H
 #define GLOW_GRAPH_NODEVALUE_H
 
+#include "glow/Base/Traits.h"
 #include "glow/Base/Type.h"
 
 namespace glow {
@@ -73,18 +74,27 @@ public:
   /// \returns the underlying pointer when casting.
   operator Node *() const { return node_; }
 
-  /// Replace all of the uses in \p F of this value with \p v.
-  void replaceAllUsesOfWith(NodeValue v, const Function *F = nullptr) const;
+  /// Replace all of the uses in \p F of this value with \p v. Types of the node
+  /// value and \p v should be exactly the same.
+  void replaceAllUsesOfWith(NodeValue v, const Function *F = nullptr,
+                            Node *skipReplacement = nullptr) const;
+
+  /// Replace all of the uses in \p F of this value with \p v. Types of the node
+  /// value and \p v can be different.
+  void typeUnsafeReplaceAllUsesOfWith(NodeValue v, const Function *F = nullptr,
+                                      Node *skipReplacement = nullptr) const;
 
   /// Return the TypeRef of the referenced return value.
   TypeRef getType() const;
   /// Set the type of the referenced value.
   void setType(TypeRef ty);
+  /// Set the type of the referenced value. Does not check that dims() match.
+  void setTypeUnsafe(TypeRef ty);
 
   /// Methods that forward to the result type (that must be valid):
   /// @{
   ElemKind getElementType() const;
-  llvm::ArrayRef<size_t> dims() const;
+  llvm::ArrayRef<dim_t> dims() const;
   /// @}
 
   bool operator==(const NodeValue &O) const {
@@ -105,7 +115,47 @@ public:
   /// Get the list of users of this NodeValue.
   llvm::iterator_range<NodeValueIterator> getUsers();
   llvm::iterator_range<NodeValueConstIterator> getUsers() const;
+
+  /// Get the full node output name based on the node name and output number.
+  /// The following format is used: nodename:outputNumber
+  static std::string
+  generateNodeOutputName(const std::string &nodeName, unsigned outputNumber = 0,
+                         bool stripResNoFor0thInput = false) {
+    return nodeName + ((stripResNoFor0thInput && outputNumber == 0)
+                           ? ""
+                           : ":" + std::to_string(outputNumber));
+  }
+
+  /// \returns a unique name for this NodeValue, where the name of the node is
+  /// appended with a colon followed by \ref resNo_.
+  /// If \p stripResNoFor0thInput then the result number for the 0th input will
+  /// not be appended (i.e. no ":0" will be appended).
+  std::string generateNodeOutputName(bool stripResNoFor0thInput = false) const;
 };
+
+/// Struct containing the output name string and node kind for use in the
+/// LoweredInfoMap for keeping track of lowered node info.
+struct NodeNameAndKind : public Named, public Kinded {
+public:
+  NodeNameAndKind(llvm::StringRef name, size_t resNo, Kinded::Kind k)
+      : Named(NodeValue::generateNodeOutputName(name, resNo)), Kinded(k) {}
+};
+
+/// Overload < operator for NodeNameAndKind to allow for usage with std::set.
+inline bool operator<(const NodeNameAndKind &x, const NodeNameAndKind &y) {
+  return x.getName() < y.getName();
+}
+
+/// Overload == operator for NodeNameAndKind to allow for usage with std::set.
+inline bool operator==(const NodeNameAndKind &x, const NodeNameAndKind &y) {
+  return x.getName() == y.getName();
+}
+
+/// Used to keep track of the origin of lowered Nodes via output names as
+/// determined by NodeValue::generateNodeOutputName(). For example if some
+/// NodeValue X is lowered from some NodeValue Y, then the output name of X is a
+/// key which maps to a set of names which contains the output name of Y.
+using LoweredInfoMap = llvm::StringMap<std::set<NodeNameAndKind>>;
 
 /// A handle type for a NodeValue. This type should be used only by the
 /// class members of Node classes when they need to refer to other nodes!

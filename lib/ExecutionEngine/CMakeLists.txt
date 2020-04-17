@@ -5,6 +5,7 @@ target_link_libraries(ExecutionEngine
                       PRIVATE
                         Backend
                         Backends
-                        Optimizer
+                        HostManager
+                        GraphOptimizer
                         Base
                         Graph)

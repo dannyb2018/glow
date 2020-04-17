@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,28 +52,34 @@ public:
   /// @name High-level, operation-level IRBuilder.
   ///@{
 
-  MaxPoolWithXYInst *createMaxPoolWithXYOp(llvm::StringRef name, Value *input,
-                                           llvm::ArrayRef<unsigned_t> kernels,
-                                           llvm::ArrayRef<unsigned_t> strides,
-                                           llvm::ArrayRef<unsigned_t> pads);
+  MaxPoolWithArgmaxInst *createMaxPoolWithArgmaxOp(
+      llvm::StringRef name, Value *input, llvm::ArrayRef<unsigned_t> kernels,
+      llvm::ArrayRef<unsigned_t> strides, llvm::ArrayRef<unsigned_t> pads,
+      unsigned_t layout, ElemKind argMaxIndicesTy);
+
+  ArgMaxInst *createArgMaxOp(llvm::StringRef name, Value *input,
+                             unsigned_t axis, bool keepDims,
+                             ElemKind outIndicesTy);
 
   AvgPoolInst *createAvgPoolOp(Value *input, llvm::ArrayRef<unsigned_t> kernels,
                                llvm::ArrayRef<unsigned_t> strides,
-                               llvm::ArrayRef<unsigned_t> pads);
+                               llvm::ArrayRef<unsigned_t> pads,
+                               unsigned_t layout);
 
   CrossEntropyLossInst *createCrossEntropyLossOp(llvm::StringRef name, Value *P,
                                                  Value *labels);
 
   TensorViewInst *createTensorView(ElemKind elemKind,
-                                   llvm::ArrayRef<size_t> dims, Value *src,
+                                   llvm::ArrayRef<dim_t> dims, Value *src,
                                    llvm::StringRef name,
-                                   llvm::ArrayRef<size_t> offsets = {});
+                                   llvm::ArrayRef<dim_t> offsets = {});
 
   LocalResponseNormalizationInst *createLocalResponseNormalizationOp(
       llvm::StringRef name, Value *input, size_t halfWindowSize = 2,
       float alpha = 1e-4, float beta = 0.75, float k = 2.0);
 
-  TopKInst *createTopKOp(llvm::StringRef name, Value *input, size_t k);
+  TopKInst *createTopKOp(llvm::StringRef name, Value *input, size_t k,
+                         ElemKind outIndicesTy);
 
   Value *createReturnOp(Value *input);
 
@@ -85,18 +91,18 @@ public:
   WeightVar *createWeightVar(TypeRef T, llvm::StringRef name = "",
                              MutabilityKind m = MutabilityKind::Mutable);
 
-  WeightVar *createWeightVar(ElemKind elemTy, llvm::ArrayRef<size_t> dims,
+  WeightVar *createWeightVar(ElemKind elemTy, llvm::ArrayRef<dim_t> dims,
                              llvm::StringRef name = "",
                              MutabilityKind m = MutabilityKind::Mutable);
 
-  WeightVar *createWeightVar(ElemKind elemTy, llvm::ArrayRef<size_t> dims,
+  WeightVar *createWeightVar(ElemKind elemTy, llvm::ArrayRef<dim_t> dims,
                              float scale, int32_t offset,
                              llvm::StringRef name = "",
                              MutabilityKind m = MutabilityKind::Mutable);
 
   AllocActivationInst *createAllocActivationInst(llvm::StringRef name,
                                                  ElemKind elemTy,
-                                                 llvm::ArrayRef<size_t> dims);
+                                                 llvm::ArrayRef<dim_t> dims);
 
 // Import the auto-generated instruction creation methods:
 #include "glow/AutoGenIRBuilder.h"

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,11 +46,20 @@ int main(int argc, char **argv) {
   Placeholder *output = EXIT_ON_ERR(LD->getSingleOutput());
   auto *outputT = bindings.allocate(output);
 
+  CHECK_EQ(0, std::distance(LD->getInputVarsMapping().keys().begin(),
+                            LD->getInputVarsMapping().keys().end()))
+      << "ModelRunner only supports models with no external inputs.";
+
   std::string modelName = loader.getFunction()->getName().str();
 
   // Compile the model, and perform quantization/emit a bundle/dump debug info
   // if requested from command line.
-  loader.compile(bindings);
+  CompilationContext cctx = loader.getCompilationContext();
+  cctx.bindings = &bindings;
+  // Disable constant folding, as the model runner is designed for models with
+  // all Constant inputs.
+  cctx.optimizationOpts.enableConstantFolding = false;
+  loader.compile(cctx);
 
   // If in bundle mode, do not run inference.
   if (!emittingBundle()) {
@@ -70,10 +79,10 @@ int main(int argc, char **argv) {
       LOG(FATAL) << "Unexpected output type";
     }
 
-    // If profiling, generate and serialize the quantization infos now that we
+    // If profiling, generate and serialize the profiling infos now that we
     // have run inference to gather the profile.
     if (profilingGraph()) {
-      loader.generateAndSerializeQuantizationInfos(bindings);
+      loader.generateAndSerializeProfilingInfos(bindings);
     }
   }
 

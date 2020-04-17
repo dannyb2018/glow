@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2018-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -105,6 +105,12 @@ template <typename Ty>
 struct CompareOperatorLessEqual : public CompareWithName<Ty> {
   bool operator()(const Ty &a, const Ty &b) const override { return a <= b; }
   llvm::StringRef getCompareName() const override { return "LessEqual"; }
+};
+
+/// Operator <.
+template <typename Ty> struct CompareOperatorLess : public CompareWithName<Ty> {
+  bool operator()(const Ty &a, const Ty &b) const override { return a < b; }
+  llvm::StringRef getCompareName() const override { return "Less"; }
 };
 /// @}
 

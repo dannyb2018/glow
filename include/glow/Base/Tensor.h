@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,12 @@
 #ifndef GLOW_BASE_TENSOR_H
 #define GLOW_BASE_TENSOR_H
 
+#include <algorithm>
 #include <cassert>
 #include <vector>
 
+#include "glow/Base/DeviceTensorTransferManager.h"
+#include "glow/Base/TensorSerialization.h"
 #include "glow/Base/Type.h"
 #include "glow/Support/Compiler.h"
 #include "glow/Support/Memory.h"
@@ -45,7 +48,72 @@ void genericTranspose(const Tensor *src, Tensor *dest,
 /// currDims expanded with dimension = 1 until the maximum tensor dimension is
 /// reached. The number of elements in the input dims is the same as in the
 /// returned dims. For example, input {2,1,4} would result in {2,1,4,1,1,1}.
-ShapeVector expandDimsToMax(llvm::ArrayRef<size_t> currDims);
+ShapeVector expandDimsToMax(llvm::ArrayRef<dim_t> currDims);
+
+namespace runtime {
+class DeviceManager;
+}
+
+/// Holds information regarding whether this Tensor exists in a device-specific
+/// form, either resident or specific for a device, and what device holds it.
+class DeviceResidencyInfo final {
+  enum class TensorResidency {
+    Host,
+    Device,
+  };
+
+  // A pointer to the device manager of the device on which the tensor
+  // resides.
+  DeviceTensorTransferManager *deviceManager_{nullptr};
+  /// The residency status of the tensor.
+  TensorResidency tensorResidency_{TensorResidency::Host};
+  // A pointer to a context structure, containing the required info to access
+  // tensor data and perform transfers.
+  void *locationContext_{nullptr};
+
+public:
+  DeviceResidencyInfo()
+      : deviceManager_(nullptr), tensorResidency_(TensorResidency::Host),
+        locationContext_(nullptr) {}
+
+  /// Move ctor.
+  DeviceResidencyInfo(DeviceResidencyInfo &&other) = delete;
+
+  /// Move assignment operator.
+  DeviceResidencyInfo &operator=(DeviceResidencyInfo &&other) = delete;
+
+  ~DeviceResidencyInfo() {
+    // If a tensor is device resident, let its device manager free the device
+    // buffer.
+    if (isDeviceResident()) {
+      deviceManager_->releaseDeviceTensor(locationContext_);
+    }
+  }
+
+  /// Removes all device specific state.
+  void clear() {
+    deviceManager_ = nullptr;
+    locationContext_ = nullptr;
+    tensorResidency_ = TensorResidency::Host;
+  }
+
+  /// \returns true if this Tensor is resident or specific for a device.
+  bool isDeviceResident() const {
+    assert((tensorResidency_ == TensorResidency::Host || deviceManager_) &&
+           "Device resident tensor must have an assigned device manager.");
+    return tensorResidency_ == TensorResidency::Device;
+  }
+
+  /// \returns the DeviceManager this tensor is resident on, if any.
+  DeviceTensorTransferManager *getDeviceManager() const {
+    return deviceManager_;
+  }
+
+  /// \returns the device specific location context for a resident Tensor.
+  void *getLocationContext() const { return locationContext_; }
+
+  friend class Tensor;
+};
 
 /// A class that represents a contiguous n-dimensional array (a tensor).
 class Tensor final {
@@ -70,6 +138,12 @@ private:
   /// The TensorPool that is managing this Tensor (if any).
   TensorPool *tensorPool_{nullptr};
 
+  /// The device residency info accosiated with the tensor.
+  DeviceResidencyInfo *deviceResidency_{nullptr};
+
+  /// If this tensor owns the DeviceResidencyInfo.
+  bool ownsDeviceResidency_{false};
+
   /// Size in bytes of the unpadded region memory. This is useful  communicating
   /// the actual size of the data, this allows for copying only inputs and not
   /// padding to the device.
@@ -84,9 +158,8 @@ public:
   /// \returns true if it is an unowned tensor.
   bool isUnowned() const { return isUnowned_; }
 
-  /// \returns the size of the unpadded memory region. If unpaddedSize_ is not
-  /// set return the size of the entire payload.
-  size_t getUnpaddedSizeInBytes() const;
+  /// \returns the number of allocated bytes pointed to by \ref data_.
+  size_t getUnpaddedSizeInBytes() const { return unpaddedSize_; }
 
   /// \returns the type of the tensor.
   const Type &getType() const { return type_; }
@@ -94,7 +167,9 @@ public:
   /// Set the type of the Tensor to \p t.
   void setType(const TypeRef t) {
     assert(type_.dims() == t->dims() && "New type must retain the same shape.");
-    assert(type_.getSizeInBytes() == t->getSizeInBytes() &&
+    assert(((type_.getElementType() == t->getElementType() &&
+             type_.size() == t->size()) ||
+            type_.getSizeInBytes() == t->getSizeInBytes()) &&
            "New type must retain the same size in bytes.");
     type_ = *t;
   }
@@ -103,7 +178,7 @@ public:
   ElemKind getElementType() const { return type_.getElementType(); }
 
   /// \returns True if the coordinate is within the array.
-  bool isInBounds(llvm::ArrayRef<size_t> indices) const {
+  bool isInBounds(llvm::ArrayRef<dim_t> indices) const {
     assert(type_.numSizes_ == indices.size() && "Invalid number of indices");
     for (size_t i = 0u, e = indices.size(); i < e; i++) {
       if (indices[i] >= type_.sizes_[i]) {
@@ -116,68 +191,88 @@ public:
   /// Set the content of the tensor to zero. If \p resetFusedScalesOffsets, then
   /// fused scales/offsets will be set to 1.0/0.0 as well.
   void zero(bool resetFusedScalesOffsets = false) {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
+    size_t size = actualSize();
     // Quantized tensors should go to their offset.
     switch (type_.getElementType()) {
     case ElemKind::Int8QTy: {
       auto *data = reinterpret_cast<int8_t *>(getData());
-      std::fill(&data[0], &data[0] + size(), (int8_t)type_.getOffset());
+      std::fill(&data[0], &data[0] + size, (int8_t)type_.getOffset());
       break;
     }
     case ElemKind::UInt8QTy: {
       auto *data = reinterpret_cast<uint8_t *>(getData());
-      std::fill(&data[0], &data[0] + size(), (uint8_t)type_.getOffset());
+      std::fill(&data[0], &data[0] + size, (uint8_t)type_.getOffset());
       break;
     }
     case ElemKind::Int16QTy: {
       auto *data = reinterpret_cast<int16_t *>(getData());
-      std::fill(&data[0], &data[0] + size(), (int16_t)type_.getOffset());
+      std::fill(&data[0], &data[0] + size, (int16_t)type_.getOffset());
       break;
     }
     case ElemKind::Int32QTy: {
       auto *data = reinterpret_cast<int32_t *>(getData());
-      std::fill(&data[0], &data[0] + size(), (int32_t)type_.getOffset());
+      std::fill(&data[0], &data[0] + size, (int32_t)type_.getOffset());
       break;
     }
-    case ElemKind::UInt8FusedQTy: {
-      assert(dims().size() == 2 && "Fused tensor must be 2-dimensional.");
-      assert(dims()[1] > 8 && "Fused tensor must have more than 8 columns.");
-      const size_t width = dims()[1];
-      auto *data = reinterpret_cast<uint8_t *>(getData());
-      for (size_t i = 0, e = dims()[0]; i < e; i++) {
-        uint8_t *scaleOffsetPtr = &data[(i + 1) * width] - 2 * sizeof(float);
-        float scale, offset;
-        if (resetFusedScalesOffsets) {
-          // Use these as defaults, and copy them into each row.
-          scale = 1.0;
-          offset = 0.0;
-          memcpy(scaleOffsetPtr, &scale, sizeof(float));
-          memcpy(scaleOffsetPtr + sizeof(float), &offset, sizeof(float));
-        } else {
-          memcpy(&scale, scaleOffsetPtr, sizeof(float));
-          memcpy(&offset, scaleOffsetPtr + sizeof(float), sizeof(float));
-        }
-        assert(scale != 0.0 &&
-               "Disallow scale = 0.0 for UInt8FusedQTy; causes div by zero.");
-        float zero = nearbyintf(-offset / scale);
-        std::fill(&data[i * width], scaleOffsetPtr, static_cast<uint8_t>(zero));
-      }
-      break;
-    }
+#define FUSED_CASE(ELEM_KIND, DATA_TYPE)                                       \
+  case ElemKind::ELEM_KIND: {                                                  \
+    assert(dims().size() == 2 && "Fused tensor must be 2-dimensional.");       \
+    assert(dims()[1] > sizeof(DATA_TYPE) &&                                    \
+           "Fused tensor must have space for scale and offset.");              \
+    const size_t dataWidth = dims()[1];                                        \
+    const size_t alignedLength = type_.strides()[0];                           \
+    auto *data = reinterpret_cast<uint8_t *>(getData());                       \
+    for (size_t i = 0, e = dims()[0]; i < e; i++) {                            \
+      uint8_t *scaleOffsetPtr =                                                \
+          data + i * alignedLength + dataWidth - 2 * sizeof(DATA_TYPE);        \
+      DATA_TYPE scale, offset;                                                 \
+      if (resetFusedScalesOffsets) {                                           \
+        /* Use these as defaults, and copy them into each row. */              \
+        scale = 1.0;                                                           \
+        offset = 0.0;                                                          \
+        memcpy(scaleOffsetPtr, &scale, sizeof(DATA_TYPE));                     \
+        memcpy(scaleOffsetPtr + sizeof(DATA_TYPE), &offset,                    \
+               sizeof(DATA_TYPE));                                             \
+      } else {                                                                 \
+        memcpy(&scale, scaleOffsetPtr, sizeof(DATA_TYPE));                     \
+        memcpy(&offset, scaleOffsetPtr + sizeof(DATA_TYPE),                    \
+               sizeof(DATA_TYPE));                                             \
+      }                                                                        \
+      DCHECK_NE(static_cast<float>(scale), 0.0)                                \
+          << "Disallow scale = 0.0 for Fused ElemKinds; causes div by zero.";  \
+      float zero = nearbyintf(-1 * static_cast<float>(offset / scale));        \
+      std::fill(data + i * alignedLength, scaleOffsetPtr,                      \
+                static_cast<uint8_t>(zero));                                   \
+    }                                                                          \
+    break;                                                                     \
+  }
+      FUSED_CASE(UInt8FusedQTy, float);
+      FUSED_CASE(UInt8FusedFP16QTy, float16_t);
+#undef FUSED_CASE
+
     default:
       // Non-quantized tensors are set to 0.
-      std::fill(&getData()[0], &getData()[0] + size() * type_.getElementSize(),
+      std::fill(&getData()[0], &getData()[0] + size * type_.getElementSize(),
                 0);
       break;
     }
   }
 
   /// \returns the shape of the tensor.
-  llvm::ArrayRef<size_t> dims() const { return type_.dims(); }
+  llvm::ArrayRef<dim_t> dims() const { return type_.dims(); }
 
-  /// \returns the number of elements in the tensor.
-  size_t size() const { return type_.size(); }
+  /// \returns the number of real meaningful elements in the tensor. Does not
+  /// take strides into account.
+  dim_t size() const { return type_.size(); }
 
-  /// \returns the number of bytes required to store the tensor.
+  /// \returns the actual number of elements in the tensor taking striding into
+  /// account. Since size() does not take striding into account, size() is
+  /// always <= actualSize().
+  dim_t actualSize() const { return type_.actualSize(); }
+
+  /// \returns the number of bytes required to store the tensor based on its
+  /// Type. Note that this includes the size required for padding.
   uint64_t getSizeInBytes() const { return type_.getSizeInBytes(); }
 
   /// \returns the TensorPool managing this object, or nullptr if it is
@@ -189,7 +284,7 @@ public:
 
   /// Initialize from a list of float literals.
   Tensor(const std::initializer_list<float> &vec) {
-    reset(ElemKind::FloatTy, {vec.size()});
+    reset(ElemKind::FloatTy, {(dim_t)vec.size()});
     auto *data = getRawDataPointer<float>();
     int i = 0;
     for (auto &f : vec) {
@@ -209,7 +304,7 @@ public:
   }
 
   /// Allocate and initialize a float new tensor.
-  Tensor(ElemKind elemTy, llvm::ArrayRef<size_t> dims)
+  Tensor(ElemKind elemTy, llvm::ArrayRef<dim_t> dims)
       : data_(nullptr), type_(elemTy, dims), isUnowned_{false} {
     reset(elemTy, dims);
   }
@@ -220,13 +315,18 @@ public:
   /// unpaddedSize can be set to indicate actual size of the inputs.
   Tensor(void *data, TypeRef ty, size_t unpaddedSize = 0)
       : data_(reinterpret_cast<char *>(data)),
-        type_(*ty), isUnowned_{false}, unpaddedSize_{unpaddedSize} {
+        type_(*ty), unpaddedSize_{unpaddedSize} {
     // Mark as unowned.
     isUnowned_ = true;
+    // We do want DeviceResidency however, since there is no owning Glow Tensor.
+    resetDeviceInfo();
+    if (unpaddedSize_ == 0) {
+      unpaddedSize_ = type_.getSizeInBytes();
+    }
   }
 
   /// Allocate and initialize a new integer tensor with \p scale and \p offset.
-  Tensor(ElemKind elemTy, llvm::ArrayRef<size_t> dims, float scale,
+  Tensor(ElemKind elemTy, llvm::ArrayRef<dim_t> dims, float scale,
          int32_t offset)
       : data_(nullptr), type_(elemTy, dims, scale, offset), isUnowned_{false} {
     reset(type_);
@@ -243,9 +343,12 @@ public:
 
   /// Initialize the content of the tensor using the \p init method. The value
   /// \p val is the initialization parameter. \p PRNG is used to generate random
-  /// numbers. Note that if the tensor's kind is UInt8FusedQTy, then the fused
+  /// numbers. Note that if the tensor's kind is Fused, then the fused
   /// scaled/offsets will not be modified.
   void init(InitKind init, float val, PseudoRNG &PRNG);
+
+  /// \returns an unowned tensor with the exact same dimensions as this.
+  Tensor getUnowned() const { return getUnowned(dims()); }
 
   /// \returns unowned tensor using the same data buffer as the current tensor
   /// but having different dimensions \p dims. \p offsets represents an optional
@@ -256,8 +359,8 @@ public:
   /// The lifetime of the returned unowned tensor should be always within
   /// the lifetime of its parent tensor, i.e. the unowned tensor should not
   /// outlive its parent tensor.
-  Tensor getUnowned(llvm::ArrayRef<size_t> dims,
-                    llvm::ArrayRef<size_t> offsets = {}) const {
+  Tensor getUnowned(llvm::ArrayRef<dim_t> dims,
+                    llvm::ArrayRef<dim_t> offsets = {}) const {
     Tensor unownedTensor;
 
     auto *firstElemPtr = getData();
@@ -266,10 +369,9 @@ public:
              "Number of dims of tensor must equal number of dims in offsets");
       // Find the index of the first element and use it to find the pointer to
       // the first element.
-      size_t index = 0, pi = 1;
-      for (int i = this->dims().size() - 1; i >= 0; i--) {
-        index += pi * offsets[i];
-        pi *= this->dims()[i];
+      size_t index = 0;
+      for (size_t i = 0; i < this->dims().size(); i++) {
+        index += type_.strides()[i] * offsets[i];
       }
       firstElemPtr = &firstElemPtr[index * type_.getElementSize()];
     }
@@ -277,40 +379,84 @@ public:
     unownedTensor.data_ = firstElemPtr;
     unownedTensor.isUnowned_ = true;
     unownedTensor.type_ = Type::newShape(getType(), dims);
+    unownedTensor.deviceResidency_ = deviceResidency_;
+
+    // If the original base Tensor is padded, then we only allow the unowned
+    // Tensor to be padded if there are no offsets. Otherwise assert that the
+    // base Tensor is not padded, and set unpaddedSize to that of the new
+    // unowned type.
     if (offsets.size() == 0) {
-      assert(size() == unownedTensor.size() && "The size of the unowned tensor "
-                                               "should the same as the size of "
-                                               "the original tensor");
+      unownedTensor.unpaddedSize_ = unpaddedSize_;
+      assert(actualSize() == unownedTensor.actualSize() &&
+             "The size of the unowned tensor "
+             "should be the same as the size of "
+             "the original tensor");
 
     } else {
-      assert(size() >= unownedTensor.size() && "The size of the unowned tensor "
-                                               "should be no greater than the "
-                                               "size of the original tensor");
+      unownedTensor.unpaddedSize_ = unownedTensor.type_.getSizeInBytes();
+      assert(getSizeInBytes() == getUnpaddedSizeInBytes() &&
+             "Problematic to get unowned offsetted view of a padded tensor");
+      assert(actualSize() >= unownedTensor.actualSize() &&
+             "The size of the unowned tensor "
+             "should be no greater than the "
+             "size of the original tensor");
     }
     return unownedTensor;
   }
 
-  /// Reset the shape and type of this tensor to match the shape and type of
-  /// \p other.
-  void reset(const Tensor *other) { reset(other->getType()); }
+  /// This is the same as \ref getUnowned() but it produces an owned tensor
+  /// instead. \returns owned tensor copied from the data buffer of the current
+  /// tensor but having different dimensions \p dims. \p offsets represents an
+  /// optional offset into the tensor representing the location of the first
+  /// element to start a subview from.
+  Tensor getOwnedSlice(llvm::ArrayRef<dim_t> dims,
+                       llvm::ArrayRef<dim_t> offsets = {}) const {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
+    return getUnowned(dims, offsets).clone();
+  }
 
-  void reset(ElemKind elemTy, llvm::ArrayRef<size_t> shape) {
+  /// Reset the shape and type of this tensor to match the shape and type of
+  /// \p other. The size of the buffer is set to \p unpaddedSize unless it is
+  /// zero, which will instead default back to the number of bytes needed for
+  /// the type of \p other.
+  void reset(const Tensor *other, size_t unpaddedSize = 0) {
+    reset(other->getType(), unpaddedSize);
+  }
+
+  void reset(ElemKind elemTy, llvm::ArrayRef<dim_t> shape) {
     Type t(elemTy, shape);
     reset(t);
   }
 
-  void reset(ElemKind elemTy, llvm::ArrayRef<size_t> shape, float scale,
+  void reset(ElemKind elemTy, llvm::ArrayRef<dim_t> shape, float scale,
              int32_t offset) {
     Type t(elemTy, shape, scale, offset);
     reset(t);
   }
 
-  /// Assigns a new shape to the tensor and allocates a new buffer.
-  void reset(const Type &T) {
+  /// Assigns a new shape to the tensor and allocates a new buffer. The size of
+  /// the buffer is set to \p unpaddedSize unless it is zero, which will
+  /// instead default back to the number of bytes needed for \p T.
+  void reset(const Type &T, size_t unpaddedSize = 0) {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
+
+    // If 0 then fall back to the passed in Type's padded size.
+    if (unpaddedSize == 0) {
+      unpaddedSize = T.getSizeInBytes();
+    }
+
     // If the new size is identical to the allocated size then there is no need
     // to re-allocate the buffer.
-    if (type_ == T && getData()) {
-      zero();
+    const bool isOrigPadded = getSizeInBytes() != getUnpaddedSizeInBytes();
+    const bool isNewPadded = T.getSizeInBytes() != unpaddedSize;
+    const bool isBufReuseAllowed = (isOrigPadded == isNewPadded) &&
+                                   (getUnpaddedSizeInBytes() == unpaddedSize);
+    if (type_ == T && getData() && isBufReuseAllowed) {
+#ifdef GLOW_DEBUG_TENSOR_INIT
+      PseudoRNG rng;
+      init(InitKind::Broadcast, GLOW_DEBUG_TENSOR_INIT, rng);
+#endif
+      resetDeviceInfo();
       return;
     }
 
@@ -322,23 +468,43 @@ public:
     // We are allocating memory specifically for this tensor, thus, it owns it.
     isUnowned_ = false;
 
+    // We are allocating memory on the host so it is not device resident.
+    resetDeviceInfo();
+
     // Note: zero-dimensional tensors have size 1.
     assert(size() > 0 && "Tensors must always have positive size.");
-    size_t count = size() * type_.getElementSize();
-    data_ = reinterpret_cast<char *>(alignedAlloc(count, TensorAlignment));
-    zero(getElementType() == ElemKind::UInt8FusedQTy);
+    data_ =
+        reinterpret_cast<char *>(alignedAlloc(unpaddedSize, TensorAlignment));
+
+    // Set unpaddedSize_ to the actual number of bytes.
+    unpaddedSize_ = unpaddedSize;
+
+#ifdef GLOW_DEBUG_TENSOR_INIT
+    PseudoRNG rng;
+    init(InitKind::Broadcast, GLOW_DEBUG_TENSOR_INIT, rng);
+#endif
   }
   /// Releases the data buffer and sets the unOwned flag to true. This is useful
   /// for keeping metadata around but not the actual contents.
   void release() {
-    if (!isUnowned())
+    if (!isUnowned()) {
       alignedFree(getData());
+    }
+    if (ownsDeviceResidency_) {
+      delete deviceResidency_;
+      ownsDeviceResidency_ = false;
+    }
 
     isUnowned_ = true;
   }
   ~Tensor() {
     if (!isUnowned()) {
       alignedFree(getData());
+    }
+
+    if (ownsDeviceResidency_) {
+      delete deviceResidency_;
+      ownsDeviceResidency_ = false;
     }
   }
 
@@ -348,6 +514,9 @@ public:
     std::swap(type_, other.type_);
     std::swap(isUnowned_, other.isUnowned_);
     std::swap(tensorPool_, other.tensorPool_);
+    std::swap(unpaddedSize_, other.unpaddedSize_);
+    std::swap(deviceResidency_, other.deviceResidency_);
+    std::swap(ownsDeviceResidency_, other.ownsDeviceResidency_);
   }
 
   /// Move assignment operator.
@@ -356,6 +525,9 @@ public:
     std::swap(type_, other.type_);
     std::swap(isUnowned_, other.isUnowned_);
     std::swap(tensorPool_, other.tensorPool_);
+    std::swap(unpaddedSize_, other.unpaddedSize_);
+    std::swap(deviceResidency_, other.deviceResidency_);
+    std::swap(ownsDeviceResidency_, other.ownsDeviceResidency_);
     return *this;
   }
 
@@ -380,26 +552,79 @@ public:
   /// Tensor to std::string.
   std::string toString(unsigned maxNumElem) const;
 
+  /// Dump a textual representation of the shape of this Tensor to std::string.
+  std::string getShapeToString() const;
+
   /// \returns true if the content of the other tensor \p other is identical to
   /// this one, given some \p allowedError. If \p verbose and the tensors are
   /// not equal, then we will log information about the mismatch (number of
   /// elements exceeding allowed error; maximum error and location found; etc.).
   bool isEqual(const Tensor &other, float allowedError = 0.0001,
                bool verbose = true) const {
+    if (isDeviceResident()) {
+      if (!other.isDeviceResident()) {
+        if (verbose) {
+          LOG(INFO) << "Tensors cannot be compared as they are not resident in "
+                       "the same location.";
+        }
+        return false;
+      }
+
+      return getDeviceManager() == other.getDeviceManager() &&
+             getLocationContext() == other.getLocationContext();
+    }
+    return isEqualImpl(other, /*isBitwise=*/false, allowedError, verbose);
+  }
+
+  /// \returns true if the content of the other tensor \p other is bitwise
+  /// identical to this one.
+  bool isBitwiseEqual(const Tensor &other, bool verbose = false) const {
+    return isEqualImpl(other, /*isBitwise=*/true, /*allowedError=*/0.0,
+                       verbose);
+  }
+
+  bool isEqualImpl(const Tensor &other, bool isBitwise, float allowedError,
+                   bool verbose) const {
     if (other.dims() != dims()) {
+      if (verbose) {
+        LOG(INFO) << "Tensors are not equal as they have different shapes: "
+                  << this->getShapeToString() << " vs. "
+                  << other.getShapeToString();
+      }
       return false;
     }
 
     // For now, make sure that either both or neither of the tensors have
-    // UInt8FusedQTy. While it is possible for an Int8QTy tensor to equal a
-    // UInt8FusedQTy tensor if the UInt8FusedQTy tensor has the same
+    // UInt8FusedQTy or UInt8Fused16QTy. While it is possible for an Int8QTy
+    // tensor to equal a fused tensor if the fused tensor has the same
     // scale/offset on all of its rows, and that scale/offset match that of the
     // Int8QTy, we do not support checking this for now.
     assert(((getElementType() == ElemKind::UInt8FusedQTy &&
              other.getElementType() == ElemKind::UInt8FusedQTy) ||
-            (getElementType() != ElemKind::UInt8FusedQTy &&
+            (getElementType() == ElemKind::UInt8FusedFP16QTy &&
+             other.getElementType() == ElemKind::UInt8FusedFP16QTy) ||
+            (getElementType() != ElemKind::UInt8FusedFP16QTy &&
              other.getElementType() != ElemKind::UInt8FusedQTy)) &&
-           "UInt8FusedQTy only supports comparing against same ElemKind.");
+           "Fused ElemKinds only supports comparing against same ElemKind.");
+
+    // Assert that the scale and offset match for the quantized types.
+    switch (getElementType()) {
+    default:
+      break;
+    case ElemKind::Int8QTy:
+    case ElemKind::UInt8QTy:
+    case ElemKind::Int16QTy:
+    case ElemKind::Int32QTy:
+      assert(getType().getScale() == other.getType().getScale() &&
+             "Scales must match.");
+      assert(getType().getOffset() == other.getType().getOffset() &&
+             "Offsets must match.");
+    }
+
+    // Bitwise compare.
+    if (isBitwise) {
+      return isBitwiseEqualImpl(other, verbose);
+    }
 
     switch (getElementType()) {
     case ElemKind::FloatTy:
@@ -407,28 +632,12 @@ public:
     case ElemKind::Float16Ty:
       return isEqualImpl<float16_t>(other, allowedError, verbose);
     case ElemKind::Int8QTy:
-      assert(getType().getScale() == other.getType().getScale() &&
-             "Scales must match.");
-      assert(getType().getOffset() == other.getType().getOffset() &&
-             "Offsets must match.");
       return isEqualImpl<int8_t>(other, allowedError, verbose);
     case ElemKind::UInt8QTy:
-      assert(getType().getScale() == other.getType().getScale() &&
-             "Scales must match.");
-      assert(getType().getOffset() == other.getType().getOffset() &&
-             "Offsets must match.");
       return isEqualImpl<uint8_t>(other, allowedError, verbose);
     case ElemKind::Int16QTy:
-      assert(getType().getScale() == other.getType().getScale() &&
-             "Scales must match.");
-      assert(getType().getOffset() == other.getType().getOffset() &&
-             "Offsets must match.");
       return isEqualImpl<int16_t>(other, allowedError, verbose);
     case ElemKind::Int32QTy:
-      assert(getType().getScale() == other.getType().getScale() &&
-             "Scales must match.");
-      assert(getType().getOffset() == other.getType().getOffset() &&
-             "Offsets must match.");
       return isEqualImpl<int32_t>(other, allowedError, verbose);
     case ElemKind::Int32ITy:
       return isEqualImpl<int32_t>(other, allowedError, verbose);
@@ -438,6 +647,10 @@ public:
       // compared as if they were data, so we will return false if any rowwise
       // scale/offset do not match.
     case ElemKind::UInt8FusedQTy:
+      return isEqualImpl<uint8_t>(other, allowedError, verbose);
+    case ElemKind::UInt8FusedFP16QTy:
+      return isEqualImpl<uint8_t>(other, allowedError, verbose);
+    case ElemKind::UInt4FusedFP16QTy:
       return isEqualImpl<uint8_t>(other, allowedError, verbose);
     case ElemKind::BoolTy:
       return isEqualImpl<bool>(other, allowedError, verbose);
@@ -450,30 +663,35 @@ public:
 
   /// Update the content and type of the tensor from the tensor \p t.
   void assign(const Tensor *t) {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
     assert(this != t && "Copying to self");
-    reset(t);
-    size_t bufferSize = size() * type_.getElementSize();
+    const size_t bufferSize = t->getUnpaddedSizeInBytes();
+    reset(t, bufferSize);
     std::copy(&t->getData()[0], &t->getData()[bufferSize], getData());
   }
 
   /// Update the raw data of the tensor from the tensor \p t.
   void copyRawFrom(const Tensor *t) {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
     assert(this != t && "Copying to self");
-    assert(size() == t->size());
+    assert(actualSize() == t->actualSize());
     assert(getElementType() == t->getElementType() && "Invalid element type");
-    size_t bufferSize = size() * type_.getElementSize();
+    assert(t->getUnpaddedSizeInBytes() == getUnpaddedSizeInBytes() &&
+           "Do not support copying between different unpadded sized tensors");
+    size_t bufferSize = type_.getSizeInBytes();
     std::copy(&t->getData()[0], &t->getData()[bufferSize], getData());
   }
 
   /// Update the content of the tensor with a slice from tensor \p t. A slice
   /// is one index from the first dimension of the tensor.
   void copySlice(const Tensor *t, size_t slice) {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
     auto dim = t->dims().slice(1);
     (void)dim;
     assert(dim == dims() && "Invalid slice size");
     assert(getElementType() == t->getElementType() && "Invalid element type");
 
-    size_t bufferSize = size() * type_.getElementSize();
+    size_t bufferSize = type_.getSizeInBytes();
     std::copy(&t->getData()[bufferSize * slice],
               &t->getData()[bufferSize * (slice + 1)], getData());
   }
@@ -483,6 +701,7 @@ public:
   /// The copying operation may overlap the end of the tensor \p t one or more
   /// times. This means that the data in the input tensor may be duplicated.
   void copyConsecutiveSlices(const Tensor *t, size_t startSliceIdx) {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
     auto onceSliceDim = t->dims().slice(1);
     (void)onceSliceDim;
     assert(onceSliceDim == dims().slice(1) && "Invalid slice size");
@@ -490,7 +709,7 @@ public:
     assert(dims().size() > 1 && "Tensor must contain at least two dimensions");
 
     size_t numSlicesInInput = t->dims()[0];
-    size_t numElementsInSlice = size() / dims()[0];
+    size_t numElementsInSlice = actualSize() / dims()[0];
     size_t bufferSize = numElementsInSlice * type_.getElementSize();
 
     // For each outer slice in the current tensor:
@@ -508,30 +727,42 @@ public:
   /// and cast them to DestElemType in this.
   template <typename DestElemType, typename SrcElemType>
   void copyWithCast(const Tensor *t) {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
     static_assert(!std::is_same<DestElemType, SrcElemType>::value,
                   "Use copyRawFrom instead");
     assert(this != t && "Copying to self");
     assert(getElementType() != t->getElementType() &&
            "Use copyRawFrom instead");
-    assert(size() == t->size() && "Different sizes");
+    assert(actualSize() == t->actualSize() && "Different sizes");
     const auto *src = t->getRawDataPointer<SrcElemType>();
     auto *dst = getRawDataPointer<DestElemType>();
-    for (size_t idx = 0, end = size(); idx != end; ++idx) {
+    for (size_t idx = 0, end = actualSize(); idx != end; ++idx) {
       dst[idx] = DestElemType(src[idx]);
     }
   }
 
-  /// Convert each element of this tensor to \p newTy.
+  /// Convert each element of this tensor to \p newTy. Calls into
+  /// \ref getCopyConvertedToType() to do the conversion, and hence supports
+  /// converting between whatever ElemKinds it supports.
   void convertToType(ElemKind newTy);
+
+  /// \returns a copy of the Tensor but converted to \p newKind. Currently
+  /// supports conversion for:
+  /// - FloatTy to Float16Ty
+  /// - Float16Ty to FloatTy
+  /// - UInt8FusedQTy to UInt8FusedFP16QTy
+  Tensor getCopyConvertedToType(ElemKind newKind) const;
 
   /// Transpose the tensor \p src into the empty tensor \p dest. Shuffle the
   /// axis based on the list \p shuffle, where each element is the src index.
   void transpose(Tensor *dest, llvm::ArrayRef<unsigned_t> shuffle) const {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
     genericTranspose(this, dest, shuffle);
   }
 
   /// Create a new copy of the current tensor.
   Tensor clone() const {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
     Tensor slice;
     slice.assign(this);
     return slice;
@@ -539,6 +770,59 @@ public:
 
   /// Return the raw unsafe pointer to the tensor payload.
   char *getUnsafePtr() const { return getData(); }
+
+  /// \returns true if tensor data is stored on a device
+  bool isDeviceResident() const {
+    return deviceResidency_ && deviceResidency_->isDeviceResident();
+  }
+
+  /// Update device residency info with new device manager and context
+  void moveToDevice(DeviceTensorTransferManager *deviceManager,
+                    void *locationContext);
+
+  /// If device resident, copy Tensor contents back to host memory and release
+  /// associated device memory.
+  void ensureOnHost();
+
+  /// Updates contents of a device resident Tensor with the data from \p t
+  /// without copying its contents to host.
+  void copyRawToDevice(const Tensor *t);
+
+  /// \returns the pointer to the device manager where the tensor resides.
+  DeviceTensorTransferManager *getDeviceManager() const {
+    assert(deviceResidency_ != nullptr && "DeviceResidencyInfo must exist");
+    assert(deviceResidency_->isDeviceResident() &&
+           "Tensor must be device resident");
+    return deviceResidency_->getDeviceManager();
+  }
+
+  /// \returns the pointer to the location context of where the tensor resides.
+  void *getLocationContext() const {
+    assert(deviceResidency_ != nullptr && "DeviceResidencyInfo must exist");
+    assert(deviceResidency_->isDeviceResident() &&
+           "Tensor must be device resident");
+    return deviceResidency_->getLocationContext();
+  }
+
+  void resetDeviceInfo() {
+    if (deviceResidency_ && ownsDeviceResidency_) {
+      deviceResidency_->clear();
+      return;
+    }
+
+    deviceResidency_ = new DeviceResidencyInfo();
+    ownsDeviceResidency_ = true;
+  }
+
+  /// Clears DeviceResidencyInfo.
+  /// Note that this does not affect the associated DeviceManager or device
+  /// memory.
+  void clearDeviceResidency() {
+    assert(deviceResidency_ != nullptr && "DeviceResidencyInfo must exist");
+    assert(deviceResidency_->isDeviceResident() &&
+           "Tensor must be device resident");
+    deviceResidency_->clear();
+  }
 
   /// \return a new handle that points and manages this tensor.
   template <class ElemTy = float> Handle<ElemTy> getHandle() &;
@@ -551,12 +835,14 @@ public:
 private:
   /// \returns a pointer to the raw data, of type \p ElemTy.
   template <class ElemTy> ElemTy *getRawDataPointer() {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
     assert(type_.isType<ElemTy>() && "Asking for the wrong ptr type.");
     return reinterpret_cast<ElemTy *>(data_);
   }
 
   /// \returns a const pointer to the raw data, of type \p ElemTy.
   template <class ElemTy> const ElemTy *getRawDataPointer() const {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
     assert(type_.isType<ElemTy>() && "Asking for the wrong ptr type.");
     return reinterpret_cast<const ElemTy *>(data_);
   }
@@ -564,12 +850,20 @@ private:
   template <class ElemTy>
   bool isEqualImpl(const Tensor &other, float allowedError,
                    bool verbose) const {
-    auto const *myData = getRawDataPointer<ElemTy>();
-    auto const *otherData = other.getRawDataPointer<ElemTy>();
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
+    auto thisHandle = getHandle<ElemTy>();
+    auto otherHandle = other.getHandle<ElemTy>();
     double maxFoundError = 0.0;
-    size_t maxFoundErrorIdx = 0, numExceedingError = 0;
-    for (size_t i = 0, e = size(); i < e; i++) {
-      double delta = myData[i] - otherData[i];
+    size_t numExceedingError = 0;
+    size_t currIndex = 0;
+    size_t maxFoundErrorIdx = 0;
+    double maxRE = 0.0; // relative error.
+    size_t maxREIdx = 0;
+    for (auto thisHandleIt = thisHandle.begin(),
+              otherHandleIt = otherHandle.begin();
+         thisHandleIt != thisHandle.end() && otherHandleIt != otherHandle.end();
+         ++thisHandleIt, ++otherHandleIt, ++currIndex) {
+      double delta = *thisHandleIt - *otherHandleIt;
       delta = std::abs(delta);
       // Since any comparison with NAN returns false, we use a negated condition
       // so that this function correctly returns false when delta is NAN.
@@ -580,19 +874,51 @@ private:
         numExceedingError += 1;
         if (!(delta <= maxFoundError)) {
           maxFoundError = delta;
-          maxFoundErrorIdx = i;
+          maxFoundErrorIdx = currIndex;
+        }
+        double sum = *thisHandleIt + *otherHandleIt;
+        double re = delta / std::abs(sum);
+        if (!(re <= maxRE)) {
+          maxRE = re;
+          maxREIdx = currIndex;
         }
       }
     }
+    auto thisHandleIt = thisHandle.begin();
+    auto otherHandleIt = otherHandle.begin();
     if (numExceedingError != 0) {
       LOG(INFO) << "Tensors not equal: " << numExceedingError << " out of "
-                << size() << " elements exceeded allowed error threshold "
+                << actualSize() << " elements exceeded allowed error threshold "
                 << allowedError << ". Maximum error found was " << maxFoundError
                 << " at index " << maxFoundErrorIdx << ": "
-                << myData[maxFoundErrorIdx] << " vs. "
-                << otherData[maxFoundErrorIdx];
+                << *(thisHandleIt.operator+(maxFoundErrorIdx)) << " vs. "
+                << *(otherHandleIt.operator+(maxFoundErrorIdx));
+      LOG(INFO) << "Maximum relative error found was: " << maxRE
+                << " at index: " << maxREIdx << ": "
+                << *(thisHandleIt.operator+(maxREIdx)) << " v.s. "
+                << *(otherHandleIt.operator+(maxREIdx));
     }
     return numExceedingError == 0;
+  }
+
+  bool isBitwiseEqualImpl(const Tensor &other, bool verbose) const {
+    assert(!isDeviceResident() && "Tensor must reside on host to access data.");
+    auto const *myData = getUnsafePtr();
+    auto const *otherData = other.getUnsafePtr();
+    dim_t mismatchCount = 0;
+    for (size_t i = 0, e = getSizeInBytes(); i < e; i++) {
+      if (myData[i] != otherData[i]) {
+        if (!verbose) {
+          return false;
+        }
+        ++mismatchCount;
+      }
+    }
+    if (mismatchCount != 0) {
+      LOG(INFO) << "Tensors not bitwise equal: " << mismatchCount
+                << " bytes out of " << getSizeInBytes() << " mismatched.";
+    }
+    return mismatchCount == 0;
   }
 };
 
@@ -610,6 +936,112 @@ void dumpImpl(const Tensor *T, llvm::raw_ostream &os,
 void dumpImpl(const Tensor *T, unsigned maxNumElem);
 void dumpImpl(const Tensor *T);
 
+template <class ElemTy> class Handle;
+
+/// A class that provides ability to iterate over a Handle<ElemTy>. Since it's
+/// common to have both mutating and const iterators, this class has template
+/// parameter IsConst, which is true to create const_iterator and false
+/// otherwise.
+template <class ElemTy, bool IsConst>
+class HandleIterator
+    : public std::iterator<std::random_access_iterator_tag, ElemTy> {
+  using HandleTy = typename std::conditional_t<IsConst, const Handle<ElemTy> *,
+                                               Handle<ElemTy> *>;
+  using ElemTyRef =
+      typename std::conditional_t<IsConst, const ElemTy &, ElemTy &>;
+
+  /// At every given moment, the iterator maintains an index, which is used to
+  /// access the Handle. When moving the iterator forward, the index is
+  /// incremented. Only valid elements can be accessed.
+  /// 0 <= idx_ <= handle_->size()
+  HandleTy handle_;
+  llvm::ArrayRef<dim_t> sizes_;
+  dim_t idx_;
+  /// Holds true if the underlying tensor has non-trivial alignment (i.e. not 1)
+  bool isAligned_;
+
+  HandleIterator() = default;
+
+  HandleIterator(HandleTy handle) : handle_(handle) {
+    sizes_ = handle->dims();
+    isAligned_ = handle->size() < handle->actualSize();
+  }
+
+  static HandleIterator begin(HandleTy handle) {
+    auto res = HandleIterator(handle);
+    res.idx_ = 0;
+    return res;
+  }
+
+  static HandleIterator end(HandleTy handle) {
+    auto res = HandleIterator(handle);
+    res.idx_ = res.handle_->size();
+    return res;
+  }
+
+  friend class Handle<ElemTy>;
+
+public:
+  HandleIterator &operator++() {
+    if (*this != handle_->end()) {
+      idx_++;
+    }
+    return *this;
+  }
+  HandleIterator &operator--() {
+    if (idx_) {
+      idx_--;
+    }
+    return *this;
+  }
+  HandleIterator operator+(int n) const {
+    auto res = HandleIterator(handle_);
+    res.idx_ = std::max(static_cast<int>(idx_) + n, 0);
+    res.idx_ = std::min(res.idx_, res.handle_->size());
+    return res;
+  }
+  HandleIterator operator-(int n) const { return *this + (-n); }
+  operator int() const { return idx_; }
+
+  ElemTyRef operator*() {
+    if (!isAligned_) {
+      return handle_->raw(idx_);
+    }
+    std::vector<dim_t> indices(sizes_.size(), 0);
+    size_t rem = idx_;
+    for (int i = static_cast<int>(sizes_.size()) - 1; i >= 0; i--) {
+      indices[i] = rem % sizes_[i];
+      rem /= sizes_[i];
+    }
+    return handle_->at(indices);
+  }
+
+  bool operator==(const HandleIterator<ElemTy, IsConst> &other) const {
+    return idx_ == other.idx_;
+  }
+
+  bool operator!=(const HandleIterator<ElemTy, IsConst> &other) const {
+    return !(*this == other);
+  }
+};
+
+/// Helper which \returns the flattened 1D offset given \p indices into a tensor
+/// with \p strides.
+inline size_t getFlattenedOffset(llvm::ArrayRef<dim_t> strides,
+                                 llvm::ArrayRef<dim_t> indices) {
+  assert(indices.size() <= strides.size() && "Invalid number of indices");
+  // The loop below can be rewritten using std::inner_product. Unfortunately
+  // std::inner_product does not optimize very well and loops that use this
+  // method don't get vectorized. Don't change this loop without benchmarking
+  // the program on a few compilers.
+  size_t index = 0;
+  for (size_t i = 0, e = indices.size(); i < e; i++) {
+    index += size_t(strides[i]) * size_t(indices[i]);
+  }
+
+  return index;
+}
+
 /// A class that provides indexed access to a tensor. This class has value
 /// semantics and it's copied around. One of the reasons for making this class
 /// value semantics is to allow efficient index calculation that the compiler
@@ -620,37 +1052,38 @@ template <class ElemTy> class Handle final {
 
   /// Contains the multiplication of the sizes from current position to end.
   /// For example, for index (w,z,y,z):  [x * y * z, y * z, z, 1]
-  size_t sizeIntegral_[max_tensor_dimensions] = {
+  dim_t sizeIntegral_[max_tensor_dimensions] = {
       0,
   };
 
-  size_t sizes_[max_tensor_dimensions] = {
+  dim_t sizes_[max_tensor_dimensions] = {
       0,
   };
 
   /// Saves the number of dimensions used in the tensor.
   uint8_t numDims_{0};
 
+  /// Remember end iterators. This is needed to speed up iterator increment,
+  /// which has to check that iterator hasn't reached the end yet.
+  HandleIterator<ElemTy, false> mutating_end_;
+  HandleIterator<ElemTy, true> const_end_;
+
   /// Create a new invalid handle. Notice that this method is private and may
   /// only be used by the static factory method below.
   Handle() = default;
 
 public:
-  /// Random access iterator to tensor elements.
-  using iterator = ElemTy *;
-
-  /// Constant random access iterator to tensor elements.
-  using const_iterator = const iterator;
-
   /// \returns an iterator to the first element of the tensor.
-  iterator begin() { return tensor_->getRawDataPointer<ElemTy>(); }
-  const_iterator begin() const { return tensor_->getRawDataPointer<ElemTy>(); }
+  HandleIterator<ElemTy, false> begin() {
+    return HandleIterator<ElemTy, false>::begin(this);
+  }
+  HandleIterator<ElemTy, true> begin() const {
+    return HandleIterator<ElemTy, true>::begin(this);
+  }
 
   /// \returns an iterator referring to the past-the-end element.
-  iterator end() { return tensor_->getRawDataPointer<ElemTy>() + size(); }
-  const_iterator end() const {
-    return tensor_->getRawDataPointer<ElemTy>() + size();
-  }
+  HandleIterator<ElemTy, false> end() { return mutating_end_; }
+  HandleIterator<ElemTy, true> end() const { return const_end_; }
 
   /// Allocate a new invalid handle.
   static Handle createInvalidHandle() { return Handle(); }
@@ -659,25 +1092,24 @@ public:
   bool isValid() const { return tensor_; }
 
   /// Calculate the index for a specific element in the tensor. Notice that
-  /// the list of indices may be incomplete.
-  size_t getElementPtr(llvm::ArrayRef<size_t> indices) const {
-    assert(indices.size() <= numDims_ && "Invalid number of indices");
-    // The loop below can be rewritten using std::inner_product. Unfortunately
-    // std::inner_product does not optimize very well and loops that use this
-    // method don't get vectorized. Don't change this loop without benchmarking
-    // the program on a few compilers.
-    size_t index = 0;
-    for (size_t i = 0, e = indices.size(); i < e; i++) {
-      index += size_t(sizeIntegral_[i]) * size_t(indices[i]);
-    }
-
-    return index;
+  /// the list of indices may be incomplete. This method provides access to
+  /// padding elements, meaning that it's possible to get an index pointing at
+  /// data, added to meet alignment requirements.
+  size_t getElementPtr(llvm::ArrayRef<dim_t> indices) const {
+    return getFlattenedOffset(llvm::makeArrayRef(sizeIntegral_, numDims_),
+                              indices);
   }
 
-  /// \returns the value of the n'th dimension \p dim, for the raw index \p idx.
+  /// \returns the value of the n'th dimension \p dim, for the index \p idx.
+  /// 0 <= idx < size(), meaning that \p idx addresses a real data elements,
+  /// not paddings.
   size_t getDimForPtr(size_t dim, size_t idx) const {
     assert(dim < numDims_ && "Invalid dimension");
-    auto R = idx / sizeIntegral_[dim];
+    assert(idx < size() && "Invalid index");
+    auto R = idx;
+    for (size_t i = dim + 1; i < numDims_; i++) {
+      R /= sizes_[i];
+    }
     return R % sizes_[dim];
   }
 
@@ -693,63 +1125,62 @@ public:
     numDims_ = sizes.size();
 
     /// We allow handles that wrap uninitialized tensors.
-    if (!numDims_) {
-      return;
+    if (numDims_) {
+      // Copy the sizes of the tensor.
+      memcpy(sizes_, tensor_->type_.sizes_,
+             max_tensor_dimensions * sizeof(sizes_[0]));
+      // Copy the strides of the tensor.
+      memcpy(sizeIntegral_, tensor_->type_.strides_,
+             max_tensor_dimensions * sizeof(tensor_->type_.strides_[0]));
+      assert(numDims_ <= max_tensor_dimensions && "Too many dimensions.");
     }
 
-    // Copy the sizes of the tensor.
-    memcpy(sizes_, tensor_->type_.sizes_,
-           max_tensor_dimensions * sizeof(sizes_[0]));
-
-    size_t pi = 1;
-    for (int i = numDims_ - 1; i >= 0; i--) {
-      sizeIntegral_[i] = pi;
-      assert(sizes_[i] > 0 && "invalid dim size");
-      pi *= sizes_[i];
-    }
-
-    assert(numDims_ <= max_tensor_dimensions && "Too many dimensions.");
+    mutating_end_ = HandleIterator<ElemTy, false>::end(this);
+    const_end_ = HandleIterator<ElemTy, true>::end(this);
   }
 
-  llvm::ArrayRef<size_t> dims() const {
-    return llvm::ArrayRef<size_t>(sizes_, numDims_);
+  llvm::ArrayRef<dim_t> dims() const {
+    return llvm::ArrayRef<dim_t>(sizes_, numDims_);
   }
 
   /// \returns the number of elements in the whole tensor.
-  size_t size() const { return tensor_->size(); }
+  dim_t size() const { return tensor_->size(); }
 
-  bool isInBounds(llvm::ArrayRef<size_t> indices) const {
+  /// \returns the actual number of elements in the tensor taking striding into
+  /// account. Since size() does not take striding into account, size() is
+  /// always <= actualSize().
+  dim_t actualSize() const { return tensor_->actualSize(); }
+
+  bool isInBounds(llvm::ArrayRef<dim_t> indices) const {
     return tensor_->isInBounds(indices);
   }
 
   void clear(ElemTy value = 0) { std::fill(begin(), end(), value); }
 
-  ElemTy &at(llvm::ArrayRef<size_t> indices) {
-    assert(tensor_->isInBounds(indices));
+  /// Returns reference to a meaningful data element. This method does not
+  /// address padding elements.
+  ElemTy &at(llvm::ArrayRef<dim_t> indices) {
     size_t index = getElementPtr(indices);
-    assert(index < size() && "Out of bounds");
     auto *data = tensor_->getRawDataPointer<ElemTy>();
     return data[index];
   }
 
-  const ElemTy &at(llvm::ArrayRef<size_t> indices) const {
-    assert(tensor_->isInBounds(indices));
+  const ElemTy &at(llvm::ArrayRef<dim_t> indices) const {
     size_t index = getElementPtr(indices);
-    assert(index < size() && "Out of bounds");
     auto *data = tensor_->getRawDataPointer<ElemTy>();
     return data[index];
   }
 
   /// \returns the element at offset \p idx without any size calculations.
+  /// The returned element can be a pad element.
   ElemTy &raw(size_t index) {
-    assert(index < size() && "Out of bounds");
     auto *data = tensor_->getRawDataPointer<ElemTy>();
     return data[index];
   }
 
   /// \returns the element at offset \p idx without any size calculations.
+  /// The returned element can be a pad element.
   const ElemTy &raw(size_t index) const {
-    assert(index < size() && "Out of bounds");
     auto *data = tensor_->getRawDataPointer<ElemTy>();
     return data[index];
   }
@@ -761,7 +1192,8 @@ public:
     assert(sizes.size() > 1 && "Tensor must have at least two dimensions");
     assert(idx < sizes[0] && "Invalid first index");
 
-    Tensor slice{Type::newShape(tensor_->getType(), sizes.slice(1))};
+    Tensor slice{Type::newShape(tensor_->getType(), sizes.slice(1),
+                                tensor_->type_.strides().slice(1))};
 
     // Extract the whole slice.
     size_t startIdx = sizeIntegral_[0] * idx;
@@ -793,7 +1225,7 @@ public:
 
   /// Update the content of the tensor from a literal list:
   void operator=(const std::initializer_list<ElemTy> &vec) {
-    assert(size() == vec.size() && "Invalid input size.");
+    assert(actualSize() == vec.size() && "Invalid input size.");
     size_t i = 0;
     for (auto &e : vec) {
       raw(i++) = e;
@@ -801,8 +1233,8 @@ public:
   }
 
   void operator=(llvm::ArrayRef<ElemTy> array) {
-    assert(size() == array.size() && "Invalid input size.");
-    std::copy(array.begin(), array.end(), begin());
+    assert(actualSize() == array.size() && "Invalid input size.");
+    std::copy(array.begin(), array.end(), &raw(0));
   }
 
   void dumpAscii(llvm::raw_ostream &os) const { dumpAsciiImpl(tensor_, os); }
@@ -810,14 +1242,14 @@ public:
 
   /// \returns the raw indices of a min and max values from the tensor.
   /// In case of multiple min or max, the smallest index is returned.
-  std::pair<size_t, size_t> minMaxArg() const {
+  std::pair<dim_t, dim_t> minMaxArg() const {
     ElemTy max = raw(0);
     ElemTy min = raw(0);
 
     size_t maxIdx = 0;
     size_t minIdx = 0;
 
-    for (size_t i = 1, e = size(); i < e; i++) {
+    for (size_t i = 1, e = actualSize(); i < e; i++) {
       ElemTy val = raw(i);
       if (val > max) {
         max = val;
@@ -835,25 +1267,36 @@ public:
   /// \p allowedError represents the delta from zero that is allowed before
   /// returning false.
   bool isZero(float allowedError = 0.0) const {
+#define RETURN_WHETHER_FUSED_IS_ZERO(DATA_TYPE)                                \
+  assert(dims().size() == 2 && "Fused tensor must be 2-dimensional.");         \
+  assert(dims()[1] > 2 * sizeof(DATA_TYPE) &&                                  \
+         "Fused tensor must have space for scale/offset.");                    \
+  const dim_t dataWidth = dims()[1];                                           \
+  const dim_t alignedLength = tensor_->getType().strides()[0];                 \
+  auto *data = reinterpret_cast<uint8_t *>(tensor_->getUnsafePtr());           \
+  for (dim_t i = 0, e = dims()[0]; i < e; i++) {                               \
+    uint8_t *scaleOffsetPtr =                                                  \
+        data + i * alignedLength + dataWidth - 2 * sizeof(DATA_TYPE);          \
+    DATA_TYPE scale, offset;                                                   \
+    memcpy(&scale, scaleOffsetPtr, sizeof(DATA_TYPE));                         \
+    memcpy(&offset, scaleOffsetPtr + sizeof(DATA_TYPE), sizeof(DATA_TYPE));    \
+    for (dim_t j = 0, e = dataWidth - 2 * sizeof(DATA_TYPE); j < e; j++) {     \
+      float currVal = (at({i, j}) * (float)scale) + (float)offset;             \
+      if (std::abs(currVal) > allowedError) {                                  \
+        return false;                                                          \
+      }                                                                        \
+    }                                                                          \
+  }                                                                            \
+  return true;
+
     if (getElementType() == ElemKind::UInt8FusedQTy) {
-      assert(dims().size() == 2 && "Fused tensor must be 2-dimensional.");
-      assert(dims()[1] > 8 && "Fused tensor must have more than 8 columns.");
-      const size_t width = dims()[1];
-      auto *data = reinterpret_cast<uint8_t *>(tensor_->getUnsafePtr());
-      for (size_t i = 0, e = dims()[0]; i < e; i++) {
-        uint8_t *scaleOffsetPtr = &data[(i + 1) * width] - 2 * sizeof(float);
-        float scale, offset;
-        memcpy(&scale, scaleOffsetPtr, sizeof(float));
-        memcpy(&offset, scaleOffsetPtr + sizeof(float), sizeof(float));
-        for (size_t j = 0, e = width - 2 * sizeof(float); j < e; j++) {
-          float currVal = (at({i, j}) * scale) + offset;
-          if (std::abs(currVal) > allowedError) {
-            return false;
-          }
-        }
-      }
-      return true;
+      RETURN_WHETHER_FUSED_IS_ZERO(float);
     }
+    if (getElementType() == ElemKind::UInt8FusedFP16QTy) {
+      RETURN_WHETHER_FUSED_IS_ZERO(float16_t);
+    }
+#undef RETURN_WHETHER_FUSED_IS_ZERO
+
     int32_t trueZero = getType().isQuantizedType() ? getType().getOffset() : 0;
     return std::all_of(begin(), end(), [=](ElemTy e) { return e == trueZero; });
   }
@@ -913,16 +1356,22 @@ public:
       }
       return;
     }
-    case ElemKind::UInt8FusedQTy: {
-      assert(dims().size() == 2 && "Fused tensor must be 2-dimensional.");
-      assert(dims()[1] > 8 && "Fused tensor must have more than 8 columns.");
-      for (size_t i = 0, e = dims()[0]; i < e; i++) {
-        for (size_t j = 0, f = dims()[1] - 8; j < f; j++) {
-          at({i, j}) = dist(PRNG);
-        }
-      }
-      return;
-    }
+
+#define FUSED_CASE(ELEM_KIND, DATA_TYPE)                                       \
+  case ElemKind::ELEM_KIND: {                                                  \
+    assert(dims().size() == 2 && "Fused tensor must be 2-dimensional.");       \
+    assert(dims()[1] > 2 * sizeof(DATA_TYPE) &&                                \
+           "Fused tensor must have space for scale/offset.");                  \
+    for (dim_t i = 0, e = dims()[0]; i < e; i++) {                             \
+      for (dim_t j = 0, f = dims()[1] - 2 * sizeof(DATA_TYPE); j < f; j++) {   \
+        at({i, j}) = dist(PRNG);                                               \
+      }                                                                        \
+    }                                                                          \
+    return;                                                                    \
+  }
+      FUSED_CASE(UInt8FusedQTy, float);
+      FUSED_CASE(UInt8FusedFP16QTy, float16_t);
+#undef FUSED_CASE
     }
   }
 
@@ -941,7 +1390,7 @@ public:
 
   /// \returns the mean and variance of the tensor.
   std::pair<double, double> calculateMeanVariance() const {
-    size_t n = size();
+    size_t n = actualSize();
     assert(n > 1 && "Input must have at least 2 elements.");
 
     // Calculate mean.
@@ -969,7 +1418,7 @@ public:
   /// where O is the offset vector, assuming \p count = 1. For \p count > 1, the
   /// same Tensor is copied \p count times along the provided \p axis. The
   /// tensors must be of the right dimensions.
-  void insertTensors(Handle<ElemTy> &slice, llvm::ArrayRef<size_t> offset,
+  void insertTensors(Handle<ElemTy> &slice, llvm::ArrayRef<dim_t> offset,
                      size_t count = 1, size_t axis = 0) {
     auto sliceCoor = slice.dims().vec();
     auto fusedCoor = dims().vec();
@@ -982,11 +1431,34 @@ public:
   /// copying into the cell at coordinate {d_0, d_1, ... d_n} a value from the
   /// tensor at {d_0 + O_0, d_1 + O_1, ... d_n + O_n}, where O is the offset
   /// vector. The tensors must be of the right dimensions.
-  void extractTensors(Handle<ElemTy> &slice, llvm::ArrayRef<size_t> offset) {
+  void extractTensors(Handle<ElemTy> &slice, llvm::ArrayRef<dim_t> offset) {
     auto sliceCoor = slice.dims().vec();
     auto fusedCoor = dims().vec();
     insertTensorsImpl(sliceCoor, fusedCoor, slice, false, offset, /* count */ 1,
                       /* axis */ 0, 0);
+  }
+
+  /// \returns a pair of the scale and offset from a row \p rowIdx of a
+  /// FusedRowwiseQuantized Tensor.
+  template <typename T>
+  std::pair<T, T> getFusedScaleOffsetFromRow(dim_t rowIdx) {
+    ElemTy *rowScaleOffsetPtr = getFusedRowScaleOffsetPtr<T>(rowIdx);
+    T scale;
+    T offset;
+    memcpy(&scale, rowScaleOffsetPtr, sizeof(T));
+    memcpy(&offset, rowScaleOffsetPtr + sizeof(T), sizeof(T));
+    return std::make_pair(scale, offset);
+  }
+
+  /// Sets the \p scale and \p offset to a row \p rowIdx of a
+  /// FusedRowwiseQuantized Tensor.
+  template <typename T>
+  void setFusedScaleOffsetInRow(dim_t rowIdx, T scale, T offset) {
+    ElemTy *rowScaleOffsetPtr = getFusedRowScaleOffsetPtr<T>(rowIdx);
+    T finalScale = static_cast<T>(scale);
+    T finalOffset = static_cast<T>(offset);
+    memcpy(rowScaleOffsetPtr, &finalScale, sizeof(T));
+    memcpy(rowScaleOffsetPtr + sizeof(T), &finalOffset, sizeof(T));
   }
 
 private:
@@ -1002,10 +1474,10 @@ private:
   /// data is copied from \p fused to \p slice. \p count and \p axis are used in
   /// conjunction for inserting the same tensor \p count times along the \p
   /// axis.
-  void insertTensorsImpl(llvm::MutableArrayRef<size_t> sliceCoor,
-                         llvm::MutableArrayRef<size_t> fusedCoor,
+  void insertTensorsImpl(llvm::MutableArrayRef<dim_t> sliceCoor,
+                         llvm::MutableArrayRef<dim_t> fusedCoor,
                          Handle<ElemTy> &slice, bool isInsert,
-                         llvm::ArrayRef<size_t> offset, size_t count,
+                         llvm::ArrayRef<dim_t> offset, size_t count,
                          size_t axis, unsigned d) {
     bool isDone = (d == slice.dims().size());
 
@@ -1026,7 +1498,7 @@ private:
         // Construct the coordinates for the slice and for the joint shape.
         // Add the 'offset' to the dimension that we concat the shapes on.
         sliceCoor[d] = i;
-        // If this is the correct axis to insert multiple times then calcuate
+        // If this is the correct axis to insert multiple times then calculate
         // the additional offset to use.
         const size_t countAxisOffset = (axis == d) ? c * slice.dims()[d] : 0;
         fusedCoor[d] = i + offset[d] + countAxisOffset;
@@ -1035,14 +1507,41 @@ private:
       }
     }
   }
+
+  /// Given a Fused tensor, \returns a pointer to the scale and offset with type
+  /// \p T of a row \p rowIdx.
+  template <typename T> ElemTy *getFusedRowScaleOffsetPtr(dim_t rowIdx) {
+    switch (getElementType()) {
+    case ElemKind::UInt8FusedQTy: {
+      constexpr auto isFloat = std::is_same<float, T>::value;
+      DCHECK(isFloat) << "Expected float scale/offset";
+      break;
+    }
+    case ElemKind::UInt4FusedFP16QTy:
+    case ElemKind::UInt8FusedFP16QTy: {
+      constexpr auto isFloat16 = std::is_same<float16_t, T>::value;
+      DCHECK(isFloat16) << "Expected float16_t scale/offset";
+      break;
+    }
+    default:
+      llvm_unreachable("Must be used with Tensor of supported Fused ElemKind");
+    }
+
+    static_assert(std::is_same<uint8_t, ElemTy>::value,
+                  "Handle of current Fused tensors expected to be uint8_t.");
+    const dim_t colIdx = dims()[1] - 2 * sizeof(T);
+    return &at({rowIdx, colIdx});
+  }
 };
 
 template <class ElemTy> Handle<ElemTy> Tensor::getHandle() & {
+  assert(!isDeviceResident() && "Tensor must reside on host to access data.");
   assert(type_.isType<ElemTy>() && "Getting a handle to the wrong type.");
   return Handle<ElemTy>(this);
 }
 
 template <class ElemTy> const Handle<ElemTy> Tensor::getHandle() const & {
+  assert(!isDeviceResident() && "Tensor must reside on host to access data.");
   assert(type_.isType<ElemTy>() && "Getting a handle to the wrong type.");
   return Handle<ElemTy>(const_cast<Tensor *>(this));
 }

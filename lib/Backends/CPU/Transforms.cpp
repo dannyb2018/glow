@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,10 +72,10 @@ static Node *optimizeCPUConv(ConvolutionNode *CN, Function *F) {
 
   // Transpose the weights into the format [D/8, K, K, C, 8], where the depth
   // dimension is consecutive in memory.
-  for (size_t c0 = 0; c0 < dims[0]; c0++)
-    for (size_t c1 = 0; c1 < dims[1]; c1++)
-      for (size_t c2 = 0; c2 < dims[2]; c2++)
-        for (size_t c3 = 0; c3 < dims[3]; c3++) {
+  for (dim_t c0 = 0; c0 < dims[0]; c0++)
+    for (dim_t c1 = 0; c1 < dims[1]; c1++)
+      for (dim_t c2 = 0; c2 < dims[2]; c2++)
+        for (dim_t c3 = 0; c3 < dims[3]; c3++) {
           F8H.at({c0 / 8, c1, c2, c3, c0 % 8}) = FH.at({c0, c1, c2, c3});
         }
 
@@ -119,8 +119,11 @@ static Node *optimizeCPUMaxSplat(MaxNode *MN, Function *F) {
       new CPUMaxSplatNode(MN->getName(), input, splat->getValue()));
 }
 
-bool CPUBackend::transformPostLowering(Function *F,
-                                       CompilationContext &) const {
+Expected<bool>
+CPUBackend::transformPostLowering(Function *F, CompilationContext &,
+                                  const glow::runtime::DeviceInfo *) const {
+  LOG_SCOPE(F->getLogContext(), "CPUBackend::transformPostLowering")
+
   bool changed = false;
   for (auto &node : F->getNodes()) {
     // Try to replace generic convolution with cpu-optimized version.

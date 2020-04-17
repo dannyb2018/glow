@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,13 +35,10 @@ enum class ModelKind {
 
 namespace {
 llvm::cl::OptionCategory cifarCat("CIFAR10 Options");
-llvm::cl::opt<BackendKind> executionBackend(
-    llvm::cl::desc("Backend to use:"), llvm::cl::Optional,
-    llvm::cl::values(clEnumValN(BackendKind::Interpreter, "interpreter",
-                                "Use interpreter (default option)"),
-                     clEnumValN(BackendKind::CPU, "cpu", "Use CPU"),
-                     clEnumValN(BackendKind::OpenCL, "opencl", "Use OpenCL")),
-    llvm::cl::init(BackendKind::Interpreter), llvm::cl::cat(cifarCat));
+llvm::cl::opt<std::string> executionBackend(
+    "backend",
+    llvm::cl::desc("Backend to use, e.g., Interpreter, CPU, OpenCL:"),
+    llvm::cl::Optional, llvm::cl::init("Interpreter"), llvm::cl::cat(cifarCat));
 llvm::cl::opt<ModelKind>
     model(llvm::cl::desc("Model to use:"), llvm::cl::Optional,
           llvm::cl::values(clEnumValN(ModelKind::MODEL_SIMPLE, "model-simple",
@@ -58,7 +55,7 @@ llvm::cl::opt<ModelKind>
 /// The database contains 10000 images.
 /// Size: (1 + (32 * 32 * 3)) * 10000 = 30730000.
 const size_t cifarImageSize = 1 + (32 * 32 * 3);
-const size_t cifarNumImages = 10000;
+const dim_t cifarNumImages = 10000;
 const unsigned numLabels = 10;
 
 static Placeholder *createDefaultModel(PlaceholderBindings &bindings,
@@ -68,15 +65,16 @@ static Placeholder *createDefaultModel(PlaceholderBindings &bindings,
   auto *RL0 = F->createRELU("relu", CV0);
   auto *MP0 = F->createMaxPool("pool", RL0, 2, 2, 0);
 
-  auto *CV1 = F->createConv(bindings, "conv", MP0, 20, 5, 1, 2, 1);
+  auto *CV1 = F->createConv(bindings, "conv", MP0->getResult(), 20, 5, 1, 2, 1);
   auto *RL1 = F->createRELU("relu", CV1);
   auto *MP1 = F->createMaxPool("pool", RL1, 2, 2, 0);
 
-  auto *CV2 = F->createConv(bindings, "conv", MP1, 20, 5, 1, 2, 1);
+  auto *CV2 = F->createConv(bindings, "conv", MP1->getResult(), 20, 5, 1, 2, 1);
   auto *RL2 = F->createRELU("relu", CV2);
   auto *MP2 = F->createMaxPool("pool", RL2, 2, 2, 0);
 
-  auto *FCL1 = F->createFullyConnected(bindings, "fc", MP2, numLabels);
+  auto *FCL1 =
+      F->createFullyConnected(bindings, "fc", MP2->getResult(), numLabels);
   auto *SM = F->createSoftMax("softmax", FCL1, expected);
   auto *save = F->createSave("ret", SM);
   return save->getPlaceholder();
@@ -185,7 +183,9 @@ void testCIFAR10() {
   auto *result = bindings.allocate(resultPH);
 
   Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
+  auto tfName = TF->getName();
+  EE.compile(CompilationMode::Train);
+  bindings.allocate(mod.getPlaceholders());
 
   // Report progress every this number of training iterations.
   // Report less often for fast models.
@@ -208,7 +208,7 @@ void testCIFAR10() {
     // Bind the images tensor to the input array A, and the labels tensor
     // to the softmax node SM.
     runBatch(EE, bindings, reportRate, sampleCounter, {A, E},
-             {&images, &labels});
+             {&images, &labels}, tfName);
 
     unsigned score = 0;
 

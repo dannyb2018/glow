@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,10 @@
 
 #include "HabanaDeviceManager.h"
 
+#include "glow/Runtime/StatsExporter.h"
+
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "synapse.h"
@@ -37,11 +40,6 @@ static llvm::cl::opt<unsigned, /* ExternalStorage */ true> GlowHabanaMemoryOpt(
     llvm::cl::desc("Amount of DRAM to allocate per Habana device in kilobytes"),
     llvm::cl::location(GlowHabanaMemory));
 
-// TODO: A failed status probably shouldn't be an assert. We should
-// fail gracefully.
-#define chk(X) GLOW_ASSERT((X) == synSuccess)
-
-/// Factory function for creating a HabanaDeviceManager.
 DeviceManager *createHabanaDeviceManager(const DeviceConfig &config) {
   return new HabanaDeviceManager(config);
 }
@@ -65,27 +63,32 @@ HabanaDeviceManager::~HabanaDeviceManager() {
   }
   std::lock_guard<std::mutex> lock(synapseMtx_);
   numActiveDevices_--;
+  statsExporterRegistry_->incrementCounter(kDevicesUsedHabana, -1);
 
   // Explicitly clear this map to force synFree of the managed IOBuffers to
   // happen now, before we synReleaseDevice.  Otherwise synReleaseDevice will
   // free the buffers, and then the destructor will try to do it again.
   functions_.clear();
-  chk(synReleaseDevice(deviceId_));
+  chk_kill(synReleaseDevice(deviceId_));
 
   // If this is the last HabanaDeviceManager to be destroyed, destroy the
   // Synapse API.
   if (numActiveDevices_ == 0) {
-    chk(synDestroy());
+    chk_kill(synDestroy());
   }
 }
 
-llvm::Error HabanaDeviceManager::init() {
+Error HabanaDeviceManager::init() {
   std::lock_guard<std::mutex> lock(synapseMtx_);
 
   // If this is the first HabanaDeviceManager to be created, initialize the
   // Synapse API.
   if (numActiveDevices_ == 0) {
     LOG(INFO) << "Using version " << synGetVersion();
+    // This environment variable tells Synapse to allow enqueueing tensors that
+    // are smaller than the declared size, which offers a significant savings
+    // in PCI traffic for embedding lookups.
+    setenv("IGNORE_ENQUEUE_SIZE_VALIDATION", "1", /*overwrite*/ 1);
     chk(synInitialize());
   }
 
@@ -96,26 +99,34 @@ llvm::Error HabanaDeviceManager::init() {
   }
 
   numActiveDevices_++;
+  statsExporterRegistry_->incrementCounter(kDevicesUsedHabana);
 
   // Fetch initial memory information.
   RETURN_IF_ERR(updateMemoryUsage());
 
   // Create thread pools for running functions and waiting on function results.
-  runPool_ = llvm::make_unique<ThreadPool>(numRunners_);
-  waitPool_ = llvm::make_unique<ThreadPool>(numWaiters_);
+  runPool_ = glow::make_unique<ThreadPool>(numRunners_);
+  waitPool_ = glow::make_unique<ThreadPool>(numWaiters_);
 
   if (!runPool_ || !waitPool_) {
     RETURN_ERR("Failed to create HabanaDeviceManager thread pools");
   }
 
-  return llvm::Error::success();
+  return Error::success();
 }
 
-llvm::Error HabanaDeviceManager::updateMemoryUsage() {
+Error HabanaDeviceManager::updateMemoryUsage() {
   // TODO: Use synGetMemInfo once implemented.
 
-  totalMemory_ = uint64_t{GlowHabanaMemory} * 1024;
-  freeMemory_ = uint64_t{GlowHabanaMemory} * 1024;
+  // Use GlowHabanaMemory if it is defined from GFLAGS or llvm params,
+  // otherwise, fall back to what config says.
+  uint64_t defaultMemory = 7 << 20;
+  if (GlowHabanaMemory == defaultMemory && config_.getDeviceMemory() != 0) {
+    totalMemory_ = config_.getDeviceMemory();
+  } else {
+    totalMemory_ = uint64_t{GlowHabanaMemory} * 1024;
+  }
+  freeMemory_ = totalMemory_;
 
   // Account for the size used by each function loaded on the card.
   for (const auto &pr : functions_) {
@@ -125,20 +136,23 @@ llvm::Error HabanaDeviceManager::updateMemoryUsage() {
     freeMemory_ -= runtimeBundle.getMutableWeightSize();
   }
 
-  return llvm::Error::success();
+  return Error::success();
 }
 
 void HabanaDeviceManager::addNetwork(const Module *module,
                                      FunctionMapTy functions,
                                      ReadyCBTy readyCB) {
+  DCHECK(readyCB != nullptr);
+
   std::unique_lock<std::mutex> lk(instanceMtx_);
   for (const auto &func : functions) {
     // Check if a function with the same name has already been added.
     if (functions_.count(func.first) != 0) {
-      llvm::errs() << "Failed to add network: already have a function called "
-                   << func.first << ".\n";
       lk.unlock();
-      readyCB(module, MAKE_ERR("Failed to add network"));
+      readyCB(module,
+              MAKE_ERR(strFormat(
+                  "Failed to add network: already have a function called %s",
+                  func.first.c_str())));
       return;
     }
 
@@ -156,13 +170,12 @@ void HabanaDeviceManager::addNetwork(const Module *module,
                              &topologyId);
     }
 
-    if (status != synSuccess) {
-      llvm::errs() << "Unable to load recipe "
-                   << habanaFunction->getRecipeName() << " for function "
-                   << func.first << ".\n";
+    if (auto err = chk_make_err(status)) {
+      LOG(ERROR) << "Unable to load recipe " << habanaFunction->getRecipeName()
+                 << " for function " << func.first << ".";
       // TODO: Unload functions that were loaded successfully.
       lk.unlock();
-      readyCB(module, MAKE_ERR("Unable to load recipe"));
+      readyCB(module, std::move(err));
       return;
     }
 
@@ -171,22 +184,26 @@ void HabanaDeviceManager::addNetwork(const Module *module,
     std::tie(std::ignore, inserted) = functions_.insert(std::make_pair(
         func.first,
         HabanaFunctionMeta{topologyId, habanaFunction,
-                           llvm::make_unique<HabanaIOBufferPool>(
+                           glow::make_unique<HabanaIOBufferPool>(
                                deviceId_, habanaFunction->getInputs(),
                                habanaFunction->getOutputs())}));
 
     if (!inserted) {
-      llvm::errs() << "Unable to add function " << func.first
-                   << "to HabanaDeviceManager.\n";
       // TODO: Unload functions that were loaded successfully.
       lk.unlock();
-      readyCB(module, MAKE_ERR("Unable to add function"));
+      readyCB(module, MAKE_ERR(strFormat(
+                          "Unable to add function %s to HabanaDeviceManager",
+                          func.first.c_str())));
       return;
     }
 
     // Optimistically activate the topology if nothing else is loaded.
     cv_.wait(lk, [this] { return inflightRequests_ == 0; });
-    chk(synActivateTopology(deviceId_, topologyId));
+    if (auto err = chk_make_err(synActivateTopology(deviceId_, topologyId))) {
+      lk.unlock();
+      readyCB(module, std::move(err));
+      return;
+    }
     activeTopo_ = topologyId;
   }
 
@@ -198,19 +215,22 @@ void HabanaDeviceManager::addNetwork(const Module *module,
     return;
   }
 
-  readyCB(module, llvm::Error::success());
+  readyCB(module, Error::success());
 }
 
 void HabanaDeviceManager::evictNetwork(std::string functionName,
                                        EvictFunctionCBTy evictCB) {
+  DCHECK(evictCB != nullptr);
+
   std::unique_lock<std::mutex> lk(instanceMtx_);
 
   // Check if a network with the given name exists on the device.
   if (functions_.count(functionName) == 0) {
-    llvm::errs() << "Failed to evict network: function called " << functionName
-                 << " was not added.\n";
     lk.unlock();
-    evictCB(functionName, MAKE_ERR("Failed to evict network"));
+    evictCB(functionName,
+            MAKE_ERR(strFormat(
+                "Failed to evict network: function called %s was not added",
+                functionName.c_str())));
     return;
   }
 
@@ -226,10 +246,10 @@ void HabanaDeviceManager::evictNetwork(std::string functionName,
     }
   }
 
-  if (status != synSuccess) {
-    llvm::errs() << "Unable to unload function " << functionName << ".\n";
+  if (auto err = chk_make_err(status)) {
+    LOG(ERROR) << "Unable to unload function " << functionName;
     lk.unlock();
-    evictCB(functionName, MAKE_ERR("Unable to unload function"));
+    evictCB(functionName, std::move(err));
     return;
   }
 
@@ -237,10 +257,11 @@ void HabanaDeviceManager::evictNetwork(std::string functionName,
   auto numErased = functions_.erase(functionName);
 
   if (numErased == 0) {
-    llvm::errs() << "Unable to evict function " << functionName
-                 << "from HabanaDeviceManager.\n";
     lk.unlock();
-    evictCB(functionName, MAKE_ERR("Unable to evict function"));
+    evictCB(functionName,
+            MAKE_ERR(strFormat(
+                "Unable to evict function %s from HabanaDeviceManager",
+                functionName.c_str())));
     return;
   }
 
@@ -252,14 +273,25 @@ void HabanaDeviceManager::evictNetwork(std::string functionName,
     return;
   }
 
-  evictCB(functionName, llvm::Error::success());
+  evictCB(functionName, Error::success());
 }
 
 void HabanaDeviceManager::runFunctionImpl(RunIdentifierTy runId,
                                           std::string functionName,
                                           std::unique_ptr<ExecutionContext> ctx,
                                           runtime::ResultCBTy resultCB) {
-  TRACE_EVENT_SCOPE(ctx->getTraceContext(), "HabanaDM::runnerThread");
+  DCHECK(resultCB != nullptr);
+
+  TRACE_EVENT_SCOPE_NAMED(ctx->getTraceContext(), TraceLevel::RUNTIME,
+                          "HabanaDM::runnerThread", trEvent);
+
+  /// Habana DeviceManager doesn't support Device Resident Tensors.
+  ctx->getPlaceholderBindings()->ensureOnHost();
+
+  if (ctx->getTraceContext()) {
+    ctx->getTraceContext()->setThreadName(
+        llvm::formatv("Habana {0} (enqueue)", deviceId_).str());
+  }
   // Try to find the function with the given name in functions_.
   uint64_t topologyId;
   HabanaFunction *function;
@@ -268,9 +300,11 @@ void HabanaDeviceManager::runFunctionImpl(RunIdentifierTy runId,
     std::lock_guard<std::mutex> lock(instanceMtx_);
     auto it = functions_.find(functionName);
     if (it == functions_.end()) {
-      llvm::errs() << "Failed to run function: function called " << functionName
-                   << " was not added.\n";
-      resultCB(runId, MAKE_ERR("Function not added"), std::move(ctx));
+      resultCB(runId,
+               MAKE_ERR(strFormat(
+                   "Failed to run function: function called %s was not added",
+                   functionName.c_str())),
+               std::move(ctx));
       return;
     }
 
@@ -285,7 +319,18 @@ void HabanaDeviceManager::runFunctionImpl(RunIdentifierTy runId,
     if (topologyId != activeTopo_) {
       // FIXME: This can starve inactive topos.
       cv_.wait(lock, [this] { return inflightRequests_ == 0; });
-      chk(synActivateTopology(deviceId_, topologyId));
+      const auto activateTopoRes = synActivateTopology(deviceId_, topologyId);
+      if (auto err = chk_make_err(activateTopoRes)) {
+        LOG(ERROR) << "synActivateTopology failed with status "
+                   << activateTopoRes;
+        trEvent.addArg(
+            "error", llvm::formatv("synActivateTopology failed with status {0}",
+                                   activateTopoRes)
+                         .str());
+        TRACE_EVENT_SCOPE_END_NAMED(trEvent);
+        resultCB(runId, std::move(err), std::move(ctx));
+        return;
+      }
       activeTopo_ = topologyId;
     }
     inflightRequests_++;
@@ -293,12 +338,14 @@ void HabanaDeviceManager::runFunctionImpl(RunIdentifierTy runId,
 
   // Execute the function.
   auto deviceBindings =
-      llvm::make_unique<HabanaBindings>(deviceId_, topologyId);
+      glow::make_unique<HabanaBindings>(deviceId_, topologyId);
   deviceBindings->setIOBuffer(ioBufferPool->get());
   ctx->setDeviceBindings(std::move(deviceBindings));
 
   auto executeErr = function->execute(ctx.get());
   if (executeErr) {
+    trEvent.addArg("error", "execute() failed");
+    TRACE_EVENT_SCOPE_END_NAMED(trEvent);
     resultCB(runId, std::move(executeErr), std::move(ctx));
     return;
   }
@@ -309,14 +356,22 @@ void HabanaDeviceManager::runFunctionImpl(RunIdentifierTy runId,
                      functionName = std::move(functionName),
                      ctx = std::move(ctx),
                      resultCB = std::move(resultCB)]() mutable {
-    TRACE_EVENT_SCOPE(ctx->getTraceContext(), "HabanaDM::waiterThread");
-    TRACE_EVENT_BEGIN(ctx->getTraceContext(), "wait");
+    DCHECK(resultCB != nullptr);
+
+    TRACE_EVENT_SCOPE(ctx->getTraceContext(), TraceLevel::RUNTIME,
+                      "HabanaDM::waiterThread");
+    if (ctx->getTraceContext()) {
+      ctx->getTraceContext()->setThreadName(
+          llvm::formatv("Habana {0} (waiter)", deviceId_).str());
+    }
+
+    TRACE_EVENT_BEGIN(ctx->getTraceContext(), TraceLevel::RUNTIME, "wait");
     auto &habanaHandle =
         static_cast<HabanaBindings *>(ctx->getDeviceBindings())->getHandle();
     bool ok = habanaHandle.wait();
     std::unique_ptr<HabanaIOBuffer> ioBuffer =
         static_cast<HabanaBindings *>(ctx->getDeviceBindings())->getIOBuffer();
-    TRACE_EVENT_END(ctx->getTraceContext(), "wait");
+    TRACE_EVENT_END(ctx->getTraceContext(), TraceLevel::RUNTIME, "wait");
 
     // Notify anything waiting for a topo switch.
     {
@@ -329,26 +384,46 @@ void HabanaDeviceManager::runFunctionImpl(RunIdentifierTy runId,
       // Return the IO buffer to the IO buffer pool.
       ioBufferPool->put(std::move(ioBuffer));
 
-      llvm::errs() << "Failed to execute function " << functionName << ".\n";
-      resultCB(runId, MAKE_ERR("Failed to execute function"), std::move(ctx));
+      resultCB(runId,
+               MAKE_ERR(strFormat("Failed to execute function %s",
+                                  functionName.c_str())),
+               std::move(ctx));
     } else {
       // Copy the execution outputs from the designated IO buffer back to the
       // PlaceholderBindings inside ctx.
-      TRACE_EVENT_BEGIN(ctx->getTraceContext(), "copyOutputs");
+      TRACE_EVENT_SCOPE_NAMED(ctx->getTraceContext(), TraceLevel::RUNTIME,
+                              "copyOutputs", coEvent);
       auto bindings = ctx->getPlaceholderBindings();
+      size_t tensors{0}, bytes{0};
       for (const auto &ph : function->getOutputs()) {
         auto *tensor = bindings->get(ph);
         if (!tensor) {
           tensor = bindings->get(bindings->getPlaceholderByName(ph->getName()));
         }
-        memcpy(tensor->getUnsafePtr(), ioBuffer->get(ph),
-               ph->getType()->getSizeInBytes());
+        tensors++;
+
+        if (auto ioBufferDataOrErr = ioBuffer->get(ph)) {
+          memcpy(tensor->getUnsafePtr(), *ioBufferDataOrErr,
+                 ph->getType()->getSizeInBytes());
+          bytes += ph->getType()->getSizeInBytes();
+        } else {
+          // Return the IO buffer to the IO buffer pool.
+          ioBufferPool->put(std::move(ioBuffer));
+          coEvent.addArg("tensors", std::to_string(tensors));
+          coEvent.addArg("bytes", std::to_string(bytes));
+          coEvent.addArg("missingTensor", ph->getName().str());
+          TRACE_EVENT_SCOPE_END_NAMED(coEvent);
+          resultCB(runId, ioBufferDataOrErr.takeError(), std::move(ctx));
+          return;
+        }
       }
-      TRACE_EVENT_END(ctx->getTraceContext(), "copyOutputs");
+      coEvent.addArg("tensors", std::to_string(tensors));
+      coEvent.addArg("bytes", std::to_string(bytes));
+      TRACE_EVENT_SCOPE_END_NAMED(coEvent);
 
       // Return the IO buffer to the IO buffer pool.
       ioBufferPool->put(std::move(ioBuffer));
-      resultCB(runId, llvm::Error::success(), std::move(ctx));
+      resultCB(runId, Error::success(), std::move(ctx));
     }
   });
 }
@@ -357,6 +432,8 @@ RunIdentifierTy
 HabanaDeviceManager::runFunction(std::string functionName,
                                  std::unique_ptr<ExecutionContext> ctx,
                                  runtime::ResultCBTy resultCB) {
+  DCHECK(resultCB != nullptr);
+
   RunIdentifierTy runId = runIdentifier_++;
   runPool_->submit([this, runId, functionName = std::move(functionName),
                     ctx = std::move(ctx),
@@ -367,10 +444,10 @@ HabanaDeviceManager::runFunction(std::string functionName,
   return runId;
 }
 
-llvm::Error HabanaDeviceManager::stop(bool block) {
+Error HabanaDeviceManager::stop(bool block) {
   runPool_->stop(block);
   waitPool_->stop(block);
-  return llvm::Error::success();
+  return Error::success();
 }
 
 uint64_t HabanaDeviceManager::getMaximumMemory() const { return totalMemory_; }
@@ -379,4 +456,14 @@ uint64_t HabanaDeviceManager::getAvailableMemory() const { return freeMemory_; }
 
 bool HabanaDeviceManager::isMemoryAvailable(uint64_t estimate) const {
   return estimate <= freeMemory_;
+}
+
+DeviceInfo HabanaDeviceManager::getDeviceInfo() const {
+  DeviceInfo info = DeviceInfo();
+  info.sramCapacity = 50 * 1024 * 1024;
+  info.peakCompute = 0.45 * 1024 * 1024 * 1024 * 1024;
+  info.peakDramBw = 30.0 * 1024 * 1024 * 1024;
+  info.peakSramBw = 1024.0 * 1024 * 1024 * 1024;
+  info.peakPCIeBw = 16.0 * 1024 * 1024 * 1024;
+  return info;
 }

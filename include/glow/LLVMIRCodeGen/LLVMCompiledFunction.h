@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,11 +26,11 @@ namespace glow {
 class LLVMCompiledFunction : public CompiledFunction {
 public:
   LLVMCompiledFunction(std::unique_ptr<llvm::orc::GlowJIT> JIT,
-                       const runtime::RuntimeBundle &runtimeBundle);
+                       runtime::RuntimeBundle &&runtimeBundle);
 
   /// \name CompiledFunction interface
   ///@{
-  virtual llvm::Error execute(ExecutionContext *context) override;
+  virtual Error execute(ExecutionContext *context) override;
 
   virtual void collectConstants(const Module *module) override;
 
@@ -53,6 +53,10 @@ protected:
   /// The LLVM JIT engine. The jit must be initialized after the ctor
   /// initializes the LLVM backends.
   std::unique_ptr<llvm::orc::GlowJIT> JIT_;
+
+  /// The JIT can be accessed from multiple threads but is not thread safe,
+  /// JITLock_ protects it.
+  std::mutex JITLock_;
 };
 } // end namespace glow
 

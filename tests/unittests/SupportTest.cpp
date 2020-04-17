@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2018-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -61,20 +61,35 @@ TEST(Support, loadYamlFile) {
   // The config file is:
   //---
   //- name:     Device1
-  //  kindName: CPU
+  //  backendName: CPU
   //  parameters: |
   //  "platformID":"1"
   //    "deviceID" : "0"
   //    - name:     Device2
-  //  kindName: CPU
+  //  backendName: CPU
   //  parameters: |
   //  "platformID":"1"
   //...
-  EXPECT_EQ(lists[0].kindName_, "CPU");
+  EXPECT_EQ(lists[0].backendName_, "CPU");
   EXPECT_EQ(lists[0].name_, "Device1");
   EXPECT_EQ(lists[0].parameters_.str,
             "\"platformID\":\"1\"\n\"deviceID\" : \"0\"\n");
-  EXPECT_EQ(lists[1].kindName_, "CPU");
+  EXPECT_EQ(lists[1].backendName_, "CPU");
   EXPECT_EQ(lists[1].name_, "Device2");
   EXPECT_EQ(lists[1].parameters_.str, "\"platformID\":\"1\"\n");
+}
+
+TEST(Support, loadStrStrMapYamlFile) {
+  std::string yamlFilename(GLOW_DATA_PATH
+                           "tests/runtime_test/backendSpecificOpts.yaml");
+  auto map = deserializeStrStrMapFromYaml(yamlFilename);
+  EXPECT_EQ(map.size(), 2);
+  // Check the loading items.
+  // The config file is:
+  // ---
+  // backendOption1: 'foo'
+  // backendOption2: 'bar'
+  // ...
+  EXPECT_EQ(map["backendOption1"], "foo");
+  EXPECT_EQ(map["backendOption2"], "bar");
 }

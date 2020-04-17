@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
+#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/IRCompileLayer.h"
 #include "llvm/ExecutionEngine/Orc/LambdaResolver.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
@@ -45,29 +46,49 @@ class GlowJIT {
 private:
   TargetMachine &TM_;
   const DataLayout DL_;
-#if FACEBOOK_INTERNAL && LLVM_VERSION_PATCH < 20181009
+#if FACEBOOK_INTERNAL && LLVM_VERSION_MAJOR < 8
   SymbolStringPool SSP_;
   ExecutionSession ES_;
   std::shared_ptr<SymbolResolver> resolver_;
 #else
   std::shared_ptr<SymbolStringPool> SSP_;
   ExecutionSession ES_;
+  /// Handles symbols that are overridden by the JIT engine (needed to manage
+  /// C++ destructors for static objects).
+#if !FACEBOOK_INTERNAL
+#if LLVM_VERSION_MAJOR == 7 || FACEBOOK_INTERNAL
+  LocalCXXRuntimeOverrides cxxSymbolOverride_;
+#else
+  LegacyLocalCXXRuntimeOverrides cxxSymbolOverride_;
+#endif
+#endif
+
   std::shared_ptr<SymbolResolver> resolver_;
 #endif
-#if LLVM_VERSION_MAJOR == 7 || FACEBOOK_INTERNAL
+#if LLVM_VERSION_MAJOR == 7 || (LLVM_VERSION_MAJOR <= 8 && FACEBOOK_INTERNAL)
   RTDyldObjectLinkingLayer objectLayer_;
   IRCompileLayer<decltype(objectLayer_), SimpleCompiler> compileLayer_;
+  /// Records C++ constructor/destructor names of static objects.
+  std::vector<llvm::orc::CtorDtorRunner<decltype(compileLayer_)>>
+      irStaticDestructorRunners_;
 #else
   LegacyRTDyldObjectLinkingLayer objectLayer_;
   LegacyIRCompileLayer<decltype(objectLayer_), SimpleCompiler> compileLayer_;
+  /// Object that records static C++ constructor/destructor names.
+  std::vector<LegacyCtorDtorRunner<decltype(compileLayer_)>>
+      irStaticDestructorRunners_;
 #endif
+
+  /// \returns the mangled name for the C++ global symbol \p name.
+  std::string mangle(const std::string &name);
 
 public:
   GlowJIT(llvm::TargetMachine &TM);
+  ~GlowJIT();
 
   TargetMachine &getTargetMachine() { return TM_; }
 
-  JITSymbol findSymbol(const std::string name);
+  JITSymbol findSymbol(const std::string &name);
 
   using ModuleHandle = orc::VModuleKey;
 

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,20 +18,59 @@
 
 llvm::cl::OptionCategory &getLLVMBackendCat() {
   static llvm::cl::OptionCategory cpuBackendCat("Glow CPU Backend Options");
-
   return cpuBackendCat;
 }
 
 llvm::cl::opt<std::string> llvmTarget("target",
                                       llvm::cl::desc("LLVM target to be used"));
+
 llvm::cl::opt<std::string>
     llvmArch("march", llvm::cl::desc("LLVM architecture to be used"));
+
 llvm::cl::opt<std::string> llvmCPU("mcpu",
                                    llvm::cl::desc("LLVM CPU to be used"));
+
+llvm::cl::opt<std::string> llvmABI("mabi",
+                                   llvm::cl::desc("Machine ABI to be used"));
+
+llvm::cl::opt<llvm::CodeModel::Model> llvmCodeModel(
+    "code-model",
+    llvm::cl::desc("Specify which code model to use on the target machine"),
+    llvm::cl::values(
+        clEnumValN(llvm::CodeModel::Model::Small, "small", "Small code model"),
+        clEnumValN(llvm::CodeModel::Model::Medium, "medium",
+                   "Medium code model"),
+        clEnumValN(llvm::CodeModel::Model::Large, "large", "Large code model")),
+    llvm::cl::init(llvm::CodeModel::Model::Large),
+    llvm::cl::cat(getLLVMBackendCat()));
+
+llvm::cl::opt<llvm::CodeModel::Model> llvmBundleCodeModel(
+    "bundle-code-model",
+    llvm::cl::desc("Specify which code model to use for a bundle"),
+    llvm::cl::values(
+        clEnumValN(llvm::CodeModel::Model::Small, "small", "Small code model"),
+        clEnumValN(llvm::CodeModel::Model::Medium, "medium",
+                   "Medium code model"),
+        clEnumValN(llvm::CodeModel::Model::Large, "large", "Large code model")),
+    llvm::cl::init(llvm::CodeModel::Model::Small),
+    llvm::cl::cat(getLLVMBackendCat()));
+
+llvm::cl::opt<llvm::Reloc::Model> llvmRelocModel(
+    "relocation-model",
+    llvm::cl::desc(
+        "Specify which relocation model to use on the target machine"),
+    llvm::cl::values(
+        clEnumValN(llvm::Reloc::Static, "static", "Non-relocatable code"),
+        clEnumValN(llvm::Reloc::PIC_, "pic", "Position independent code")),
+    llvm::cl::init(llvm::Reloc::Static), llvm::cl::cat(getLLVMBackendCat()));
+
 llvm::cl::list<std::string>
     llvmTargetFeatures("target-feature",
                        llvm::cl::desc("LLVM target/CPU features to be used"),
                        llvm::cl::CommaSeparated, llvm::cl::ZeroOrMore);
+
+llvm::cl::alias llvmMAttr("mattr", llvm::cl::desc("Alias for -target-feature"),
+                          llvm::cl::aliasopt(llvmTargetFeatures));
 
 llvm::cl::opt<std::string>
     llvmCompiler("llvm-compiler",
@@ -42,3 +81,30 @@ llvm::cl::list<std::string> llvmCompilerOptions(
     "llvm-compiler-opt",
     llvm::cl::desc("Options to pass to the external LLVM compiler"),
     llvm::cl::ZeroOrMore);
+
+llvm::cl::opt<llvm::FloatABI::ABIType>
+    floatABI("float-abi", llvm::cl::desc("Option to set float ABI type"),
+             llvm::cl::values(clEnumValN(llvm::FloatABI::Default, "default",
+                                         "Default float ABI type"),
+                              clEnumValN(llvm::FloatABI::Soft, "soft",
+                                         "Soft float ABI (softfp)"),
+                              clEnumValN(llvm::FloatABI::Hard, "hard",
+                                         "Hard float ABI (hardfp)")),
+             llvm::cl::init(llvm::FloatABI::Default));
+
+static llvm::cl::OptionCategory bundleSaverCat("Bundle Options");
+
+llvm::cl::opt<glow::BundleApiType>
+    bundleAPI("bundle-api", llvm::cl::desc("Specify which bundle API to use."),
+              llvm::cl::Optional,
+              llvm::cl::values(clEnumValN(glow::BundleApiType::Dynamic,
+                                          "dynamic", "Dynamic API"),
+                               clEnumValN(glow::BundleApiType::Static, "static",
+                                          "Static API")),
+              llvm::cl::init(glow::BundleApiType::Static),
+              llvm::cl::cat(bundleSaverCat));
+
+llvm::cl::opt<bool> bundleAPIVerbose(
+    "bundle-api-verbose",
+    llvm::cl::desc("Print more details in the bundle API header file"),
+    llvm::cl::init(false), llvm::cl::cat(bundleSaverCat));

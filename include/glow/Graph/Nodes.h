@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,10 +36,12 @@ public:
     OutputIdx = 0,
   };
 
-  Storage(Kinded::Kind k, llvm::StringRef name) : Node(k, name) {}
+  Storage(Kinded::Kind k, llvm::StringRef name, const std::string &layout)
+      : Node(k, name), layout_(layout) {}
 
   /// \return the single output value of the node.
   NodeValue getOutput() { return getNthResult(0); }
+  const NodeValue getOutput() const { return getNthResult(0); }
 
   /// Declare the standard Node methods.
   /// @{
@@ -51,6 +53,8 @@ public:
   NodeValue getNthInput(unsigned idx);
   llvm::StringRef getOutputName(unsigned idx) const;
   bool hasSideEffects() const;
+  bool isCanonical() const { return true; }
+  bool isDataParallel() const { return false; }
   Node *clone() const;
   /// @}
 
@@ -60,13 +64,20 @@ public:
   /// Methods that forward to the result type (that must be valid):
   /// @{
   ElemKind getElementType() const { return getType()->getElementType(); };
-  llvm::ArrayRef<size_t> dims() const { return getType()->dims(); };
+  llvm::ArrayRef<dim_t> dims() const { return getType()->dims(); };
   /// @}
 
   static bool classof(const Kinded *k) {
     return k->getKind() == Kinded::Kind::ConstantKind ||
            k->getKind() == Kinded::Kind::PlaceholderKind;
   }
+
+  /// \return the layout of the storage.
+  const std::string &getLayout() const { return layout_; }
+
+private:
+  /// Specifies the Storage's layout
+  const std::string layout_;
 };
 
 class Constant : public Storage {
@@ -75,14 +86,14 @@ class Constant : public Storage {
 
 public:
   /// Create a new constant and initialize its payload.
-  Constant(llvm::StringRef name, TypeRef Ty)
-      : Storage(Kinded::Kind::ConstantKind, name) {
+  Constant(llvm::StringRef name, TypeRef Ty, const std::string &layout)
+      : Storage(Kinded::Kind::ConstantKind, name, layout) {
     addResult(Ty);
     payload_.reset(*Ty);
   }
 
-  Constant(llvm::StringRef name, Tensor &&payload)
-      : Storage(Kinded::Kind::ConstantKind, name),
+  Constant(llvm::StringRef name, Tensor &&payload, const std::string &layout)
+      : Storage(Kinded::Kind::ConstantKind, name, layout),
         payload_(std::move(payload)) {
     addResult(&payload_.getType());
   }
@@ -91,14 +102,20 @@ public:
     return k->getKind() == Kinded::Kind::ConstantKind;
   }
 
-  /// \returns a mutable reference to the payload tensor. If the payload tensor
-  /// is unowned then it will be converted to an owned copy before returning.
-  Tensor &getPayloadMutable() {
-    // If payload is unowned, make an owned copy of the payload for
-    // modification.
+  /// If payload is unowned, make an owned copy of the payload for
+  /// modification.
+  void ensureIsOwned() {
     if (payload_.isUnowned()) {
       payload_ = payload_.clone();
     }
+  }
+
+  /// \returns a mutable reference to the payload tensor. If the payload tensor
+  /// is unowned then it will be converted to an owned copy before returning.
+  Tensor &getPayloadMutable() {
+    /// Make sure the payload is owned before handing out a mutable reference.
+    ensureIsOwned();
+
     assert(!payload_.isUnowned() &&
            "Can only modify Constants with owned payloads");
     return payload_;
@@ -115,7 +132,9 @@ public:
 
   void setPayloadType(TypeRef ty) { payload_.setType(ty); }
 
-  std::string getDebugDesc() const;
+  bool isDataParallel() const { return false; }
+
+  std::string getDebugDesc(bool skipUsers = false) const;
 
   llvm::hash_code getHash() const;
 
@@ -131,10 +150,18 @@ class Placeholder : public Storage {
   /// Specifies if the placeholder is trainable.
   bool isTrainable_;
 
+  /// Specifies if associated Tensors should be zeroed when allocated.
+  bool allocZero_{false};
+
+  /// Specifies if this is a static placeholder, this means it is set once
+  /// before the first network run and will be reused by following runs.
+  bool isStatic_{false};
+
 public:
   /// Create a new placeholder.
-  Placeholder(llvm::StringRef name, TypeRef Ty, bool isTrainable)
-      : Storage(Kinded::Kind::PlaceholderKind, name),
+  Placeholder(llvm::StringRef name, TypeRef Ty, bool isTrainable,
+              const std::string &layout)
+      : Storage(Kinded::Kind::PlaceholderKind, name, layout),
         isTrainable_(isTrainable) {
     addResult(Ty);
   }
@@ -143,18 +170,32 @@ public:
   /// differentiation.
   bool isTraining() const { return isTrainable_; }
 
+  /// \returns True if associated Tensors should be zeroed when allocated.
+  bool allocZero() const { return allocZero_; }
+
+  /// Update the isStatic_ field.
+  void setStatic(bool isStatic) { isStatic_ = isStatic; }
+
+  /// Get the status of the isStatic_ flag.
+  bool isStatic() const { return isStatic_; }
+
+  /// Sets whether or not associated Tensors should be zeroed.
+  void setAllocZero(bool on = true) { allocZero_ = on; }
+
   static bool classof(const Kinded *k) {
     return k->getKind() == Kinded::Kind::PlaceholderKind;
   }
 
-  std::string getDebugDesc() const;
+  bool isDataParallel() const { return false; }
+
+  std::string getDebugDesc(bool skipUsers = false) const;
 
   llvm::hash_code getHash() const;
 };
 
 /// Calculate the size of the output tensor based on the convolution/pooling
 /// parameters.
-inline std::pair<size_t, size_t> calculateConvPoolOutputDims(
+inline std::pair<dim_t, dim_t> calculateConvPoolOutputDims(
     size_t sx, size_t sy, llvm::ArrayRef<unsigned_t> kernels,
     llvm::ArrayRef<unsigned_t> strides, llvm::ArrayRef<unsigned_t> pads,
     unsigned_t dilation = 1) {
@@ -175,24 +216,59 @@ inline std::pair<size_t, size_t> calculateConvPoolOutputDims(
 /// Calculate the size of the output tensor based on the 3D convolution/pooling
 /// parameters \p inH \p inW, \p inT which are the input's height, width, and
 /// depth respectively.
-inline ShapeHWD calculate3DConvPoolOutputDims(
-    size_t inH, size_t inW, size_t inD, llvm::ArrayRef<unsigned_t> kernels,
+inline ShapeTHW calculate3DConvPoolOutputDims(
+    size_t inT, size_t inH, size_t inW, llvm::ArrayRef<unsigned_t> kernels,
     llvm::ArrayRef<unsigned_t> strides, llvm::ArrayRef<unsigned_t> pads) {
-  PaddingTLNBRF pdim(pads);
-  ShapeHWD kdim(kernels);
-  ShapeHWD sdim(strides);
+  PaddingNFTBLR pdim(pads);
+  ShapeTHW kdim(kernels);
+  ShapeTHW sdim(strides);
 
+  size_t outT = ((inT + pdim.near + pdim.far - kdim.temporal_frames) /
+                     sdim.temporal_frames +
+                 1);
   size_t outH =
       ((inH + pdim.top + pdim.bottom - kdim.height) / sdim.height + 1);
   size_t outW = ((inW + pdim.left + pdim.right - kdim.width) / sdim.width + 1);
-  size_t outD = ((inD + pdim.near + pdim.far - kdim.depth) / sdim.depth + 1);
 
-  llvm::SmallVector<size_t, 3> outDims{outH, outW, outD};
-  return ShapeHWD(llvm::makeArrayRef(outDims));
+  llvm::SmallVector<size_t, 3> outDims{outT, outH, outW};
+  return ShapeTHW(llvm::makeArrayRef(outDims));
+}
+
+/// Calculate the size of the output tensor based on the ConvTranspose
+/// parameters.
+inline std::pair<dim_t, dim_t> calculateConvTransposeOutputDims(
+    size_t sx, size_t sy, llvm::ArrayRef<unsigned_t> kernels,
+    llvm::ArrayRef<unsigned_t> strides, llvm::ArrayRef<unsigned_t> pads,
+    unsigned_t dilation = 1) {
+  PaddingTLBR pdim(pads);
+  ShapeHW kdim(kernels);
+  ShapeHW sdim(strides);
+
+  size_t outsx = (sx - 1) * sdim.height + (kdim.height - 1) * dilation + 1 -
+                 pdim.top - pdim.bottom;
+  size_t outsy = (sy - 1) * sdim.width + (kdim.width - 1) * dilation + 1 -
+                 pdim.left - pdim.right;
+
+  return {outsx, outsy};
 }
 
 /// Modes of the padding operation.
 enum PaddingMode { CONSTANT = 0, REFLECT, EDGE };
+
+/// Different lengths modes used for SLS variants.
+enum class LengthsMode { Variable, AllOne };
+
+/// Convolution Layouts.
+enum ConvolutionLayout { NHWC = 0, NCHW };
+
+/// Activations fused into ConvolutionNode (not supported on all backends).
+enum FusedActivation { NONE = 0, RELU, TANH, SIGMOID };
+
+/// Define output operators.
+llvm::raw_ostream &operator<<(llvm::raw_ostream &os, ConvolutionLayout layout);
+llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                              FusedActivation fusedActivation);
+llvm::raw_ostream &operator<<(llvm::raw_ostream &os, LengthsMode lengthsMode);
 
 /// Support for hashing the Nodes. This is required for using
 /// llvm::hash_combine.
@@ -205,6 +281,11 @@ struct NodeValue;
 /// FIXME: This is a workaround, because defining the hash_code
 /// hash_value(float) does not work for some reason.
 size_t toBinary(float f);
+/// Convert a collection of floats into a vector of
+/// unsigned integer binary representation.
+/// FIXME: This is a workaround, because defining the hash_code
+/// hash_value(float) does not work for some reason.
+std::vector<size_t> toBinary(llvm::ArrayRef<float> vec);
 llvm::hash_code hash_value(const glow::Tensor &T);
 
 llvm::hash_code hash_value(const glow::Type *T);
@@ -273,6 +354,27 @@ public:
   }
 #include "glow/AutoGenNodes.def"
 };
+
+/// Signifiers for exporting and importing properties of Nodes.
+constexpr char layoutSignifier[] = "layout";
+constexpr char staticSignifier[] = "offline";
+constexpr char trainableSignifier[] = "trainable";
+constexpr char elemKindSignifier[] = "elemKind";
+constexpr char saveNameSignifier[] = "saveName";
+constexpr char qScaleSignifier[] = "qScale";
+constexpr char qOffsetSignifier[] = "qOffset";
+constexpr char shapeSignifier[] = "shape";
+
+/// \returns the string ID for a type attribute property for a specific \p ioNum
+/// and \p signifier and whether \p isInput. E.g. to retrieve result number 0's
+/// shape, you'd pass `(0, "shape", false)`. \p addPrefix is an additional
+/// prefix to include at the front of the returned ID.
+inline std::string getTypeAttrID(unsigned ioNum, const std::string &signifier,
+                                 bool isInput = false,
+                                 const std::string &addPrefix = "") {
+  return addPrefix + (isInput ? "i" : "o") + std::to_string(ioNum) + "_" +
+         signifier;
+}
 
 } // namespace glow
 

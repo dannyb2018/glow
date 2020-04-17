@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,11 +48,12 @@ TEST(GraphAutoGrad, autoGrad) {
   auto *RL0 = F->createRELU("relu1", CV0);
   auto *MP0 = F->createMaxPool("pool1", RL0, 3, 3, 0);
 
-  auto *CV1 = F->createConv(bindings, "conv2", MP0, 16, 5, 1, 2, 1);
+  auto *CV1 =
+      F->createConv(bindings, "conv2", MP0->getResult(), 16, 5, 1, 2, 1);
   auto *RL1 = F->createRELU("conv23", CV1);
   auto *MP1 = F->createMaxPool("pool2", RL1, 3, 3, 0);
 
-  auto *FCL1 = F->createFullyConnected(bindings, "fc3", MP1, 10);
+  auto *FCL1 = F->createFullyConnected(bindings, "fc3", MP1->getResult(), 10);
   auto *RL2 = F->createRELU("relu3", FCL1);
   auto *selected =
       mod.createPlaceholder(ElemKind::Int64ITy, {10, 1}, "selected", false);
@@ -62,9 +63,8 @@ TEST(GraphAutoGrad, autoGrad) {
   auto *result = F->createSave("return", SM);
   (void)result;
 
-  Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
+  glow::differentiate(F, TC);
+  EE.compile(CompilationMode::Train);
 }
 
 TEST(GraphAutoGrad, checkLRNGen) {
@@ -92,9 +92,8 @@ TEST(GraphAutoGrad, checkLRNGen) {
 
   auto *result = F->createSave("return", SM);
   (void)result;
-  Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
+  glow::differentiate(F, TC);
+  EE.compile(CompilationMode::Train);
 }
 
 TEST(GraphAutoGrad, cloneAndDiff) {
@@ -173,13 +172,12 @@ TEST(GraphAutoGrad, checkPlaceholderGradTest) {
   // Expect a single user to the trainable input placeholder.
   EXPECT_EQ(A->getNumUsers(), 1);
 
-  Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
+  glow::differentiate(F, TC);
+  EE.compile(CompilationMode::Train);
 
   // Check that the Placeholder has multiple users, because at least one write
-  /// node will be added.
-  EXPECT_GE(A->getNumUsers(), 1);
+  // node will be added.
+  EXPECT_GT(A->getNumUsers(), 1);
 }
 
 /// Check that we can differentiate functions that use ConvertToNode.
@@ -198,15 +196,12 @@ TEST(GraphAutoGrad, checkConvertToGradTest) {
   auto inputHandle = bindings.allocate(A)->getHandle<float>();
   inputHandle.randomize(-3.0, 3.0, mod.getPRNG());
 
-  TypeRef outTy = mod.uniqueType(ElemKind::Float16Ty, A->dims());
-
-  auto *convertTo = F->createConvertTo("convertTo", A, outTy);
+  auto *convertTo = F->createConvertTo("convertTo", A, ElemKind::Float16Ty);
   auto *result = F->createSave("save", convertTo);
   bindings.allocate(result->getPlaceholder());
 
-  Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
+  glow::differentiate(F, TC);
+  EE.compile(CompilationMode::Train);
 }
 
 /// Check that we can differentiate functions that use MatMulNode.
@@ -233,9 +228,45 @@ TEST(GraphAutoGrad, checkMatMulGradTest) {
   auto *R = F->createSave("save", MatMul);
   Bindings.allocate(R->getPlaceholder());
 
-  Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
+  glow::differentiate(F, TC);
+  EE.compile(CompilationMode::Train);
+}
+
+/// Check that we can differentiate functions that use BatchMatMul.
+TEST(GraphAutoGrad, checkBatchMatMulGradTest) {
+  ExecutionEngine EE;
+  TrainingConfig TC;
+
+  auto &Mod = EE.getModule();
+  Function *F = Mod.createFunction("main");
+
+  auto *A = Mod.createPlaceholder(ElemKind::FloatTy, {5, 20, 13}, "A",
+                                  /*isTrainable=*/false);
+  auto *B = Mod.createPlaceholder(ElemKind::FloatTy, {13, 30}, "B",
+                                  /*isTrainable=*/false);
+  auto *BatchMatMul = F->createBatchMatMul("batchMatMul", A, B);
+
+  F->createSave("save", BatchMatMul);
+
+  glow::differentiate(F, TC);
+  EE.compile(CompilationMode::Train);
+}
+
+// Check that we can differentiate functions that use Tile.
+TEST(GraphAutoGrad, checkTileGradTest) {
+  ExecutionEngine EE;
+  TrainingConfig TC;
+
+  auto &Mod = EE.getModule();
+  Function *F = Mod.createFunction("main");
+
+  auto *A = Mod.createPlaceholder(ElemKind::FloatTy, {10, 10}, "A", false);
+  auto *Tile = F->createTile("tile", A, /*tiles=*/5, /*axis=*/1);
+
+  F->createSave("save", Tile);
+
+  glow::differentiate(F, TC);
+  EE.compile(CompilationMode::Train);
 }
 
 /// Check that we can differentiate functions that use BatchedReduceAddNode.
@@ -256,9 +287,8 @@ TEST(GraphAutoGrad, checkBatchedReduceAddGradTest) {
   auto *R = F->createSave("save", BRA);
   Bindings.allocate(R->getPlaceholder());
 
-  Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
+  glow::differentiate(F, TC);
+  EE.compile(CompilationMode::Train);
 }
 
 /// Check that we can differentiate functions that use GatherNode.
@@ -283,9 +313,8 @@ TEST(GraphAutoGrad, checkGatherGrad1DIndexTest) {
   auto *R = F->createSave("save", G);
   Bindings.allocate(R->getPlaceholder());
 
-  Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
+  glow::differentiate(F, TC);
+  EE.compile(CompilationMode::Train);
 }
 
 TEST(GraphAutoGrad, checkGatherGrad2DIndexTest) {
@@ -309,9 +338,8 @@ TEST(GraphAutoGrad, checkGatherGrad2DIndexTest) {
   auto *R = F->createSave("save", G);
   Bindings.allocate(R->getPlaceholder());
 
-  Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
+  glow::differentiate(F, TC);
+  EE.compile(CompilationMode::Train);
 }
 
 TEST(GraphAutoGrad, checkGatherGrad3DIndexTest) {
@@ -335,7 +363,29 @@ TEST(GraphAutoGrad, checkGatherGrad3DIndexTest) {
   auto *R = F->createSave("save", G);
   Bindings.allocate(R->getPlaceholder());
 
-  Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
+  glow::differentiate(F, TC);
+  EE.compile(CompilationMode::Train);
+}
+
+TEST(GraphAutoGrad, checkAdaptiveAvgPoolGradTest) {
+  ExecutionEngine EE;
+  TrainingConfig TC;
+  PlaceholderBindings Bindings;
+
+  auto &Mod = EE.getModule();
+  Function *F = Mod.createFunction("main");
+
+  auto *Data =
+      Mod.createPlaceholder(ElemKind::FloatTy, {1, 8, 4, 1}, "Data", false);
+
+  auto HandleData = Bindings.allocate(Data)->getHandle<float>();
+  HandleData.randomize(-3.0, 3.0, Mod.getPRNG());
+
+  auto outTy = Mod.uniqueType(ElemKind::FloatTy, {1, 3, 3, 1});
+  Node *A = F->createAdaptiveAvgPool("pool", Data, outTy);
+  auto *R = F->createSave("save", A);
+  Bindings.allocate(R->getPlaceholder());
+
+  glow::differentiate(F, TC);
+  EE.compile(CompilationMode::Train);
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,9 +22,9 @@
 using namespace glow;
 
 CPUFunction::CPUFunction(std::unique_ptr<llvm::orc::GlowJIT> JIT,
-                         const runtime::RuntimeBundle &runtimeBundle)
-    : LLVMCompiledFunction(std::move(JIT), runtimeBundle) {}
+                         runtime::RuntimeBundle &&runtimeBundle)
+    : LLVMCompiledFunction(std::move(JIT), std::move(runtimeBundle)) {}
 
-llvm::Error CPUFunction::execute(ExecutionContext *context) {
+Error CPUFunction::execute(ExecutionContext *context) {
   return LLVMCompiledFunction::execute(context);
 }

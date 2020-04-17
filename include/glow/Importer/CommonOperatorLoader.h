@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <functional>
+#include <numeric>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -45,6 +46,8 @@ struct LoadWeightResult {
   /// Glow tensor containing quantization scales. This should only be non-null
   /// if there is more than 1 quantization parameter found.
   std::unique_ptr<Tensor> scales;
+  /// Type info of the weight, this is used for offline weights.
+  Type type;
 };
 
 /// Contains loaders for operators, which are common to ONNX and Caffe2
@@ -58,7 +61,7 @@ class CommonOperatorLoader : public ProtobufLoader {
   /// result.offsets and result.scales are the quantization scales and offsets
   /// of the onnxTensorDescriptorV1 if there were more than 1. If there is
   /// exactly 1 scale and offset then result.t will be a quantized glow tensor.
-  inline llvm::Expected<LoadWeightResult>
+  inline Expected<LoadWeightResult>
   loadWeight(const onnxTensorDescriptorV1 &in) {
     // Only support CPU memory tensors.
     if (in.memoryType != ONNXIFI_MEMORY_TYPE_CPU) {
@@ -66,7 +69,7 @@ class CommonOperatorLoader : public ProtobufLoader {
     }
 
     // Number of qparams in the onnxTensorDescriptor.
-    const size_t qparams = static_cast<size_t>(in.quantizationParams);
+    const dim_t qparams = static_cast<dim_t>(in.quantizationParams);
 
     // Only support quantizationAxis=1 for now.
     if (qparams > 0 && in.quantizationAxis != 1) {
@@ -76,13 +79,10 @@ class CommonOperatorLoader : public ProtobufLoader {
           in.name, in.quantizationAxis));
     }
 
-    // This is a caffe2 offset shift.
-    constexpr int32_t OFFSETSHIFT = 128;
-
     LoadWeightResult result;
-    result.t = llvm::make_unique<Tensor>();
+    result.t = glow::make_unique<Tensor>();
 
-    std::vector<size_t> dims;
+    std::vector<dim_t> dims;
     for (unsigned i = 0; i < in.dimensions; ++i) {
       dims.push_back(in.shape[i]);
     }
@@ -90,26 +90,19 @@ class CommonOperatorLoader : public ProtobufLoader {
     // Load unquantized tensor.
     if (in.quantizationParams == 0) {
       if (in.dataType == ONNXIFI_DATATYPE_FLOAT32) {
-        Type ty(ElemKind::FloatTy, dims);
-        *result.t = Tensor((void *)in.buffer, &ty);
+        result.type = Type(ElemKind::FloatTy, dims);
+      } else if (in.dataType == ONNXIFI_DATATYPE_FLOAT16) {
+        result.type = Type(ElemKind::Float16Ty, dims);
       } else if (in.dataType == ONNXIFI_DATATYPE_INT32) {
-        Type ty(ElemKind::Int32ITy, dims);
-        *result.t = Tensor((void *)in.buffer, &ty);
+        result.type = Type(ElemKind::Int32ITy, dims);
       } else if (in.dataType == ONNXIFI_DATATYPE_INT64) {
-        Type ty(ElemKind::Int64ITy, dims);
-        *result.t = Tensor((void *)in.buffer, &ty);
+        result.type = Type(ElemKind::Int64ITy, dims);
       } else if (in.dataType == ONNXIFI_DATATYPE_UINT8) {
-        // Must copy the weights here because we will need to modify them by
-        // adjusting for OFFSETSHIFT.
-        result.t->reset(ElemKind::Int8QTy, dims, 1.0, 0);
-        auto TH = result.t->template getHandle<int8_t>();
-        uint8_t *data = (uint8_t *)in.buffer;
-        for (size_t i = 0; i < TH.size(); ++i) {
-          TH.raw(i) = static_cast<int8_t>((((uint8_t)data[i]) - OFFSETSHIFT));
-        }
+        // UInt8 type is used for variety of rowwise quantized SLSs.
+        // Make dummy scale and offset for these cases.
+        result.type = Type(ElemKind::UInt8QTy, dims, 1.0, 0);
       } else if (in.dataType == ONNXIFI_DATATYPE_UINT64) {
-        Type ty(ElemKind::Int64ITy, dims);
-        *result.t = Tensor((void *)in.buffer, &ty);
+        result.type = Type(ElemKind::Int64ITy, dims);
         for (size_t i = 0; i < result.t->size(); ++i) {
           RETURN_ERR_IF_NOT(
               ((int64_t *)in.buffer)[i] >= 0,
@@ -121,9 +114,14 @@ class CommonOperatorLoader : public ProtobufLoader {
             "got input with ONNXIFI_DATATYPE: %zu",
             static_cast<size_t>(in.dataType)));
       }
-
-      return llvm::Expected<LoadWeightResult>(std::move(result));
+      if (!in.isOffline) {
+        *result.t = Tensor((void *)in.buffer, &result.type);
+      }
+      return Expected<LoadWeightResult>(std::move(result));
     }
+
+    // This is a caffe2 offset shift.
+    constexpr int32_t OFFSETSHIFT = 128;
 
     // Load quantized tensor with either a single or multiple qparams.
     float scale = 1.0;
@@ -138,39 +136,46 @@ class CommonOperatorLoader : public ProtobufLoader {
     } else {
       Type scalesTy(ElemKind::FloatTy, llvm::makeArrayRef({qparams}));
       Type offsetsTy(ElemKind::Int32ITy, llvm::makeArrayRef({qparams}));
-      result.scales = llvm::make_unique<Tensor>((void *)in.scales, &scalesTy);
-      result.offsets = llvm::make_unique<Tensor>((void *)in.biases, &offsetsTy);
+      result.scales = glow::make_unique<Tensor>((void *)in.scales, &scalesTy);
+      result.offsets = glow::make_unique<Tensor>((void *)in.biases, &offsetsTy);
     }
 
     if (in.dataType == ONNXIFI_DATATYPE_UINT8) {
       // Must copy the weights here because we will need to modify them by
       // adjusting for OFFSETSHIFT.
-      result.t->reset(ElemKind::Int8QTy, dims, scale, offset - OFFSETSHIFT);
+      result.type = Type(ElemKind::Int8QTy, dims, scale, offset - OFFSETSHIFT);
+      if (!in.isOffline) {
+        result.t->reset(result.type);
 
-      auto TH = result.t->getHandle<int8_t>();
-      uint8_t *data = (uint8_t *)in.buffer;
-      for (size_t i = 0; i < TH.size(); ++i) {
-        TH.raw(i) = (int8_t)(data[i] - OFFSETSHIFT);
+        auto TH = result.t->getHandle<int8_t>();
+        uint8_t *data = (uint8_t *)in.buffer;
+        for (size_t i = 0; i < TH.size(); ++i) {
+          TH.raw(i) = (int8_t)(data[i] - OFFSETSHIFT);
+        }
       }
     } else if (in.dataType == ONNXIFI_DATATYPE_INT32) {
-      Type ty(ElemKind::Int32QTy, dims, scale, offset);
-      *result.t = Tensor((void *)in.buffer, &ty);
+      result.type = Type(ElemKind::Int32QTy, dims, scale, offset);
+      if (!in.isOffline) {
+        *result.t = Tensor((void *)in.buffer, &result.type);
+      }
     } else if (in.dataType == ONNXIFI_DATATYPE_INT8) {
-      Type ty(ElemKind::Int8QTy, dims, scale, offset);
-      *result.t = Tensor((void *)in.buffer, &ty);
+      result.type = Type(ElemKind::Int8QTy, dims, scale, offset);
+      if (!in.isOffline) {
+        *result.t = Tensor((void *)in.buffer, &result.type);
+      }
     } else {
       RETURN_ERR(strFormat("Only uint8, int32, and int8, quantized tensors are "
                            "supported, got input with ONNXIFI_DATATYPE: %zu",
                            static_cast<size_t>(in.dataType)));
     }
 
-    return llvm::Expected<LoadWeightResult>(std::move(result));
+    return Expected<LoadWeightResult>(std::move(result));
   }
 
   /// Merge shape \p shape into \p mergeShape, following multidirectional
   /// broadcasting rules.
-  llvm::Error mergeMultidirectionalBroadcast(std::vector<size_t> &mergeShape,
-                                             llvm::ArrayRef<size_t> shape) {
+  Error mergeMultidirectionalBroadcast(std::vector<dim_t> &mergeShape,
+                                       llvm::ArrayRef<dim_t> shape) {
     size_t shift = mergeShape.size() - shape.size();
     for (size_t i = 0; i < shape.size(); i++) {
       if (shape[i] != 1) {
@@ -181,54 +186,66 @@ class CommonOperatorLoader : public ProtobufLoader {
       }
       // Otherwise, just leave mergeShape[i] as it is.
     }
-    return llvm::Error::success();
+    return Error::success();
   }
 
-public:
+protected:
   CommonOperatorLoader(llvm::ArrayRef<const char *> names,
-                       llvm::ArrayRef<TypeRef> types, Function &F)
+                       llvm::ArrayRef<TypeRef> types, Function *F)
       : ProtobufLoader(names, types, F) {}
 
-protected:
+  CommonOperatorLoader(llvm::ArrayRef<const char *> names,
+                       llvm::ArrayRef<TypeRef> types, Module &mod)
+      : ProtobufLoader(names, types, mod) {}
+
   using ArgumentDictionaryTy =
       std::unordered_map<std::string, const AttrType *>;
 
   /// \returns True if the operator has broadcasting activated.
-  virtual llvm::Expected<bool>
-  getBroadcast(const ArgumentDictionaryTy &dict) = 0;
+  virtual Expected<bool> getBroadcast(ArgumentDictionaryTy &dict) = 0;
 
   /// \returns True if the operator with the name \p typeName has support
   /// for multidirectional broadcasting.
   virtual bool hasMultidirectionalBroadcast(const llvm::StringRef typeName) = 0;
 
+  inline Expected<LengthsMode> getLengthsMode(ArgumentDictionaryTy &dict) {
+    bool length1 = false;
+    if (dict.count("length1")) {
+      ASSIGN_VALUE_OR_RETURN_ERR(length1, loadInt(dict["length1"]));
+    }
+    if (length1) {
+      return LengthsMode::AllOne;
+    }
+    return LengthsMode::Variable;
+  }
+
   /// Associate the name of operation outputs to a NodeValues corresponding to
   /// node \p node. If \p numOutputs is lower than 0, then all outputs are
   /// associated. Otherwise, the first \p numOutputs outputs are associated.
-  llvm::Error addNodeAsOutput(const OpType &op, Node *node,
-                              int numOutputs = -1) {
+  Error addNodeAsOutput(const OpType &op, Node *node, int numOutputs = -1) {
     RETURN_ERR_IF_NOT(numOutputs <= op.output_size(),
                       "Can't register more than outputs in the operation.");
     numOutputs = (numOutputs < 0) ? op.output_size() : numOutputs;
     for (int i = 0; i < numOutputs; i++) {
       nodeValueByName_[op.output(i)] = NodeValue(node, i);
     }
-    return llvm::Error::success();
+    return Error::success();
   }
 
   /// Loads RELU operator, given its protobuf representation and parsed args.
-  llvm::Error loadRelu(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadRelu(const OpType &op, ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
-    auto *R = G_.createRELU(opName, in);
+    auto *R = G_->createRELU(opName, in);
     RETURN_IF_ERR(addNodeAsOutput(op, R));
-    return llvm::Error::success();
+    return Error::success();
   }
 
   /// Loads PRELU operator, given its protobuf representation and parsed args.
   /// Follows undirectional broadcasting described here:
   /// https://github.com/onnx/onnx/blob/fb1a80692c1ab0bd27b1072f2e7bffacba336777/docs/Broadcasting.md
-  llvm::Error loadPRelu(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadPRelu(const OpType &op, ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
 
     NodeValue in;
@@ -242,66 +259,85 @@ protected:
     // Sets the axis of each inputs so that the trailing-most dimensions of
     // input tensors and the target shape are aligned.
     int axis = targetDim.size() - slope.dims().size();
-    auto *finalSlope = G_.createBroadcast(opName, slope, targetDim, axis);
-    auto *R = G_.createPRELU(opName, in, finalSlope);
+    auto *finalSlope = G_->createBroadcast(opName, slope, targetDim, axis);
+    auto *R = G_->createPRELU(opName, in, finalSlope);
     RETURN_IF_ERR(addNodeAsOutput(op, R));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadSigmoid(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadSigmoid(const OpType &op, ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
-    auto *S = G_.createSigmoid(opName, in);
+    auto *S = G_->createSigmoid(opName, in);
     RETURN_IF_ERR(addNodeAsOutput(op, S));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadTanh(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadTanh(const OpType &op, ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
-    auto *T = G_.createTanh(opName, in);
+    auto *T = G_->createTanh(opName, in);
     RETURN_IF_ERR(addNodeAsOutput(op, T));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadShape(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadExp(const OpType &op, ArgumentDictionaryTy &dict) {
+    const std::string &opName = loadOperatorName(op);
+    NodeValue in;
+    ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
+    auto *E = G_->createExp(opName, in);
+    RETURN_IF_ERR(addNodeAsOutput(op, E));
+    return Error::success();
+  }
+
+  Error loadShape(const OpType &op, ArgumentDictionaryTy &dict) {
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
 
     // This is statically known data, and so we create a Tensor for it.
-    Tensor T(ElemKind::Int64ITy, {in.dims().size()});
+    Tensor T(ElemKind::Int64ITy, {(dim_t)in.dims().size()});
     T.getHandle<int64_t>() =
         std::vector<int64_t>(in.dims().begin(), in.dims().end());
 
     RETURN_IF_ERR(createAndRegisterConstant(op.output(0), std::move(T)));
 
-    return llvm::Error::success();
+    return Error::success();
   }
 
   /// Loads Sqrt operator, given its protobuf representation and parsed args.
-  llvm::Error loadSqrt(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadSqrt(const OpType &op, ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
-    auto *R = G_.createPow(opName, in, 0.5f);
+    auto *R = G_->createPow(opName, in, 0.5f);
     RETURN_IF_ERR(addNodeAsOutput(op, R));
-    return llvm::Error::success();
+    return Error::success();
+  }
+
+  /// Loads Sqr operator, given its protobuf representation and parsed args.
+  Error loadSqr(const OpType &op, ArgumentDictionaryTy &dict) {
+    const std::string &opName = loadOperatorName(op);
+    NodeValue in;
+    ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
+    auto *R = G_->createPow(opName, in, 2.0f);
+    RETURN_IF_ERR(addNodeAsOutput(op, R));
+    return Error::success();
   }
 
   /// Loads Reciprocal operator, given its protobuf representation and parsed
   /// args.
-  llvm::Error loadReciprocal(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadReciprocal(const OpType &op, ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
-    auto *R = G_.createPow(opName, in, -1.0f);
+    auto *R = G_->createPow(opName, in, -1.0f);
     RETURN_IF_ERR(addNodeAsOutput(op, R));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadSum(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadSum(const OpType &op, ArgumentDictionaryTy &dict) {
     if (op.input_size() == 1) {
       NodeValue in;
       ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
@@ -312,7 +348,7 @@ protected:
       ASSIGN_VALUE_OR_RETURN_ERR(in0, getNodeValueByName(op.input(0)));
       NodeValue in1;
       ASSIGN_VALUE_OR_RETURN_ERR(in1, getNodeValueByName(op.input(1)));
-      auto *node = G_.createAdd(opName, in0, in1);
+      auto *node = G_->createAdd(opName, in0, in1);
       RETURN_IF_ERR(addNodeAsOutput(op, node));
     } else {
       const std::string &opName = loadOperatorName(op);
@@ -322,26 +358,26 @@ protected:
       for (unsigned i = 0; i < numInputs; i++) {
         NodeValue in;
         ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(i)));
-        inputs.push_back(G_.createExpandDims(opName, in, {0}));
+        inputs.push_back(G_->createExpandDims(opName, in, {0}));
       }
-      ConcatNode *concat = G_.createConcat(opName, inputs, /* axis */ 0);
-      Node *node = G_.createBatchedReduceAdd(opName, concat, /* axis */ 0);
+      ConcatNode *concat = G_->createConcat(opName, inputs, /* axis */ 0);
+      Node *node = G_->createBatchedReduceAdd(opName, concat, /* axis */ {0});
       RETURN_IF_ERR(addNodeAsOutput(op, node));
     }
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadSoftmax(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadSoftmax(const OpType &op, ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
 
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
 
-    // We do not do training right now on loaded protos. C2 and ONNX do not even
-    // have an option for a selected input anyway. So I am creating this as a
-    // placeholder which goes unused during inference.
-    auto selected = G_.getParent()->createConstant(
-        ElemKind::Int64ITy, {in.dims()[0], 1}, "selected");
+    RETURN_ERR_IF_NOT(in.dims().size() >= 2, "SoftMax input dims must be >= 2");
+
+    // Create a constant to store labels to be used in SoftMaxGradNode.
+    auto selected =
+        mod_.createConstant(ElemKind::Int64ITy, {in.dims()[0], 1}, "selected");
 
     // ONNX allows shapes like <N x 10 x 1 x 1 >. Flatten the inputs to the
     // softmax function. This is similar to a bitcast operation.
@@ -350,18 +386,18 @@ protected:
       ASSIGN_VALUE_OR_RETURN_ERR(axis, loadInt(dict["axis"]));
     }
 
-    auto *FN = G_.createFlatten("reshapeInput", in, axis);
+    auto *FN = G_->createFlatten("reshapeInput", in, axis);
 
-    auto *SM = G_.createSoftMax(opName, FN, selected);
+    auto *SM = G_->createSoftMax(opName, FN, selected);
 
     // The output should have the same shape as the original input.
     auto origInDims = in.getType()->dims();
-    auto *RN = G_.createReshape("reshapeOutput", SM, origInDims);
+    auto *RN = G_->createReshape("reshapeOutput", SM, origInDims);
     RETURN_IF_ERR(addNodeAsOutput(op, RN));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadLRN(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadLRN(const OpType &op, ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
@@ -375,21 +411,21 @@ protected:
     float k;
     ASSIGN_VALUE_OR_RETURN_ERR(k, loadFloat(dict["bias"]));
 
-    auto *tr = G_.createTranspose(opName, in, NCHW2NHWC);
+    auto *tr = G_->createTranspose(opName, in, NCHW2NHWC);
 
-    auto *node = G_.createLocalResponseNormalization(opName, tr, size / 2,
-                                                     alpha, beta, k);
+    auto *node = G_->createLocalResponseNormalization(opName, tr, size / 2,
+                                                      alpha, beta, k);
 
-    auto *N = G_.createTranspose(opName, node, NHWC2NCHW);
+    auto *N = G_->createTranspose(opName, node, NHWC2NCHW);
 
     // LRN in Caffe2 has a scale_ output, but I believe it's unused for
     // inference. So explicitly only set output 0.
     nodeValueByName_[op.output(0)] = N->getResult();
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadMinMax(llvm::StringRef typeName, const OpType &op,
-                         ArgumentDictionaryTy &dict) {
+  Error loadMinMax(llvm::StringRef typeName, const OpType &op,
+                   ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in0;
     ASSIGN_VALUE_OR_RETURN_ERR(in0, getNodeValueByName(op.input(0)));
@@ -398,73 +434,75 @@ protected:
 
     Node *node = nullptr;
     if (typeName == "Min") {
-      node = G_.createMin(opName, in0, in1);
+      node = G_->createMin(opName, in0, in1);
     } else if (typeName == "Max") {
-      node = G_.createMax(opName, in0, in1);
+      node = G_->createMax(opName, in0, in1);
     } else {
       RETURN_ERR("Invalid min or max operator");
     }
 
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadBatchMatMul(const OpType &op, ArgumentDictionaryTy &dict,
-                              bool isBatched) {
+  static Expected<NodeValue>
+  handleBatchMatMulTranspose(Function *F, ArgumentDictionaryTy &dict,
+                             llvm::StringRef key, NodeValue input) {
+    if (!dict.count(key)) {
+      return input;
+    }
+
+    int isTransposed;
+    ASSIGN_VALUE_OR_RETURN_ERR(isTransposed, loadInt(dict[key]));
+    if (isTransposed == 1) {
+      auto dimsSize = input.dims().size();
+      RETURN_ERR_IF_NOT(dimsSize >= 2,
+                        "C2 specs say rank of inputs must be >= 2");
+
+      std::vector<unsigned_t> shuffle;
+      unsigned_t i;
+      for (i = 0; i < dimsSize - 2; ++i) {
+        shuffle.push_back(i);
+      }
+      shuffle.push_back(i + 1);
+      shuffle.push_back(i);
+
+      return F->createTranspose(input.getNode()->getName().str() + ".transpose",
+                                input, shuffle);
+    }
+
+    return input;
+  }
+
+  Error loadBatchMatMul(const OpType &op, ArgumentDictionaryTy &dict,
+                        bool isBatched) {
     const std::string &opName = loadOperatorName(op);
     NodeValue LHS;
     ASSIGN_VALUE_OR_RETURN_ERR(LHS, getNodeValueByName(op.input(0)));
     NodeValue RHS;
     ASSIGN_VALUE_OR_RETURN_ERR(RHS, getNodeValueByName(op.input(1)));
 
-    bool transLHS = false;
-    if (dict.count("trans_a")) {
-      int trans_a;
-      ASSIGN_VALUE_OR_RETURN_ERR(trans_a, loadInt(dict["trans_a"]));
-      transLHS = trans_a == 1;
-    }
-
-    (void)transLHS;
-    RETURN_ERR_IF_NOT(!transLHS, "Don't support transpose lhs for now.");
-
-    bool transRHS = false;
-    if (dict.count("trans_b")) {
-      int trans_b;
-      ASSIGN_VALUE_OR_RETURN_ERR(trans_b, loadInt(dict["trans_b"]));
-      transRHS = trans_b == 1;
-    }
-
-    if (transRHS) {
-      // The semantic of the transpose in that context is:
-      // swap the last two dimensions.
-      unsigned_t nbDims = RHS.dims().size();
-      RETURN_ERR_IF_NOT(nbDims >= 2, "C2 specs say rank of RHS must be >= 2");
-      std::vector<unsigned_t> shuffle;
-      unsigned_t i;
-      for (i = 0; i < nbDims - 2; ++i) {
-        shuffle.push_back(i);
-      }
-      shuffle.push_back(i + 1);
-      shuffle.push_back(i);
-      RHS = G_.createTranspose("RHS.transpose", RHS, shuffle);
-    }
+    ASSIGN_VALUE_OR_RETURN_ERR(
+        LHS, handleBatchMatMulTranspose(G_, dict, "trans_a", LHS));
+    ASSIGN_VALUE_OR_RETURN_ERR(
+        RHS, handleBatchMatMulTranspose(G_, dict, "trans_b", RHS));
 
     Node *node = nullptr;
 
     // BatchMatMul sometimes is actually just a matmul, depending on dimensions
     // of inputs. Thus, only do batch matmul if LHS is 3-dimensional.
     if (isBatched && LHS.dims().size() == 3) {
-      node = G_.createBatchMatMul(opName, LHS, RHS);
+      node = G_->createBatchMatMul(opName, LHS, RHS);
     } else {
-      node = G_.createMatMul(opName, LHS, RHS);
+      node = G_->createMatMul(opName, LHS, RHS);
     }
 
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadArithmetic(llvm::StringRef typeName, const OpType &op,
-                             ArgumentDictionaryTy &dict) {
+  Error loadArithmetic(llvm::StringRef typeName, const OpType &op,
+                       ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in0;
     ASSIGN_VALUE_OR_RETURN_ERR(in0, getNodeValueByName(op.input(0)));
@@ -473,66 +511,85 @@ protected:
 
     bool broadcast;
     ASSIGN_VALUE_OR_RETURN_ERR(broadcast, getBroadcast(dict));
-
-    NodeValue finalIn0 = in0;
-    NodeValue finalIn1 = in1;
-
-    if (broadcast) {
-      // Broadcasting can be:
-      // - multidirectional (ONNX opset 7+), or
-      // - unidirectional (ONNX opset 1->6,  Caffe2).
-      if (hasMultidirectionalBroadcast(typeName)) {
-        // Compute the target shape that is a combination of the operand shapes.
-        std::vector<size_t> targetDim;
-        ASSIGN_VALUE_OR_RETURN_ERR(targetDim, computeMultidirectionalBroadcast(
-                                                  in0.dims(), in1.dims()));
-        // Sets the axis of each inputs so that the trailing-most dimensions of
-        // input tensors and the target shape are aligned.
-        int axis0 = targetDim.size() - in0.dims().size();
-        int axis1 = targetDim.size() - in1.dims().size();
-        finalIn0 = G_.createBroadcast(opName, in0, targetDim, axis0);
-        finalIn1 = G_.createBroadcast(opName, in1, targetDim, axis1);
+    // Check implicit broadcast
+    if (!broadcast && in0.dims().size() != in1.dims().size()) {
+      bool validBroadcast = true;
+      auto dimsA = in0.dims();
+      auto dimsB = in1.dims();
+      for (int i = dimsA.size() - 1, j = dimsB.size() - 1; i >= 0 && j >= 0;) {
+        auto a = dimsA[i];
+        auto b = dimsB[j];
+        if (!(a == b || a == 1 || b == 1)) {
+          validBroadcast = false;
+          break;
+        }
+        --i;
+        --j;
       }
-      // Unidirectional broadcasting consists of broadcasting the right operand
-      // (in1) so that it matches the shape of the left operand (in0).
-      else {
-        // With unidirectional broadcasting, the 'axis' attribute specifies
-        // from how much the right operand shape must be 'shifted' right.
-        // - In Caffe2, the 'axis' attribute is optional. If not specified, axis
-        // must be automatically computed so that the trailing-most dimensions
-        // of in1 is aligned to the trailing-most dimension of in0.
-        // - In ONNX, the 'axis' attribute is mandatory. axis == -1 is
-        // equivalent to no axis specified in Caffe2.
-        int axis = -1;
-        if (dict.count("axis")) {
-          ASSIGN_VALUE_OR_RETURN_ERR(axis, loadInt(dict["axis"]));
-        }
-        if (axis == -1) {
-          // Align trailing most dimensions.
-          axis = in0.dims().size() - in1.dims().size();
-        }
-        finalIn1 = G_.createBroadcast(opName, in1, in0.dims(), axis);
+      if (!validBroadcast) {
+        LOG(WARNING) << "Invalid broadcast rule for inputs of " << opName;
+      }
+      broadcast = validBroadcast;
+    }
+
+    int axis = -1;
+
+    // Broadcasting can be:
+    // - multidirectional (ONNX opset 7+), or
+    // - unidirectional (ONNX opset 1->6,  Caffe2).
+
+    // Unidirectional broadcasting consists of broadcasting the right operand
+    // (in1) so that it matches the shape of the left operand (in0).
+    if (broadcast && !hasMultidirectionalBroadcast(typeName)) {
+      // With unidirectional broadcasting, the 'axis' attribute specifies
+      // from how much the right operand shape must be 'shifted' right.
+      // - In Caffe2, the 'axis' attribute is optional. If not specified, axis
+      // must be automatically computed so that the trailing-most dimensions
+      // of in1 is aligned to the trailing-most dimension of in0.
+      // - In ONNX, the 'axis' attribute is mandatory. axis == -1 is
+      // equivalent to no axis specified in Caffe2.
+
+      if (dict.count("axis")) {
+        ASSIGN_VALUE_OR_RETURN_ERR(axis, loadInt(dict["axis"]));
+      }
+      if (axis == -1) {
+        // Align trailing most dimensions.
+        axis = in0.dims().size() - in1.dims().size();
       }
     }
 
     Node *node = nullptr;
-    if (typeName == "Mul") {
-      node = G_.createMul(opName, finalIn0, finalIn1);
-    } else if (typeName == "Add") {
-      node = G_.createAdd(opName, finalIn0, finalIn1);
-    } else if (typeName == "Sub") {
-      node = G_.createSub(opName, finalIn0, finalIn1);
-    } else if (typeName == "Div") {
-      node = G_.createDiv(opName, finalIn0, finalIn1);
+    if (broadcast) {
+      if (typeName == "Mul") {
+        node = G_->createNodeWithBroadcast<MulNode>(opName, axis, in0, in1);
+      } else if (typeName == "Add") {
+        node = G_->createNodeWithBroadcast<AddNode>(opName, axis, in0, in1);
+      } else if (typeName == "Sub") {
+        node = G_->createNodeWithBroadcast<SubNode>(opName, axis, in0, in1);
+      } else if (typeName == "Div") {
+        node = G_->createNodeWithBroadcast<DivNode>(opName, axis, in0, in1);
+      } else {
+        RETURN_ERR("Unsupported arithmetic typeName");
+      }
     } else {
-      RETURN_ERR("Unsupported arithmetic typeName");
+      if (typeName == "Mul") {
+        node = G_->createMul(opName, in0, in1);
+      } else if (typeName == "Add") {
+        node = G_->createAdd(opName, in0, in1);
+      } else if (typeName == "Sub") {
+        node = G_->createSub(opName, in0, in1);
+      } else if (typeName == "Div") {
+        node = G_->createDiv(opName, in0, in1);
+      } else {
+        RETURN_ERR("Unsupported arithmetic typeName");
+      }
     }
 
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadSplit(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadSplit(const OpType &op, ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
@@ -541,29 +598,30 @@ protected:
       ASSIGN_VALUE_OR_RETURN_ERR(axis, loadInt(dict["axis"]));
     }
 
-    std::vector<size_t> split;
-    if (dict.count("split"))
-      split = getShape(dict["split"]);
+    std::vector<dim_t> split;
+    if (dict.count("split")) {
+      ASSIGN_VALUE_OR_RETURN_ERR(split, getShape<dim_t>(dict["split"]));
+    }
 
     std::vector<SliceNode *> outputs;
-    G_.createSplit(opName, in, op.output_size(), axis, split, outputs);
+    G_->createSplit(opName, in, op.output_size(), axis, split, outputs);
 
     for (int i = 0, e = op.output_size(); i < e; i++) {
       // Each output from Split is a SliceNode which only has a single output,
       // so only use 0 here as the node value result.
       nodeValueByName_[op.output(i)] = outputs[i]->getResult();
     }
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadReshape(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadReshape(const OpType &op, ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
 
     // Get the requested shape from the model.
     // First look at input tensors, then at the "shape" attribute.
-    std::vector<int64_t> requestedDims;
+    std::vector<dim_t> requestedDims;
     if (op.input_size() > 1) {
       if (!getConstantByNameOrNull(op.input(1))) {
         RETURN_ERR("Non-constant shape tensors are unsupported by Glow.");
@@ -578,7 +636,9 @@ protected:
     } else if (dict.count("shape")) {
       RETURN_ERR_IF_NOT(op.input_size() == 1,
                         "Cannot specify new shape by both argument and input.");
-      std::vector<int64_t> protoDims = getShape<int64_t>(dict["shape"]);
+      std::vector<int64_t> protoDims;
+      ASSIGN_VALUE_OR_RETURN_ERR(protoDims, getShape<int64_t>(dict["shape"]));
+
       for (auto dim : protoDims) {
         requestedDims.push_back(dim);
       }
@@ -588,17 +648,17 @@ protected:
 
     // Compute the actual new shape
     ssize_t negOneIndex = -1;
-    llvm::ArrayRef<size_t> inputDims = in.dims();
-    std::vector<size_t> outputDims;
+    llvm::ArrayRef<dim_t> inputDims = in.dims();
+    std::vector<dim_t> outputDims;
     int64_t dimProduct = 1;
     for (size_t i = 0, e = requestedDims.size(); i != e; i++) {
-      int64_t newDim = requestedDims[i];
+      dim_t newDim = requestedDims[i];
       if (newDim == 0) {
         // 0 means that corresponding input dimension should be propagated to
         // the output.
         newDim = inputDims[i];
       }
-      if (newDim != -1) {
+      if (newDim != (dim_t)-1) {
         dimProduct *= newDim;
         outputDims.push_back(newDim);
       } else {
@@ -615,16 +675,16 @@ protected:
       outputDims[negOneIndex] = in.getType()->size() / dimProduct;
     }
 
-    auto *node = G_.createReshape(opName, in, outputDims);
+    auto *node = G_->createReshape(opName, in, outputDims);
 
     // Caffe2 sometimes outputs old_shape which goes unused. We do not currently
     // support it, so explicitly only set the first output.
     nodeValueByName_[op.output(0)] = node->getResult();
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadTranspose(const OpType &op, ArgumentDictionaryTy &dict,
-                            llvm::StringRef permArgName) {
+  Error loadTranspose(const OpType &op, ArgumentDictionaryTy &dict,
+                      llvm::StringRef permArgName) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
@@ -632,7 +692,8 @@ protected:
     // There is a difference between ONNX and Caffe2 specs for Transpose:
     // one contains permutation under name "perm", the other contains it under
     // argument name "axes". That's why the name is passed as a parameter.
-    std::vector<unsigned_t> perm = getShape<unsigned_t>(dict[permArgName]);
+    std::vector<unsigned_t> perm;
+    ASSIGN_VALUE_OR_RETURN_ERR(perm, getShape<unsigned_t>(dict[permArgName]));
     if (perm.empty()) {
       // Empty permutation argument means reversing axes order.
       size_t N = in.dims().size();
@@ -640,13 +701,13 @@ protected:
         perm.push_back(i);
     }
 
-    auto *T = G_.createTranspose(opName, in, perm);
+    auto *T = G_->createTranspose(opName, in, perm);
 
     RETURN_IF_ERR(addNodeAsOutput(op, T));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadFlatten(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadFlatten(const OpType &op, ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
@@ -654,24 +715,34 @@ protected:
     if (dict.count("axis")) {
       ASSIGN_VALUE_OR_RETURN_ERR(axis, loadInt(dict["axis"]));
     }
-    auto *node = G_.createFlatten(opName, in, axis);
+    auto *node = G_->createFlatten(opName, in, axis);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadIdentity(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadIdentity(const OpType &op, ArgumentDictionaryTy &dict) {
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
     nodeValueByName_[op.output(0)] = in;
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadTopK(const OpType &op, ArgumentDictionaryTy &dict) {
+  Error loadTopK(const OpType &op, ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
-    unsigned_t k;
-    ASSIGN_VALUE_OR_RETURN_ERR(k, loadInt(dict["k"]));
+    RETURN_ERR_IF_NOT(op.input_size() <= 2, "Maximum number of inputs is 2.");
+    unsigned_t k = 0;
+    if (op.input_size() > 1) {
+      Constant *kConst = getConstantByNameOrNull(op.input(1));
+      RETURN_ERR_IF_NOT(kConst, "Non-constant k is not supported by Glow.");
+      RETURN_ERR_IF_NOT(kConst->getElementType() == ElemKind::Int64ITy,
+                        "k input must be of type Int64.");
+      auto constH = kConst->getPayload().getHandle<int64_t>();
+      k = constH.at({0});
+    } else {
+      ASSIGN_VALUE_OR_RETURN_ERR(k, loadInt(dict["k"]));
+    }
 
     int axis = -1;
     if (dict.count("axis")) {
@@ -685,18 +756,25 @@ protected:
     RETURN_ERR_IF_NOT(axis == lastDim,
                       "Currently only support axis being last dimension.");
 
-    auto *R = G_.createTopK(opName, in, k);
+    auto *R = G_->createTopK(opName, in, k);
     RETURN_IF_ERR(addNodeAsOutput(op, R));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadReduceMeanOrSum(llvm::StringRef typeName, const OpType &op,
-                                  ArgumentDictionaryTy &dict) {
+  Error loadReduceOp(llvm::StringRef typeName, const OpType &op,
+                     ArgumentDictionaryTy &dict) {
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
 
-    auto shapeAxes = getShape<unsigned_t>(dict["axes"]);
+    std::vector<unsigned_t> shapeAxes = {};
+    if (dict.count("axes")) {
+      ASSIGN_VALUE_OR_RETURN_ERR(shapeAxes, getShape<unsigned_t>(dict["axes"]));
+    } else {
+      shapeAxes.resize(in.dims().size());
+      std::iota(shapeAxes.begin(), shapeAxes.end(), 0);
+    }
+
     std::sort(shapeAxes.begin(), shapeAxes.end());
 
     llvm::ArrayRef<unsigned_t> axes(shapeAxes);
@@ -706,7 +784,7 @@ protected:
       auto it = std::unique(shapeAxes.begin(), shapeAxes.end());
       if (it != shapeAxes.end()) {
         RETURN_ERR("Axes values are not unique.",
-                   GlowErr::ErrorCode::MODEL_LOADER_UNSUPPORTED_SHAPE);
+                   ErrorValue::ErrorCode::MODEL_LOADER_UNSUPPORTED_SHAPE);
       }
     }
 
@@ -719,28 +797,32 @@ protected:
 
     NodeValue node;
     if (typeName == "ReduceMean") {
-      node = G_.createBatchedReduceMean(opName, in, axes);
+      node = G_->createBatchedReduceMean(opName, in, axes);
+    } else if (typeName == "ReduceSum") {
+      node = G_->createBatchedReduceAdd(opName, in, axes);
+    } else if (typeName == "ReduceMin") {
+      node = G_->createBatchedReduceMin(opName, in, axes);
     } else {
-      node = G_.createBatchedReduceAdd(opName, in, axes);
+      RETURN_ERR("Unsupported Reduce Op " + typeName.str());
     }
 
     // Our batched reduce add/mean does not keep the dim; reshape if necessary.
     if (keepDims) {
 
-      std::vector<size_t> shape = node.dims();
+      std::vector<dim_t> shape = node.dims();
 
       // Add removed axes. Requires increasing order sort - done above.
       for (const auto &axis : shapeAxes) {
         shape.insert(shape.begin() + axis, 1);
       }
-      node = G_.createReshape(opName, node, shape);
+      node = G_->createReshape(opName, node, shape);
     }
 
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadBatchOneHot(const OpType &op) {
+  Error loadBatchOneHot(const OpType &op) {
     const std::string &opName = loadOperatorName(op);
     NodeValue data;
     ASSIGN_VALUE_OR_RETURN_ERR(data, getNodeValueByName(op.input(0)));
@@ -749,24 +831,28 @@ protected:
     NodeValue values;
     ASSIGN_VALUE_OR_RETURN_ERR(values, getNodeValueByName(op.input(2)));
 
-    auto *node = G_.createBatchOneHot(opName, data, lengths, values);
+    auto *node = G_->createBatchOneHot(opName, data, lengths, values);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadSparseLengthsSum(const OpType &op) {
+  Error loadSparseLengthsSum(const OpType &op, ArgumentDictionaryTy &dict) {
     NodeValue in0;
     ASSIGN_VALUE_OR_RETURN_ERR(in0, getNodeValueByName(op.input(0)));
     NodeValue in1;
     ASSIGN_VALUE_OR_RETURN_ERR(in1, getNodeValueByName(op.input(1)));
     NodeValue in2;
     ASSIGN_VALUE_OR_RETURN_ERR(in2, getNodeValueByName(op.input(2)));
-    auto *node = G_.createSparseLengthsSum(loadOperatorName(op), in0, in1, in2);
+    LengthsMode lengthsMode;
+    ASSIGN_VALUE_OR_RETURN_ERR(lengthsMode, getLengthsMode(dict));
+    auto *node = G_->createSparseLengthsSum(loadOperatorName(op), in0, in1, in2,
+                                            lengthsMode);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadSparseLengthsWeightedSum(const OpType &op) {
+  Error loadSparseLengthsWeightedSum(const OpType &op,
+                                     ArgumentDictionaryTy &dict) {
     NodeValue in0;
     ASSIGN_VALUE_OR_RETURN_ERR(in0, getNodeValueByName(op.input(0)));
     NodeValue in1;
@@ -775,21 +861,41 @@ protected:
     ASSIGN_VALUE_OR_RETURN_ERR(in2, getNodeValueByName(op.input(2)));
     NodeValue in3;
     ASSIGN_VALUE_OR_RETURN_ERR(in3, getNodeValueByName(op.input(3)));
-    auto *node = G_.createSparseLengthsWeightedSum(loadOperatorName(op), in0,
-                                                   in1, in2, in3);
+    LengthsMode lengthsMode;
+    ASSIGN_VALUE_OR_RETURN_ERR(lengthsMode, getLengthsMode(dict));
+    auto *node = G_->createSparseLengthsWeightedSum(loadOperatorName(op), in0,
+                                                    in1, in2, in3, lengthsMode);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadLengthsToRanges(const OpType &op) {
+  Error loadEmbeddingBag(const OpType &op, ArgumentDictionaryTy &dict) {
+    NodeValue in0;
+    ASSIGN_VALUE_OR_RETURN_ERR(in0, getNodeValueByName(op.input(0)));
+    NodeValue in1;
+    ASSIGN_VALUE_OR_RETURN_ERR(in1, getNodeValueByName(op.input(1)));
+    NodeValue in2;
+    ASSIGN_VALUE_OR_RETURN_ERR(in2, getNodeValueByName(op.input(2)));
+    NodeValue in3;
+    ASSIGN_VALUE_OR_RETURN_ERR(in3, getNodeValueByName(op.input(3)));
+    LengthsMode lengthsMode;
+    ASSIGN_VALUE_OR_RETURN_ERR(lengthsMode, getLengthsMode(dict));
+    auto *node =
+        G_->createEmbeddingBag(loadOperatorName(op), in0, in1, in2, in3,
+                               /* hasEndOffset */ false, lengthsMode);
+    RETURN_IF_ERR(addNodeAsOutput(op, node));
+    return Error::success();
+  }
+
+  Error loadLengthsToRanges(const OpType &op) {
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
-    auto *node = G_.createLengthsToRanges(loadOperatorName(op), in);
+    auto *node = G_->createLengthsToRanges(loadOperatorName(op), in);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadBatchBoxCox(const OpType &op) {
+  Error loadBatchBoxCox(const OpType &op) {
     NodeValue data;
     ASSIGN_VALUE_OR_RETURN_ERR(data, getNodeValueByName(op.input(0)));
     NodeValue lambda1;
@@ -797,23 +903,22 @@ protected:
     NodeValue lambda2;
     ASSIGN_VALUE_OR_RETURN_ERR(lambda2, getNodeValueByName(op.input(2)));
     auto *node =
-        G_.createBatchBoxCox(loadOperatorName(op), data, lambda1, lambda2);
+        G_->createBatchBoxCox(loadOperatorName(op), data, lambda1, lambda2);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadDotProduct(const OpType &op) {
+  Error loadDotProduct(const OpType &op) {
     NodeValue X;
     ASSIGN_VALUE_OR_RETURN_ERR(X, getNodeValueByName(op.input(0)));
     NodeValue Y;
     ASSIGN_VALUE_OR_RETURN_ERR(Y, getNodeValueByName(op.input(1)));
-    auto *node = G_.createDotProduct(loadOperatorName(op), X, Y);
+    auto *node = G_->createDotProduct(loadOperatorName(op), X, Y);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadReplaceNaN(const OpType &op,
-                             const ArgumentDictionaryTy &dict) {
+  Error loadReplaceNaN(const OpType &op, ArgumentDictionaryTy &dict) {
     // Load the input and NaN replacement value:
     NodeValue input;
     ASSIGN_VALUE_OR_RETURN_ERR(input, getNodeValueByName(op.input(0)));
@@ -822,12 +927,12 @@ protected:
     if (valueIt != dict.end()) {
       ASSIGN_VALUE_OR_RETURN_ERR(value, loadFloat(valueIt->second));
     }
-    auto *node = G_.createReplaceNaN(loadOperatorName(op), input, value);
+    auto *node = G_->createReplaceNaN(loadOperatorName(op), input, value);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadLengthsSum(const OpType &op) {
+  Error loadLengthsSum(const OpType &op) {
     const std::string &opName = loadOperatorName(op);
     NodeValue data;
     ASSIGN_VALUE_OR_RETURN_ERR(data, getNodeValueByName(op.input(0)));
@@ -837,27 +942,24 @@ protected:
     RETURN_ERR_IF_NOT(lengths.dims().size() == 1,
                       "Lengths must be a 1D vector.");
 
-    auto *node = G_.createLengthsSum(opName, data, lengths);
+    auto *node = G_->createLengthsSum(opName, data, lengths);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadExpandDims(const OpType &op,
-                             const ArgumentDictionaryTy &dict) {
+  Error loadExpandDims(const OpType &op, ArgumentDictionaryTy &dict) {
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
-    auto dims = dict.find("dims");
-    if (dims == dict.end()) {
-      RETURN_ERR("Missing dims argument for ExpandDims operator.");
-    }
-    Node *node =
-        G_.createExpandDims(loadOperatorName(op), in, getShape(dims->second));
+    std::vector<dim_t> shape;
+    ASSIGN_VALUE_OR_RETURN_ERR(shape, getShape<dim_t>(dict["dims"]));
+
+    Node *node = G_->createExpandDims(loadOperatorName(op), in, shape);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
 
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadClip(const OpType &op, const ArgumentDictionaryTy &dict) {
+  Error loadClip(const OpType &op, ArgumentDictionaryTy &dict) {
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
     float cmin = std::numeric_limits<float>::lowest();
@@ -870,13 +972,12 @@ protected:
       ASSIGN_VALUE_OR_RETURN_ERR(cmax, loadFloat(dict.find("max")->second));
     }
 
-    auto *node = G_.createClip(loadOperatorName(op), in, cmin, cmax);
+    auto *node = G_->createClip(loadOperatorName(op), in, cmin, cmax);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadSparseToDense(const OpType &op,
-                                const ArgumentDictionaryTy &dict) {
+  Error loadSparseToDense(const OpType &op, ArgumentDictionaryTy &dict) {
     if (op.input_size() != 3) {
       RETURN_ERR("SparseToDense operator must have three inputs.");
     }
@@ -888,14 +989,13 @@ protected:
     NodeValue dataToInferDim;
     ASSIGN_VALUE_OR_RETURN_ERR(dataToInferDim, getNodeValueByName(op.input(2)));
 
-    auto *node = G_.createSparseToDense(loadOperatorName(op), indices, values,
-                                        dataToInferDim);
+    auto *node = G_->createSparseToDense(loadOperatorName(op), indices, values,
+                                         dataToInferDim);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadSparseToDenseMask(const OpType &op,
-                                    const ArgumentDictionaryTy &dict) {
+  Error loadSparseToDenseMask(const OpType &op, ArgumentDictionaryTy &dict) {
     size_t inputSize = op.input_size();
     if (inputSize != 3 && inputSize != 4) {
       RETURN_ERR("SparseToDenseMask operator must have 3 or 4 inputs.");
@@ -914,26 +1014,24 @@ protected:
     } else {
       // If Lengths input is not present, create scalar containing number of
       // index-value pairs.
-      auto *lengthsConstant = G_.getParent()->createConstant(
-          ElemKind::Int32ITy, {}, "lengthsConstant");
+      auto *lengthsConstant =
+          mod_.createConstant(ElemKind::Int32ITy, {}, "lengthsConstant");
       lengthsConstant->getPayloadMutable().template getHandle<int32_t>().raw(
           0) = indices.dims()[0];
       lengths = lengthsConstant->getOutput();
     }
 
-    auto maskIt = dict.find("mask");
-    RETURN_ERR_IF_NOT(maskIt != dict.end(),
-                      "Require mask when loading SparseToDenseMask.");
-    auto mask = getShape<int64_t>(maskIt->second);
+    std::vector<dim_t> mask;
+    ASSIGN_VALUE_OR_RETURN_ERR(mask, getShape<dim_t>(dict["mask"]));
 
-    auto *node = G_.createSparseToDenseMask(
+    auto *node = G_->createSparseToDenseMask(
         loadOperatorName(op), indices, values, defaultValue, lengths, mask);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadGatherOps(const std::string &typeName, const OpType &op,
-                            const ArgumentDictionaryTy &dict) {
+  Error loadGatherOps(const std::string &typeName, const OpType &op,
+                      ArgumentDictionaryTy &dict) {
 
     NodeValue data;
     ASSIGN_VALUE_OR_RETURN_ERR(data, getNodeValueByName(op.input(0)));
@@ -951,13 +1049,13 @@ protected:
       batchDims = axis;
     }
 
-    Node *GN = G_.createGather(loadOperatorName(op), data, indices, batchDims);
+    Node *GN = G_->createGather(loadOperatorName(op), data, indices, batchDims);
     RETURN_IF_ERR(addNodeAsOutput(op, GN));
-    return llvm::Error::success();
+    return Error::success();
   }
 
-  llvm::Error loadGatherRanges(const std::string &typeName, const OpType &op,
-                               const ArgumentDictionaryTy &dict) {
+  Error loadGatherRanges(const std::string &typeName, const OpType &op,
+                         ArgumentDictionaryTy &dict) {
     NodeValue data;
     ASSIGN_VALUE_OR_RETURN_ERR(data, getNodeValueByName(op.input(0)));
     RETURN_ERR_IF_NOT(data.dims().size() == 1, "Data must be a 1D vector.");
@@ -974,10 +1072,30 @@ protected:
     unsigned_t maxOutputSize;
     ASSIGN_VALUE_OR_RETURN_ERR(maxOutputSize, loadInt(maxOutputSizeIt->second));
 
-    Node *GR = G_.createGatherRanges(loadOperatorName(op), data, ranges,
-                                     maxOutputSize);
+    Node *GR = G_->createGatherRanges(loadOperatorName(op), data, ranges,
+                                      maxOutputSize);
     RETURN_IF_ERR(addNodeAsOutput(op, GR));
-    return llvm::Error::success();
+    return Error::success();
+  }
+
+  // Loads Less operator. Internally it's a cmpLT Node.
+  Error loadLess(const OpType &op, ArgumentDictionaryTy &dict) {
+    // Input Type.
+    NodeValue xNV;
+    ASSIGN_VALUE_OR_RETURN_ERR(xNV, getNodeValueByName(op.input(0)));
+    NodeValue yNV;
+    ASSIGN_VALUE_OR_RETURN_ERR(yNV, getNodeValueByName(op.input(1)));
+
+    std::string opName = loadOperatorName(op);
+
+    auto *xNode = xNV.getNode();
+    auto *yNode = yNV.getNode();
+
+    Node *N = G_->createNodeWithBroadcast<CmpLTNode>(opName, /* axis */ -1,
+                                                     xNode, yNode);
+
+    RETURN_IF_ERR(addNodeAsOutput(op, N));
+    return Error::success();
   }
 
   using ProtobufLoader::ProtobufLoader;
@@ -985,9 +1103,9 @@ protected:
   /// If operator type is supported, returns Expected<true> and creates new
   /// operator. Returns Operator<false> if operator type is not supported.
   /// Returns Error if an error occurred
-  llvm::Expected<bool> tryLoadCommonOperator(llvm::StringRef typeName,
-                                             const OpType &op,
-                                             ArgumentDictionaryTy &dict) {
+  Expected<bool> tryLoadCommonOperator(llvm::StringRef typeName,
+                                       const OpType &op,
+                                       ArgumentDictionaryTy &dict) {
     if (typeName == "Relu") {
       RETURN_IF_ERR(loadRelu(op, dict));
       return true;
@@ -1004,12 +1122,20 @@ protected:
       RETURN_IF_ERR(loadTanh(op, dict));
       return true;
     }
+    if (typeName == "Exp") {
+      RETURN_IF_ERR(loadExp(op, dict));
+      return true;
+    }
     if (typeName == "Shape") {
       RETURN_IF_ERR(loadShape(op, dict));
       return true;
     }
     if (typeName == "Sqrt") {
       RETURN_IF_ERR(loadSqrt(op, dict));
+      return true;
+    }
+    if (typeName == "Sqr") {
+      RETURN_IF_ERR(loadSqr(op, dict));
       return true;
     }
     if (typeName == "Reciprocal") {
@@ -1064,8 +1190,9 @@ protected:
       RETURN_IF_ERR(loadTopK(op, dict));
       return true;
     }
-    if (typeName == "ReduceMean" || typeName == "ReduceSum") {
-      RETURN_IF_ERR(loadReduceMeanOrSum(typeName, op, dict));
+    if (typeName == "ReduceMean" || typeName == "ReduceSum" ||
+        typeName == "ReduceMin") {
+      RETURN_IF_ERR(loadReduceOp(typeName, op, dict));
       return true;
     }
     if (typeName == "BatchMatMul") {
@@ -1077,11 +1204,15 @@ protected:
       return true;
     }
     if (typeName == "SparseLengthsSum") {
-      RETURN_IF_ERR(loadSparseLengthsSum(op));
+      RETURN_IF_ERR(loadSparseLengthsSum(op, dict));
       return true;
     }
     if (typeName == "SparseLengthsWeightedSum") {
-      RETURN_IF_ERR(loadSparseLengthsWeightedSum(op));
+      RETURN_IF_ERR(loadSparseLengthsWeightedSum(op, dict));
+      return true;
+    }
+    if (typeName == "EmbeddingBag") {
+      RETURN_IF_ERR(loadEmbeddingBag(op, dict));
       return true;
     }
     if (typeName == "LengthsToRanges") {
@@ -1128,19 +1259,22 @@ protected:
       RETURN_IF_ERR(loadGatherRanges(typeName, op, dict));
       return true;
     }
-
+    if (typeName == "Less") {
+      RETURN_IF_ERR(loadLess(op, dict));
+      return true;
+    }
     return false;
   }
 
   /// Utility function which computes the resulting shape in case of
   /// multidirectional broadcasting.
-  llvm::Expected<std::vector<size_t>>
-  computeMultidirectionalBroadcast(llvm::ArrayRef<size_t> shape0,
-                                   llvm::ArrayRef<size_t> shape1) {
+  Expected<std::vector<dim_t>>
+  computeMultidirectionalBroadcast(llvm::ArrayRef<dim_t> shape0,
+                                   llvm::ArrayRef<dim_t> shape1) {
     size_t numDims0 = shape0.size();
     size_t numDims1 = shape1.size();
     size_t newNumDims = numDims0 > numDims1 ? numDims0 : numDims1;
-    std::vector<size_t> reshapeDims(newNumDims);
+    std::vector<dim_t> reshapeDims(newNumDims);
 
     for (size_t i = 0; i < newNumDims; i++) {
       reshapeDims[i] = 1;
@@ -1151,9 +1285,21 @@ protected:
     return reshapeDims;
   }
 
+  /// Associate all outputs of \p op with nodes in \p NVs. Number of outputs of
+  /// \p op should match the number of elements of \p NVs.
+  /// \returns error code in case of error.
+  Error assignNodeOutputs(const OpType &op, llvm::ArrayRef<NodeValue> NVs) {
+    RETURN_ERR_IF_NOT((dim_t)NVs.size() == (dim_t)op.output_size(),
+                      "Output size mismatch.");
+    for (size_t i = 0; i < NVs.size(); i++) {
+      nodeValueByName_[op.output(i)] = NVs[i];
+    }
+    return Error::success();
+  }
+
   /// Load pre-trained weights from \p weightDescriptors.
-  llvm::Error loadWeights(uint32_t weightsCount,
-                          const onnxTensorDescriptorV1 *weightDescriptors) {
+  Error loadWeights(uint32_t weightsCount,
+                    const onnxTensorDescriptorV1 *weightDescriptors) {
     for (uint32_t i = 0; i < weightsCount; ++i) {
       const char *name = weightDescriptors[i].name;
 
@@ -1164,7 +1310,17 @@ protected:
         return resOrErr.takeError();
       }
 
-      RETURN_IF_ERR(createAndRegisterConstant(name, std::move(*loadResult.t)));
+      // If the weight is offline create a static placeholder, otherwise create
+      // a constant.
+      if (weightDescriptors[i].isOffline) {
+        Placeholder *pl;
+        ASSIGN_VALUE_OR_RETURN_ERR(
+            pl, createAndRegisterPlaceholder(name, &loadResult.type,
+                                             /*isStatic*/ true));
+      } else {
+        RETURN_IF_ERR(
+            createAndRegisterConstant(name, std::move(*loadResult.t)));
+      }
 
       if (loadResult.offsets) {
         auto offsetsName = strFormat("%s_loaded_offsets", name);
@@ -1179,7 +1335,7 @@ protected:
       }
     }
 
-    return llvm::Error::success();
+    return Error::success();
   }
 };
 

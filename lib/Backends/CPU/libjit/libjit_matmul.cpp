@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,11 +52,6 @@ constexpr int nr = regsB;
 constexpr int mc = 256;
 constexpr int kc = 128;
 constexpr int nc = 4096;
-
-/// Only pack matrices if dimension is above this threshold.  Packing is
-/// primarily helpful for avoiding TLB pressure and cache set conflicts, so this
-/// can be fairly large.
-constexpr int pack_threshold = 1024;
 
 /// Compute a RAxRB block of C using a vectorized dot product, where RA is the
 /// number of registers to load from matrix A, and RB is the number of registers
@@ -117,7 +112,7 @@ void libjit_matmul_zdot(size_t k, const float *a, size_t lda, const float *b,
 template <size_t regsA>
 void pack_matrix_a(size_t m, size_t k, const float *a, size_t lda,
                    float *a_to) {
-  for (size_t i = 0; i < m - mr + 1; i += mr) {
+  for (int i = 0; i < int(m) - mr + 1; i += mr) {
     for (size_t j = 0; j < k; j++) {
       const float *a_ij_pntr = &A(i, j);
       for (size_t ai = 0; ai < regsA; ai++) {
@@ -199,8 +194,8 @@ void libjit_matmul_inner(int m, int n, int k, const float *a, int lda,
     libjit_matmul_inner_unpacked(m, n, k, a, lda, b, ldb, c, ldc);
   }
 
-  size_t i = (m / mr) * mr;
-  size_t j = (n / nr) * nr;
+  sdim_t i = (m / mr) * mr;
+  sdim_t j = (n / nr) * nr;
   if (i < m) {
     libjit_matmul_odd(m - i, j, k, &A(i, 0), lda, &B(0, 0), ldb, &C(i, 0), ldc);
   }
@@ -223,97 +218,51 @@ void libjit_matmul_inner(int m, int n, int k, const float *a, int lda,
 /// respectively.
 template <bool pack>
 void __attribute__((noinline))
-libjit_matmul_outer(size_t m, size_t n, size_t k, const float *a, size_t lda,
-                    const float *b, size_t ldb, float *c, size_t ldc) {
-  float *packedB;
-  libjit_aligned_malloc((void **)&packedB, 64, kc * nc);
+libjit_matmul_outer(dim_t m, dim_t n, dim_t k, const float *a, dim_t lda,
+                    const float *b, dim_t ldb, float *c, dim_t ldc) {
+  float *packedB = nullptr;
+  if (pack) {
+    libjit_aligned_malloc((void **)&packedB, 64, kc * nc);
+  }
 
-  for (size_t p = 0; p < k; p += kc) {
-    size_t pb = MIN(k - p, kc);
-    for (size_t j = 0; j < n; j += nc) {
-      size_t jb = MIN(n - j, nc);
+  for (dim_t p = 0; p < k; p += kc) {
+    dim_t pb = MIN(k - p, kc);
+    for (dim_t j = 0; j < n; j += nc) {
+      dim_t jb = MIN(n - j, nc);
       if (pack) {
         pack_matrix_b<regsB>(jb, pb, &B(p, j), ldb, packedB);
       }
-      for (size_t i = 0; i < m; i += mc) {
-        size_t ib = MIN(m - i, mc);
+      for (dim_t i = 0; i < m; i += mc) {
+        dim_t ib = MIN(m - i, mc);
         libjit_matmul_inner<pack>(ib, jb, pb, &A(i, p), lda, &B(p, j), ldb,
                                   &C(i, j), ldc, packedB);
       }
     }
   }
 
-  libjit_aligned_free(packedB);
+  if (pack) {
+    libjit_aligned_free(packedB);
+  }
 }
 
 #undef C
 #undef B
 #undef A
 
-} // namespace
-
-extern "C" {
-
-/// Performs the matrix multiplication c = a * b, where c, a, and b are
-/// row-major matrices.
-/// \p c is a m x n matrix, so \p cDims = {m, n}
-/// \p a is a m x k matrix, so \p aDims = {m, k}
-/// \p b is a k x n matrix, so \p bDims = {k, n}
-void libjit_matmul_f(float *c, const float *a, const float *b,
-                     const size_t *cDims, const size_t *aDims,
-                     const size_t *bDims) {
-  memset(c, 0, cDims[0] * cDims[1] * sizeof(float));
-  // Call the matrix multiplication routine with appropriate dimensions and
-  // leading dimensions. The "leading dimension" for a row-major matrix is equal
-  // to the number of columns in the matrix.  For a, this is k; for b and c,
-  // this is n.
-  //
-  // This "outer" helper assumes the matrices are given in column-major format
-  // (the packing algorithm is more effective with column-major matrices), while
-  // the input is row-major. So we compute C += B * A, which is equivalent.
-  //
-  // The matrix multiplication routine is heavily inspired by:
-  // https://github.com/flame/how-to-optimize-gemm
-  int m = cDims[1];
-  int n = cDims[0];
-  int k = aDims[1];
-  bool pack = m >= pack_threshold;
-  if (pack) {
-    libjit_matmul_outer<true>(m, n, k, b, bDims[1], a, aDims[1], c, cDims[1]);
-  } else {
-    libjit_matmul_outer<false>(m, n, k, b, bDims[1], a, aDims[1], c, cDims[1]);
-  }
-}
-
-void libjit_matmul_i8(int8_t *outW, const int8_t *lhsW, const int8_t *rhsW,
-                      const size_t *outWdims, const size_t *lhsWdims,
-                      const size_t *rhsWdims, int32_t outOffset,
-                      int32_t lhsOffset, int32_t rhsOffset, int32_t outPre,
-                      int32_t outPost, int32_t outScale) {
-  for (size_t x = 0; x < outWdims[0]; x++) {
-    for (size_t y = 0; y < outWdims[1]; y++) {
-      int32_t sum = 0;
-      for (size_t i = 0; i < lhsWdims[1]; i++) {
-        int32_t lhs = lhsW[libjit_getXY(lhsWdims, x, i)] - lhsOffset;
-        int32_t rhs = rhsW[libjit_getXY(rhsWdims, i, y)] - rhsOffset;
-        sum += lhs * rhs;
-      }
-      int32_t s = libjit_scale_i32i8(sum, outPre, outPost, outScale, outOffset);
-      outW[libjit_getXY(outWdims, x, y)] = libjit_clip(s);
-    }
-  }
-}
-
-void libjit_rowwise_quantized_fc_i8(
-    int8_t *outW, const int8_t *inW, const int8_t *weightsW,
-    const int32_t *biasW, const int32_t *weightsOffsets, const int32_t *biasPre,
-    const int32_t *biasPost, const int32_t *biasScale, const int32_t *outPre,
-    const int32_t *outPost, const int32_t *outScale, const size_t *outWdims,
-    const size_t *inWdims, const size_t *weightsWdims, const size_t *biasWdims,
-    size_t rowNum, int32_t outOffset, int32_t inOffset, int32_t biasOffset) {
-  size_t in_w = inWdims[1];
-  size_t out_h = outWdims[0];
-  size_t out_w = outWdims[1];
+/// Generic template for rowwise quantized FullyConnected. The template allows
+/// choosing element type and bias type.
+template <typename ElemTy, typename BiasElemTy>
+void libjit_rowwise_quantized_fc_generic(
+    ElemTy *outW, const ElemTy *inW, const ElemTy *weightsW,
+    const BiasElemTy *biasW, const int32_t *weightsOffsets,
+    const int32_t *biasPre, const int32_t *biasPost, const int32_t *biasScale,
+    const int32_t *outPre, const int32_t *outPost, const int32_t *outScale,
+    const dim_t *outWdims, const dim_t *inWdims, const dim_t *weightsWdims,
+    const dim_t *biasWdims, dim_t rowNum, int32_t outOffset, int32_t inOffset,
+    int32_t biasOffset) {
+  dim_t in_w = inWdims[1];
+  dim_t out_h = outWdims[0];
+  dim_t out_w = outWdims[1];
 
   // In rowwise quantized FC, weights is not pretransposed : I * Tranpose(W) +
   // B. out(i, j) = in(i, 0) * weights(j, 0) + in(i, 1) * weights(j, 1) + ... +
@@ -334,5 +283,87 @@ void libjit_rowwise_quantized_fc_i8(
       outW[libjit_getXY(outWdims, i, j)] = libjit_clip(scaledSum);
     }
   }
+}
+} // namespace
+
+extern "C" {
+
+/// Performs the matrix multiplication c = a * b, where c, a, and b are
+/// row-major matrices.
+/// \p c is a m x n matrix, so \p cDims = {m, n}
+/// \p a is a m x k matrix, so \p aDims = {m, k}
+/// \p b is a k x n matrix, so \p bDims = {k, n}
+void libjit_matmul_f(float *c, const float *a, const float *b,
+                     const dim_t *cDims, const dim_t *aDims,
+                     const dim_t *bDims) {
+  memset(c, 0, cDims[0] * cDims[1] * sizeof(float));
+  // Call the matrix multiplication routine with appropriate dimensions and
+  // leading dimensions. The "leading dimension" for a row-major matrix is equal
+  // to the number of columns in the matrix.  For a, this is k; for b and c,
+  // this is n.
+  //
+  // This "outer" helper assumes the matrices are given in column-major format
+  // (the packing algorithm is more effective with column-major matrices), while
+  // the input is row-major. So we compute C += B * A, which is equivalent.
+  //
+  // The matrix multiplication routine is heavily inspired by:
+  // https://github.com/flame/how-to-optimize-gemm
+  int m = cDims[1];
+  int n = cDims[0];
+  int k = aDims[1];
+
+  // Use the unpacked version which does not use extra HEAP or STACK which
+  // makes the memory usage predictable. This is very useful when building
+  // bundles (AOT) for MCU targets where the HEAP and STACK are relatively
+  // limited in size. By avoiding heap/stack usage the memory consumption
+  // is controlled and perfectly known (e.g. printed in the bundle API).
+  libjit_matmul_outer<false>(m, n, k, b, bDims[1], a, aDims[1], c, cDims[1]);
+}
+
+void libjit_matmul_i8(int8_t *outW, const int8_t *lhsW, const int8_t *rhsW,
+                      const dim_t *outWdims, const dim_t *lhsWdims,
+                      const dim_t *rhsWdims, int32_t outOffset,
+                      int32_t lhsOffset, int32_t rhsOffset, int32_t outPre,
+                      int32_t outPost, int32_t outScale) {
+  for (dim_t x = 0; x < outWdims[0]; x++) {
+    for (dim_t y = 0; y < outWdims[1]; y++) {
+      int32_t sum = 0;
+      for (dim_t i = 0; i < lhsWdims[1]; i++) {
+        int32_t lhs = lhsW[libjit_getXY(lhsWdims, x, i)] - lhsOffset;
+        int32_t rhs = rhsW[libjit_getXY(rhsWdims, i, y)] - rhsOffset;
+        sum += lhs * rhs;
+      }
+      int32_t s = libjit_scale_i32i8(sum, outPre, outPost, outScale, outOffset);
+      outW[libjit_getXY(outWdims, x, y)] = libjit_clip(s);
+    }
+  }
+}
+
+/// Rowwise quantized FullyConnected with int8 precision and int32 bias.
+void libjit_rowwise_quantized_fc_i8_i32(
+    int8_t *outW, const int8_t *inW, const int8_t *weightsW,
+    const int32_t *biasW, const int32_t *weightsOffsets, const int32_t *biasPre,
+    const int32_t *biasPost, const int32_t *biasScale, const int32_t *outPre,
+    const int32_t *outPost, const int32_t *outScale, const dim_t *outWdims,
+    const dim_t *inWdims, const dim_t *weightsWdims, const dim_t *biasWdims,
+    dim_t rowNum, int32_t outOffset, int32_t inOffset, int32_t biasOffset) {
+  libjit_rowwise_quantized_fc_generic<int8_t, int32_t>(
+      outW, inW, weightsW, biasW, weightsOffsets, biasPre, biasPost, biasScale,
+      outPre, outPost, outScale, outWdims, inWdims, weightsWdims, biasWdims,
+      rowNum, outOffset, inOffset, biasOffset);
+}
+
+/// Rowwise quantized FullyConnected with int8 precision and int8 bias.
+void libjit_rowwise_quantized_fc_i8_i8(
+    int8_t *outW, const int8_t *inW, const int8_t *weightsW,
+    const int8_t *biasW, const int32_t *weightsOffsets, const int32_t *biasPre,
+    const int32_t *biasPost, const int32_t *biasScale, const int32_t *outPre,
+    const int32_t *outPost, const int32_t *outScale, const dim_t *outWdims,
+    const dim_t *inWdims, const dim_t *weightsWdims, const dim_t *biasWdims,
+    dim_t rowNum, int32_t outOffset, int32_t inOffset, int32_t biasOffset) {
+  libjit_rowwise_quantized_fc_generic<int8_t, int8_t>(
+      outW, inW, weightsW, biasW, weightsOffsets, biasPre, biasPost, biasScale,
+      outPre, outPost, outScale, outWdims, inWdims, weightsWdims, biasWdims,
+      rowNum, outOffset, inOffset, biasOffset);
 }
 }

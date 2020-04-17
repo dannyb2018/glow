@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,10 +57,10 @@ void CPULLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
     auto *filterDims = emitValueDims(builder, filter);
     auto *biasDims = emitValueDims(builder, bias);
 
-    auto *kernels = emitConstSizeTArray(builder, CI->getKernels());
-    auto *strides = emitConstSizeTArray(builder, CI->getStrides());
-    auto *pads = emitConstSizeTArray(builder, CI->getPads());
-    auto *group = emitConstSizeT(builder, CI->getGroup());
+    auto *kernels = emitConstDimTArray(builder, CI->getKernels());
+    auto *strides = emitConstDimTArray(builder, CI->getStrides());
+    auto *pads = emitConstDimTArray(builder, CI->getPads());
+    auto *group = emitConstDimT(builder, CI->getGroup());
 
     size_t inChannels = src->dims()[3];
     size_t outChannels = dest->dims()[3];

@@ -1,4 +1,4 @@
-# Copyright (c) 2017-present, Facebook, Inc.
+# Copyright (c) Glow Contributors. See CONTRIBUTORS file.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ if(NOT ENABLE_TESTING)
 endif()
 
 if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Wall /EHsc- /GR-")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Wall /EHsc- /GR- /bigobj")
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Oy /Od")
   set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
   set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELEASE}")
@@ -31,22 +31,17 @@ if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:4194304")
 else()
   include(CheckCXXCompilerFlag)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wnon-virtual-dtor -fno-exceptions -fno-rtti")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wnon-virtual-dtor")
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fno-omit-frame-pointer -O0")
-  set(FAST_MATH_FLAGS "-ffast-math -fno-finite-math-only")
   CHECK_CXX_COMPILER_FLAG("-Wno-psabi" HAS_W_NO_PSABI)
   if(HAS_W_NO_PSABI)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-psabi")
   endif()
-  if((CMAKE_SYSTEM_PROCESSOR STREQUAL aarch64 OR CMAKE_SYSTEM_PROCESSOR STREQUAL armv7)
-     AND CMAKE_CXX_COMPILER_ID STREQUAL Clang)
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${FAST_MATH_FLAGS}")
-    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} ${FAST_MATH_FLAGS}")
-    set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL} ${FAST_MATH_FLAGS}")
-  else()
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native ${FAST_MATH_FLAGS}")
-    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -march=native ${FAST_MATH_FLAGS}")
-    set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL} -march=native ${FAST_MATH_FLAGS}")
+  if(NOT ((CMAKE_SYSTEM_PROCESSOR STREQUAL aarch64 OR CMAKE_SYSTEM_PROCESSOR STREQUAL armv7)
+     AND CMAKE_CXX_COMPILER_ID STREQUAL Clang))
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -march=native")
+    set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL} -march=native")
   endif()
 endif()
 
@@ -55,7 +50,7 @@ endif()
 # linker does not clean unused objects.
 function(make_whole_archive DST SRC)
   get_target_property(__src_target_type ${SRC} TYPE)
-  
+
   # Depending on the type of the source library, we will set up the
   # link command for the specific SRC library.
   if (${__src_target_type} STREQUAL "STATIC_LIBRARY")

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ int main() {
   glow::Caffe2ModelLoader loader("lenet_mnist/predict_net.pb",
                                  "lenet_mnist/init_net.pb", {inputName},
                                  {inputType}, *F);
-  EE.compile(glow::CompilationMode::Infer, F);
+  EE.compile(glow::CompilationMode::Infer);
 
   // Get input and output placeholders.
   auto *input = llvm::cast<glow::Placeholder>(
@@ -57,6 +57,6 @@ int main() {
 
   // Read output and find argmax.
   auto out = bindings.get(output)->getHandle<float>();
-  printf("digit: %zu\n", out.minMaxArg().second);
+  printf("digit: %zu\n", (size_t)out.minMaxArg().second);
   return 0;
 }

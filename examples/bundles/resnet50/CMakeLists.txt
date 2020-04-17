@@ -23,10 +23,10 @@ target_link_libraries(ResNet50Bundle ${BUNDLE_OUTPUT_DIRECTORY}/resnet50.o png)
 add_dependencies(ResNet50Bundle ResNet50BundleMain ResNet50BundleNet)
 
 # Quantized
-add_executable(QuantizedResNet50Bundle $<TARGET_OBJECTS:ResNet50BundleMain>)
+add_executable(QuantizedResNet50Bundle $<TARGET_OBJECTS:QuantizedResNet50BundleMain>)
 set_target_properties(QuantizedResNet50Bundle PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${QUANTIZED_BUNDLE_OUTPUT_DIRECTORY})
 target_link_libraries(QuantizedResNet50Bundle ${QUANTIZED_BUNDLE_OUTPUT_DIRECTORY}/resnet50.o png)
-add_dependencies(QuantizedResNet50Bundle ResNet50BundleMain QuantizedResNet50BundleNet)
+add_dependencies(QuantizedResNet50Bundle QuantizedResNet50BundleMain QuantizedResNet50BundleNet)
 
 # Glow Bundles
 # ============
@@ -35,11 +35,12 @@ add_custom_command(
   OUTPUT
     ${BUNDLE_OUTPUT_DIRECTORY}/resnet50.o
   COMMAND
-    image-classifier ${IMAGES}/dog_207.png -g -image-mode=0to1
-    -m=${RESNET50_BUNDLE_DIR}/resnet50 -model-input-name=${MODEL_INPUT_NAME}
-    -cpu -emit-bundle ${BUNDLE_OUTPUT_DIRECTORY}
+    model-compiler -g -model=${RESNET50_BUNDLE_DIR}/resnet50
+    -model-input=${MODEL_INPUT_NAME},float,[1,3,224,224]
+    -backend=CPU -emit-bundle=${BUNDLE_OUTPUT_DIRECTORY}
+    -bundle-api=dynamic
   DEPENDS
-    image-classifier ResNet50BundleDir
+    model-compiler ResNet50BundleDir
 )
 add_custom_target(ResNet50BundleNet DEPENDS ${BUNDLE_OUTPUT_DIRECTORY}/resnet50.o ResNet50BundleNetFiles)
 
@@ -61,19 +62,29 @@ add_custom_command(
   OUTPUT
     ${QUANTIZED_BUNDLE_OUTPUT_DIRECTORY}/resnet50.o
   COMMAND
-    image-classifier ${IMAGES}/dog_207.png -g -i=0to1 -load-profile=profile.yml -assert-all-nodes-quantized -keep-original-precision-for-nodes=SoftMax
-    -m=${RESNET50_BUNDLE_DIR}/resnet50 -model-input-name=${MODEL_INPUT_NAME}
-    -cpu -emit-bundle ${QUANTIZED_BUNDLE_OUTPUT_DIRECTORY}
+    model-compiler -g -load-profile=profile.yml -assert-all-nodes-quantized -keep-original-precision-for-nodes=SoftMax
+    -model=${RESNET50_BUNDLE_DIR}/resnet50
+    -model-input=${MODEL_INPUT_NAME},float,[1,3,224,224]
+    -backend=CPU -emit-bundle=${QUANTIZED_BUNDLE_OUTPUT_DIRECTORY}
+    -bundle-api=dynamic
   DEPENDS
-  image-classifier ResNet50BundleDir
+    model-compiler ResNet50BundleDir
 )
 add_custom_target(QuantizedResNet50BundleNet DEPENDS ${QUANTIZED_BUNDLE_OUTPUT_DIRECTORY}/resnet50.o ResNet50BundleQuantizationProfile)
 
 # Other
 # =====
-# Driver program with main function
+# Driver program with main function for regular bundle
 add_library(ResNet50BundleMain OBJECT main.cpp)
 target_compile_options(ResNet50BundleMain PRIVATE -std=c++11 -g)
+target_include_directories(ResNet50BundleMain PUBLIC ${BUNDLE_OUTPUT_DIRECTORY})
+add_dependencies(ResNet50BundleMain ResNet50BundleNet)
+
+# Driver program with main function for quantized bundle
+add_library(QuantizedResNet50BundleMain OBJECT main.cpp)
+target_compile_options(QuantizedResNet50BundleMain PRIVATE -std=c++11 -g)
+target_include_directories(QuantizedResNet50BundleMain PUBLIC ${QUANTIZED_BUNDLE_OUTPUT_DIRECTORY})
+add_dependencies(QuantizedResNet50BundleMain QuantizedResNet50BundleNet)
 
 # Network structure and weight files
 foreach(file ${RESNET50_NET_FILES})

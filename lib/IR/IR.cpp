@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -102,9 +102,22 @@ Instruction::Operand Instruction::getOperand(unsigned idx) const {
   return ops_[idx];
 }
 
+llvm::StringRef Instruction::getOperandName(unsigned idx) const {
+  switch (getKind()) {
+#define DEF_INSTR(CLASS, NAME)                                                 \
+  case glow::Kinded::Kind::CLASS##Kind:                                        \
+    return static_cast<const CLASS *>(this)->getOperandName(idx);
+#define DEF_BACKEND_SPECIFIC_INSTR(CLASS, NAME) DEF_INSTR(CLASS, NAME)
+#define DEF_VALUE(CLASS, NAME)
+#include "glow/AutoGenInstr.def"
+  default:
+    llvm_unreachable("Unhandled instruction");
+  }
+}
+
 void Instruction::eraseFromParent() { getParent()->eraseInstruction(this); }
 
-void Instruction::verifyUseList(
+bool Instruction::verifyUseList(
     const InstructionNumbering &InstrNumbering) const {
   for (const auto &op : ops_) {
     auto *v = op.first;
@@ -113,9 +126,10 @@ void Instruction::verifyUseList(
     assert(v->hasUser(this) && "Invalid use-list");
     v->verifyUseList(InstrNumbering);
   }
+  return true;
 }
 
-void Instruction::verify() const {
+bool Instruction::verify() const {
   // All operands of instructions must be either memory (AllocActivation or
   // WeightVar), or a TensorView of such.
   for (const auto &opPair : getOperands()) {
@@ -133,18 +147,24 @@ void Instruction::verify() const {
 #define DEF_BACKEND_SPECIFIC_INSTR(CLASS, NAME) DEF_INSTR(CLASS, NAME)
 #define DEF_VALUE(CLASS, NAME)
 #include "glow/AutoGenInstr.def"
+  return true;
 }
 
-void Value::verify(const IRFunction &M) const {}
+bool Value::verify(const IRFunction &M) const { return true; }
 
-void Value::verifyUseList(const InstructionNumbering &InstrNumbering) const {
+bool Value::verifyUseList(const InstructionNumbering &InstrNumbering) const {
   auto users = getUsers();
   for (const auto &use : users) {
     auto *I = use.get();
     (void)I;
     // Every instruction using this value should be in the instruction list.
     assert(InstrNumbering.getInstrNumber(I) != -1);
+    // All uses must come after defs.
+    assert(!isa<Instruction>(this) ||
+           InstrNumbering.getInstrNumber(I) >
+               InstrNumbering.getInstrNumber(cast<Instruction>(this)));
   }
+  return true;
 }
 
 void Instruction::destroyInstruction(Instruction *I) {
@@ -301,7 +321,7 @@ static void verifyLiveness(const IRFunction &M) {
   }
 }
 
-void IRFunction::verify() const {
+bool IRFunction::verify() const {
   InstructionNumbering InstrNumbering(*this);
   assert(!instrs_.empty() && "Instruction list is empty!");
   llvm::StringSet<> nameSet;
@@ -326,6 +346,7 @@ void IRFunction::verify() const {
     (void)it;
     assert(it.second && "All Instruction and WeightVar names must be unique.");
   }
+  return true;
 }
 
 Value *IRFunction::getWeightForNode(const Storage *V) const {
@@ -353,6 +374,24 @@ bool Instruction::isDataParallel() const {
 #include "glow/AutoGenInstr.def"
   }
   return false;
+}
+
+Instruction *Instruction::clone() const {
+  switch (getKind()) {
+  default:
+    llvm_unreachable("Unknown value kind");
+    break;
+#define DEF_INSTR(CLASS, NAME)                                                 \
+  case Kinded::Kind::CLASS##Kind: {                                            \
+    auto *X = llvm::cast<const CLASS>(this);                                   \
+    return X->clone();                                                         \
+    break;                                                                     \
+  }
+#define DEF_BACKEND_SPECIFIC_INSTR(CLASS, NAME) DEF_INSTR(CLASS, NAME)
+#define DEF_VALUE(CLASS, NAME)
+#include "glow/AutoGenInstr.def"
+  }
+  return nullptr;
 }
 
 //===----------------------------------------------------------------------===//
@@ -518,7 +557,7 @@ void Instruction::dumpOperands(llvm::raw_ostream &os) const {
 }
 
 IRFunction::IRFunction(Function *G)
-    : Named(G ? G->getName() : llvm::StringRef{}), G_(G) {}
+    : IRContainer(G ? G->getName() : llvm::StringRef{}), G_(G) {}
 
 static bool hasResultValue(const Instruction *I) {
   return I->getKind() == Instruction::Kind::AllocActivationInstKind ||
@@ -585,6 +624,61 @@ std::string IRFunction::toString() const {
   llvm::raw_string_ostream os(storage);
   dump(os);
   return os.str();
+}
+
+IRFunction *
+IRFunction::clone(llvm::StringRef newName,
+                  llvm::DenseMap<const Value *, Value *> *map,
+                  llvm::DenseMap<const Value *, Value *> *currToNewMap) {
+  // Create a new function.
+  auto *newF = new IRFunction(getGraph());
+  newF->setName(newName);
+  return clone(newF, map, currToNewMap);
+}
+
+IRFunction *
+IRFunction::clone(IRFunction *newF, llvm::DenseMap<const Value *, Value *> *map,
+                  llvm::DenseMap<const Value *, Value *> *currToNewMap) const {
+
+  llvm::DenseMap<const Value *, Value *> currToNew;
+  // Initialize the map from a user-provided map.
+  if (currToNewMap) {
+    currToNew.insert(currToNewMap->begin(), currToNewMap->end());
+  }
+  // Clone weights.
+  for (auto &w : getWeights()) {
+    auto cloneWeight =
+        new WeightVar(w->getName(), w->getType(), w->getMutability());
+    newF->getWeights().emplace_back(cloneWeight);
+    currToNew[w] = cloneWeight;
+  }
+  // Clone the variable map.
+  for (auto &v : getVariableMap()) {
+    assert(v.second && "The value should have been cloned already");
+    newF->getVariableMap()[v.first] = currToNew[v.second];
+  }
+  // Clone instructions.
+  for (const auto &I : getInstrs()) {
+    auto *cloneI = I.clone();
+    currToNew[&I] = cloneI;
+    // Remap all operands.
+    for (unsigned idx = 0, e = cloneI->getNumOperands(); idx < e; ++idx) {
+      cloneI->setOperand(idx, currToNew[cloneI->getOperand(idx).first]);
+    }
+    newF->insertInstruction(cloneI);
+  }
+  // Record the node mapping into the external map.
+  if (map) {
+    assert(map->empty() && "The external map must be empty");
+    for (auto it : currToNew) {
+      map->insert(it);
+    }
+  }
+  assert(newF->getInstrs().size() == getInstrs().size() && "Invalid func size");
+  assert(newF->getWeights().size() == getWeights().size() &&
+         "Invalid func size");
+  newF->verify();
+  return newF;
 }
 
 //===----------------------------------------------------------------------===//

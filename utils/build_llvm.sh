@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Copyright (c) 2017-present, Facebook, Inc.
+# Copyright (c) Glow Contributors. See CONTRIBUTORS file.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ cd llvm_build
 # LLVM_INSTALL_UTILS adds the utilities like FileCheck to the install
 cmake ../llvm/ -G Ninja -DCMAKE_INSTALL_PREFIX="$BASE/llvm_install" \
       -DCMAKE_BUILD_TYPE=Release -DLLVM_INSTALL_UTILS=ON \
-      -DLLVM_ENABLE_PROJECTS=clang
+      -DLLVM_ENABLE_PROJECTS=clang -DLLVM_ENABLE_RTTI=ON
 cmake --build . --target install
 
 echo "Built LLVM into " "$BASE/llvm_install"

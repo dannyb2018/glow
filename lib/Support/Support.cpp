@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,7 +45,7 @@ template <> struct BlockScalarTraits<glow::MultiLineStr> {
 template <> struct MappingTraits<glow::DeviceConfigHelper> {
   static void mapping(IO &io, glow::DeviceConfigHelper &info) {
     io.mapRequired("name", info.name_);
-    io.mapRequired("kindName", info.kindName_);
+    io.mapRequired("backendName", info.backendName_);
     io.mapRequired("parameters", info.parameters_);
   }
 };
@@ -54,6 +54,8 @@ template <> struct MappingTraits<glow::DeviceConfigHelper> {
 } // end namespace llvm
 
 LLVM_YAML_IS_SEQUENCE_VECTOR(glow::DeviceConfigHelper);
+
+LLVM_YAML_IS_STRING_MAP(std::string);
 
 namespace glow {
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os, void *ptr) {
@@ -133,6 +135,31 @@ const std::string strFormat(const char *format, ...) {
   return std::string(str.data(), len);
 }
 
+/// Create a formatted string that should live until the end of the execution.
+const std::string &staticStrFormat(const char *format, ...) {
+  // The storage for strings that should live until the end of the execution.
+  static std::vector<std::string> staticStrings;
+  // Initialize use of varargs.
+  va_list vaArgs;
+  va_start(vaArgs, format);
+
+  // Create a copy of the varargs.
+  va_list vaArgsCopy;
+  va_copy(vaArgsCopy, vaArgs);
+  // Compute the length of the output to be produced.
+  // The vsnprintf call does not actually write anything, but properly computes
+  // the amount of characters that would be written.
+  const int len = vsnprintf(NULL, 0, format, vaArgsCopy);
+  va_end(vaArgsCopy);
+
+  // Create a formatted string without any risk of memory issues.
+  std::vector<char> str(len + 1);
+  std::vsnprintf(str.data(), str.size(), format, vaArgs);
+  va_end(vaArgs);
+  staticStrings.emplace_back(std::string(str.data(), len));
+  return staticStrings.back();
+}
+
 std::string legalizeName(llvm::StringRef name) {
   std::string legalName;
 
@@ -163,9 +190,8 @@ const char *getDotFileNodeColor(size_t index) {
   return colorNames[index % arrayLen];
 }
 
-std::vector<DeviceConfigHelper>
-deserializeDeviceConfigFromYaml(llvm::StringRef fileName) {
-  std::vector<DeviceConfigHelper> result;
+template <typename T> static T deserializeFromYaml(llvm::StringRef fileName) {
+  T result;
   llvm::outs() << fileName << "\n";
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> text =
       llvm::MemoryBuffer::getFileAsStream(fileName);
@@ -179,4 +205,24 @@ deserializeDeviceConfigFromYaml(llvm::StringRef fileName) {
 
   return result;
 }
+
+std::vector<DeviceConfigHelper>
+deserializeDeviceConfigFromYaml(llvm::StringRef fileName) {
+  return deserializeFromYaml<std::vector<DeviceConfigHelper>>(fileName);
+}
+
+std::map<std::string, std::string>
+deserializeStrStrMapFromYaml(llvm::StringRef fileName) {
+  return deserializeFromYaml<std::map<std::string, std::string>>(fileName);
+}
+
+Expected<int> getIntFromStr(llvm::StringRef input) {
+  const char *start = input.data();
+  char *end;
+  int val = std::strtol(start, &end, 10);
+  RETURN_ERR_IF_NOT(!(end == start || *end != '\0'),
+                    "Integer was not properly specified.");
+  return val;
+}
+
 } // namespace glow

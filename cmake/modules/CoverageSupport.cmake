@@ -1,4 +1,4 @@
-# Copyright (c) 2017-present, Facebook, Inc.
+# Copyright (c) Glow Contributors. See CONTRIBUTORS file.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -44,13 +44,13 @@ if(GLOW_USE_COVERAGE)
     COMMAND echo "Cleaning is done. Running tests"
 
     # Run all tests.
-    COMMAND ${CMAKE_CTEST_COMMAND} -V -j 4 -LE EXPENSIVE
+    COMMAND ${CMAKE_CTEST_COMMAND} -V -j 4 -LE EXPENSIVE\\|STRESS
 
     # Capture lcov counters based on the test run.
     COMMAND ${LCOV_PATH} --no-checksum --directory . --capture --output-file glow_coverage.info
 
     # Ignore not related files.
-    COMMAND ${LCOV_PATH} --remove glow_coverage.info '*v1*' '/usr/*' '*tests/*' '*llvm_install*' --output-file ${PROJECT_BINARY_DIR}/glow_coverage_result.info
+    COMMAND ${LCOV_PATH} --remove glow_coverage.info '*v1*' '/usr/*' '*tests/*' '*llvm_install*' 'build/*' --output-file ${PROJECT_BINARY_DIR}/glow_coverage_result.info
 
     # Generate HTML report based on the profiles.
     COMMAND ${GENHTML_PATH} -o glow_coverage ${PROJECT_BINARY_DIR}/glow_coverage_result.info

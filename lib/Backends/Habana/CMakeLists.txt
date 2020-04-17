@@ -1,7 +1,11 @@
+add_subdirectory(ClassGen)
+
 add_library(Habana
             Habana.cpp
             HabanaDeviceManager.cpp
-            HabanaFactory.cpp)
+            HabanaFactory.cpp
+            HabanaFunction.cpp
+            HabanaUtils.cpp)
 
 target_include_directories(Habana
                            PUBLIC
@@ -17,8 +21,8 @@ target_link_libraries(Habana
                         CodeGen
                         IR
                         LLVMCore
-                        Optimizer
                         QuantizationBase
+                        Runtime
                         Support)
 
 set(linked_backends ${linked_backends} Habana PARENT_SCOPE)

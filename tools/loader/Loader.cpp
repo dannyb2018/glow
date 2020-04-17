@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,10 @@
 #include "glow/Base/Tensor.h"
 #include "glow/Converter/TypeAToTypeBFunctionConverter.h"
 #include "glow/IR/IR.h"
-#include "glow/Quantization/Quantization.h"
+#include "glow/Importer/Caffe2ModelLoader.h"
+#include "glow/Importer/ONNXModelLoader.h"
+#include "glow/Optimizer/GraphOptimizer/CompilationContext.h"
+#include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
 #include "glow/Quantization/Serialization.h"
 #include "glow/Runtime/RuntimeTypes.h"
 
@@ -31,6 +34,8 @@
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
+#include <future>
 #include <sstream>
 
 using namespace glow;
@@ -43,9 +48,9 @@ static llvm::cl::opt<bool, true>
                    llvm::cl::desc("Enable rowwise quantized fully connected."),
                    llvm::cl::location(enableRowwiseOpt), llvm::cl::init(false));
 
-namespace {
 llvm::cl::OptionCategory loaderCat("Loader Options");
 
+namespace {
 llvm::cl::list<std::string> modelPathOpt(
     "model",
     llvm::cl::desc(
@@ -59,6 +64,36 @@ llvm::cl::list<std::string> modelPathOpt(
 llvm::cl::alias modelPathAOpt("m", llvm::cl::desc("Alias for -model"),
                               llvm::cl::aliasopt(modelPathOpt),
                               llvm::cl::cat(loaderCat));
+
+llvm::cl::list<std::string> modelInputsOpt(
+    "model-input", llvm::cl::ZeroOrMore,
+    llvm::cl::desc(
+        " For ONNX models the inputs of the graph can be inferred   \n"
+        " automatically and hence this option is not mandatory.     \n"
+        " For Caffe2 models the graph definition does not contain   \n"
+        " the description of the inputs and hence must be provided  \n"
+        " explicitly using this option. One or more model inputs    \n"
+        " are provided using the following format:                  \n"
+        "    -model-input=<inputName1>,<inputType1>,<inputShape1>   \n"
+        "    -model-input=<inputName2>,<inputType2>,<inputShape2>   \n"
+        "    ....................................................   \n"
+        " For quantized types the format is slightly different since\n"
+        " the scale and offset parameters should also be provided:  \n"
+        "    -model-input=<name>,<type>,<scale>,<offset>,<shape>    \n"
+        " For example we can can provide one or more inputs:        \n"
+        "    -model-input=input_03_data,float,[1]                   \n"
+        "    -model-input=data_bias,int32,[1,32,32]                 \n"
+        "    -model-input=data,int8q,0.123,-13,[1,10]               \n"
+        " If only the name is provided, the default type is 'float' \n"
+        " and the default shape is '[1]':                           \n"
+        "    -model-input=<inputName1>                              \n"
+        " The supported types are:                                  \n"
+        "    - float, float16 (floating point types)                \n"
+        "    - int32, int64 (integer types)                         \n"
+        "    - int8q, int16q, int32q (integer quantized types)      \n"
+        "    - bool (logic type)\n"),
+    llvm::cl::value_desc("name,[type,[scale,offset],shape]"),
+    llvm::cl::cat(loaderCat));
 
 llvm::cl::opt<bool>
     verbose("verbose",
@@ -83,8 +118,28 @@ llvm::cl::opt<quantization::Schema> quantizationSchema(
                    "Use symmetric ranges"),
         clEnumValN(quantization::Schema::SymmetricWithUnsigned,
                    "symmetric_with_uint8",
-                   "Use symmetric ranges with potentially uint8 ranges")),
+                   "Use symmetric ranges with potentially uint8 ranges"),
+        clEnumValN(quantization::Schema::SymmetricWithPower2Scale,
+                   "symmetric_with_power2_scale",
+                   "Use symmetric ranges with power of 2 scaling factor")),
     llvm::cl::init(quantization::Schema::Asymmetric), llvm::cl::cat(loaderCat));
+
+llvm::cl::opt<quantization::Calibration> quantizationCalibrationOpt(
+    "quantization-calibration",
+    llvm::cl::desc("Specify which quantization calibration method to use"),
+    llvm::cl::Optional,
+    llvm::cl::values(
+        clEnumValN(quantization::Calibration::None, "none", "No calibration"),
+        clEnumValN(quantization::Calibration::KLMinimization, "KL",
+                   "Quantization calibration method based on minimizing the "
+                   "Kullback-Leibler divergence metric (relative entropy)")),
+    llvm::cl::init(quantization::Calibration::None), llvm::cl::cat(loaderCat));
+
+llvm::cl::opt<bool> calibrateConstantsOpt(
+    "calibrate-constants",
+    llvm::cl::desc("Option to enable the quantization calibration for constant "
+                   "weights which is disabled by default."),
+    llvm::cl::init(false), llvm::cl::Optional, llvm::cl::cat(loaderCat));
 
 llvm::cl::opt<ElemKind> quantizationPrecision(
     "quantization-precision",
@@ -94,6 +149,16 @@ llvm::cl::opt<ElemKind> quantizationPrecision(
         clEnumValN(ElemKind::Int8QTy, "Int8", "Use Int8 quantization"),
         clEnumValN(ElemKind::Int16QTy, "Int16", "Use Int16 quantization")),
     llvm::cl::init(ElemKind::Int8QTy), llvm::cl::cat(loaderCat));
+
+llvm::cl::opt<ElemKind> quantizationPrecisionBias(
+    "quantization-precision-bias",
+    llvm::cl::desc("Specify which quantization precision to use for bias "
+                   "of Convolution and Fully Connected nodes."),
+    llvm::cl::Optional,
+    llvm::cl::values(
+        clEnumValN(ElemKind::Int8QTy, "Int8", "Use Int8 bias quantization"),
+        clEnumValN(ElemKind::Int32QTy, "Int32", "Use Int32 bias quantization")),
+    llvm::cl::init(ElemKind::Int32QTy), llvm::cl::cat(loaderCat));
 
 llvm::cl::opt<std::string> loadProfileFileOpt(
     "load-profile",
@@ -124,14 +189,10 @@ llvm::cl::list<std::string> doNotLowerNodesForProfilingOpt(
     llvm::cl::value_desc("NodeNames (e.g. Convolution,FullyConnected)"),
     llvm::cl::ZeroOrMore, llvm::cl::CommaSeparated, llvm::cl::cat(loaderCat));
 
-llvm::cl::opt<BackendKind> ExecutionBackend(
-    llvm::cl::desc("Backend to use:"),
-    llvm::cl::values(clEnumValN(BackendKind::Interpreter, "interpreter",
-                                "Use interpreter"),
-                     clEnumValN(BackendKind::CPU, "cpu", "Use CPU"),
-                     clEnumValN(BackendKind::OpenCL, "opencl", "Use OpenCL"),
-                     clEnumValN(BackendKind::Habana, "habana", "Use Habana")),
-    llvm::cl::init(BackendKind::Interpreter), llvm::cl::cat(loaderCat));
+llvm::cl::opt<std::string> ExecutionBackend(
+    "backend",
+    llvm::cl::desc("Backend to use, e.g., Interpreter, CPU, OpenCL:"),
+    llvm::cl::init("Interpreter"), llvm::cl::cat(loaderCat));
 
 /// Debugging options.
 llvm::cl::OptionCategory
@@ -159,6 +220,12 @@ llvm::cl::opt<bool>
                   llvm::cl::desc("Run all floating-point computation in fp16."),
                   llvm::cl::init(false), llvm::cl::cat(loaderCat));
 
+llvm::cl::opt<bool> convertPlaceholdersOpt(
+    "convert-placeholders",
+    llvm::cl::desc("Convert model placeholders by merging ConvertTo, Quantize "
+                   "and Dequantize nodes into the model inputs and outputs."),
+    llvm::cl::init(false), llvm::cl::cat(loaderCat));
+
 /// Emit a bundle into the specified output directory.
 llvm::cl::opt<std::string>
     emitBundle("emit-bundle",
@@ -176,30 +243,42 @@ llvm::cl::opt<bool> assertAllNodesQuantizedOpt(
         "whitelist node kinds that are allowed to be left unquantized."),
     llvm::cl::init(false), llvm::cl::cat(loaderCat));
 
-/// The device configs file used for Runtime.
-llvm::cl::opt<std::string> loadDeviceConfigsFileOpt(
-    "load-device-configs",
-    llvm::cl::desc("Load device configs used in Runtime"),
-    llvm::cl::value_desc("profile.yaml"), llvm::cl::Optional,
-    llvm::cl::cat(loaderCat));
+llvm::cl::opt<unsigned> numHistogramBinsOpt(
+    "num-histogram-bins",
+    llvm::cl::desc("Number of bins used for histogram during profiling. If "
+                   "histogram based calibration is used then the number of "
+                   "histogram bins must be greater than 255 in order for any "
+                   "calibration to take place (in the order of 1000's)."),
+    llvm::cl::init(10), llvm::cl::value_desc("N"), llvm::cl::cat(loaderCat));
 
 /// Name of the network being bundled.
 llvm::cl::opt<std::string> networkName(
     "network-name",
-    llvm::cl::desc("Name of the network being bundled. "
-                   "This name is used as both the function name "
-                   "of the entry point to the network "
-                   "and as a prefix for all the files that are generated."),
+    llvm::cl::desc("Name of the network being bundled. This name is used as a "
+                   "prefix for all the files that are generated."),
     llvm::cl::cat(loaderCat));
 
+/// Name of the main entry of the bundle.
+llvm::cl::opt<std::string>
+    mainEntryName("main-entry-name",
+                  llvm::cl::desc("Name of the main entry in the bundle. "
+                                 "This name is used as the function name "
+                                 "of the entry point to the network."),
+                  llvm::cl::cat(loaderCat));
+
+} // namespace
+
+// These are outside the namespace so they can be used by the image-classifier.
 llvm::cl::opt<unsigned> numDevices("num-devices",
                                    llvm::cl::desc("Number of Devices to use"),
                                    llvm::cl::init(1), llvm::cl::value_desc("N"),
                                    llvm::cl::cat(loaderCat));
-} // namespace
 
-// timeOpt and iterationsOpt are outside the namespace so they can be used by
-// the image-classifier.
+llvm::cl::opt<bool> runAllInputsOnAllDevices(
+    "run-all-inputs-on-all-devices",
+    llvm::cl::desc("Run all inputs on all devices. Used for testing purposes."),
+    llvm::cl::init(false), llvm::cl::cat(loaderCat));
+
 llvm::cl::opt<bool>
     timeOpt("time",
             llvm::cl::desc("Print timer output to stderr detailing how long it "
@@ -210,9 +289,16 @@ llvm::cl::opt<unsigned> iterationsOpt(
     "iterations", llvm::cl::desc("Number of iterations to perform"),
     llvm::cl::Optional, llvm::cl::init(0), llvm::cl::cat(loaderCat));
 
-llvm::StringRef Loader::getModelOptPath() {
-  assert(modelPathOpt.size() == 1 && "Model path must be a single path.");
-  return modelPathOpt[0];
+std::string Loader::getModelOptPath() {
+  // If given a single path, return it.
+  if (modelPathOpt.size() == 1 &&
+      llvm::sys::fs::is_directory(*modelPathOpt.begin())) {
+    return *modelPathOpt.begin();
+  }
+
+  // Model path must be to one or more files. Use the path of the first file.
+  size_t found = modelPathOpt[0].find_last_of("/");
+  return found == std::string::npos ? "." : modelPathOpt[0].substr(0, found);
 }
 
 llvm::StringRef Loader::getModelOptDir() {
@@ -225,6 +311,138 @@ llvm::StringRef Loader::getModelOptDir() {
 bool glow::emittingBundle() { return !emitBundle.empty(); }
 
 bool glow::profilingGraph() { return !dumpProfileFileOpt.empty(); }
+
+/// Parse the 'modelInputsOpt' option and get the model input names and types.
+/// The expected format is one of the following:
+/// - <name> (default type is 'float', default shape is '[1]')
+/// - <name>,<type>,<shape> for non-quantized types.
+/// - <name>,<type>,<scale>,<offset>,<shape> for quantized types.
+static void getModelInputs(std::vector<std::string> &inputNames,
+                           std::vector<Type> &inputTypes) {
+  for (const auto &str : modelInputsOpt) {
+    // Parse name.
+    auto strPair = llvm::StringRef(str).split(',');
+    llvm::StringRef name = strPair.first;
+    CHECK(name.size()) << "Model input name empty";
+
+    // Verify name is unique and add to vector.
+    for (const auto &nameIter : inputNames) {
+      if (name.equals(nameIter)) {
+        LOG(FATAL) << strFormat("Model input name \"%s\" is not unique. Check "
+                                "the graph definition for the input names.",
+                                std::string(name).c_str());
+      }
+    }
+    inputNames.push_back(name);
+
+    // If only the name is provided, use the default type and shape.
+    if (strPair.second.size() == 0) {
+      inputTypes.push_back(Type(ElemKind::FloatTy, {1}));
+      continue;
+    }
+
+    // Parse type.
+    strPair = strPair.second.split(',');
+    llvm::StringRef type = strPair.first;
+    CHECK(type.size()) << "Model input type empty";
+    ElemKind kind;
+    if (type.equals("float")) {
+      kind = ElemKind::FloatTy;
+    } else if (type.equals("float16")) {
+      kind = ElemKind::Float16Ty;
+    } else if (type.equals("int8q")) {
+      kind = ElemKind::Int8QTy;
+    } else if (type.equals("int16q")) {
+      kind = ElemKind::Int16QTy;
+    } else if (type.equals("int32q")) {
+      kind = ElemKind::Int32QTy;
+    } else if (type.equals("int32")) {
+      kind = ElemKind::Int32ITy;
+    } else if (type.equals("int64")) {
+      kind = ElemKind::Int64ITy;
+    } else if (type.equals("bool")) {
+      kind = ElemKind::BoolTy;
+    } else {
+      LOG(FATAL) << strFormat("Model input type \"%s\" not supported",
+                              std::string(type).c_str());
+    }
+
+    // For quantized type get scale and offset.
+    double scale;
+    int32_t offset;
+    if (isQuantizedElemKind(kind)) {
+      strPair = strPair.second.split(',');
+      CHECK(strPair.first.size()) << "Model input scale empty";
+      CHECK(!strPair.first.getAsDouble(scale))
+          << "Model input scale parameter invalid";
+      strPair = strPair.second.split(',');
+      CHECK(strPair.first.size()) << "Model input offset empty";
+      CHECK(!strPair.first.getAsInteger(0, offset))
+          << "Model input offset parameter invalid";
+    }
+
+    // Parse shape string.
+    llvm::StringRef shape = strPair.second;
+    CHECK(shape.size()) << "Model input shape empty";
+    ShapeVector dims;
+    CHECK_EQ(shape.front(), '[') << "First shape char should be [";
+    shape = shape.drop_front();
+    CHECK_EQ(shape.back(), ']') << "First shape char should be ]";
+    shape = shape.drop_back();
+    CHECK(shape.size()) << "Model input shape empty";
+    size_t val;
+    while (shape.contains(',')) {
+      auto splitRes = shape.split(',');
+      CHECK(!splitRes.first.getAsInteger(0, val))
+          << "Model input shape integer invalid";
+      dims.push_back(val);
+      shape = splitRes.second;
+    }
+    CHECK(!shape.getAsInteger(0, val)) << "Model input shape integer invalid";
+    dims.push_back(val);
+
+    // Build type and add to vector.
+    if (isQuantizedElemKind(kind)) {
+      inputTypes.push_back(Type(kind, dims, (float)scale, offset));
+    } else {
+      inputTypes.push_back(Type(kind, dims));
+    }
+  }
+}
+
+std::unique_ptr<ProtobufLoader> Loader::loadModel() {
+
+  // Get model input names and types.
+  std::vector<std::string> inputNames;
+  std::vector<Type> inputTypes;
+  getModelInputs(inputNames, inputTypes);
+  std::vector<const char *> inputNameRefs;
+  std::vector<TypeRef> inputTypeRefs;
+  for (size_t idx = 0, e = inputNames.size(); idx < e; idx++) {
+    inputNameRefs.push_back(inputNames[idx].c_str());
+    inputTypeRefs.push_back(&inputTypes[idx]);
+  }
+
+  // Load the model based on the model format.
+  std::unique_ptr<ProtobufLoader> protoLoader;
+  if (!getCaffe2NetDescFilename().empty()) {
+    // For Caffe2 format the input placeholder names/types must be provided
+    // explicitly (mandatory).
+    protoLoader.reset(new Caffe2ModelLoader(
+        getCaffe2NetDescFilename(), getCaffe2NetWeightFilename(), inputNameRefs,
+        inputTypeRefs, *getFunction()));
+  } else {
+    // For ONNX format the input placeholders names/types can be optionally
+    // provided but is not mandatory. If not provided (the arrays are empty)
+    // they are derived automatically. One might want to provide explicitly
+    // the input placeholder types in order to override the placeholder sizes
+    // (one such example is the batch size).
+    protoLoader.reset(new ONNXModelLoader(getOnnxModelFilename(), inputNameRefs,
+                                          inputTypeRefs, *getFunction()));
+  }
+
+  return protoLoader;
+}
 
 static bool commandLineIsInvalid() {
   if (!dumpProfileFileOpt.empty() &&
@@ -253,6 +471,11 @@ static bool commandLineIsInvalid() {
                   end = llvm::sys::path::rend(modelPathOpt[0]);
              it != end; ++it) {
           networkName = *it;
+          // Strip extension (if any).
+          size_t lastDotPos = networkName.find_last_of(".");
+          if (lastDotPos != std::string::npos) {
+            networkName = networkName.substr(0, lastDotPos);
+          }
           // Empty names are replaced by '.' (see Path.h in LLVM).
           if (!networkName.empty() && networkName != ".") {
             break;
@@ -292,96 +515,58 @@ void glow::parseCommandLine(int argc, char **argv) {
   }
 }
 
-/// Helper to get the Kind of a Node (e.g. Kinded::Kind::AddNodeKind) given its
-/// \p nodeName (e.g. Add).
-static Kinded::Kind getKindFromNodeName(llvm::StringRef nodeName) {
-#define DEF_NODE(CLASS, NAME)                                                  \
-  if (nodeName == #NAME) {                                                     \
-    return Kinded::Kind::CLASS##Kind;                                          \
+quantization::QuantizationConfiguration Loader::getQuantizationConfiguration() {
+  quantization::QuantizationConfiguration quantConfig;
+  quantConfig.precision = quantizationPrecision;
+  quantConfig.precisionBias = quantizationPrecisionBias;
+  quantConfig.schema = quantizationSchema;
+  quantConfig.calibration = quantizationCalibrationOpt;
+  quantConfig.calibrateConstants = calibrateConstantsOpt;
+  quantConfig.enableRowwise = enableRowwiseOpt;
+  quantConfig.assertAllNodesQuantized = assertAllNodesQuantizedOpt;
+  if (!loadProfileFileOpt.empty()) {
+    quantConfig.infos = deserializeProfilingInfosFromYaml(loadProfileFileOpt);
   }
-#include "glow/AutoGenNodes.def"
-  LOG(FATAL) << "Unknown node name: " << nodeName.str();
+  return quantConfig;
 }
 
-/// Helper to get the BackendKind type from a backend's \p name. Need to be
-/// updated if a new backend comes.
-static BackendKind getBackendKindFromName(std::string &name) {
-  const llvm::StringMap<BackendKind> mapping(
-      {{"CPU", BackendKind::CPU},
-       {"Interpreter", BackendKind::Interpreter},
-       {"OpenCL", BackendKind::OpenCL},
-       {"Habana", BackendKind::Habana}});
-  CHECK(mapping.find(name) != mapping.end())
-      << "Unknown backendKind name: " << name;
-  return mapping.lookup(name);
-}
+CompilationContext Loader::getCompilationContext(QuantizationMode mode) {
 
-/// Helper to get the parameters in DeviceConfig from \p str. The \p str has
-/// multiple lines, and each line with this format : "str1" : "str2".
-static llvm::StringMap<std::string> getBackendParams(std::string &str) {
-  llvm::StringMap<std::string> ret{};
-  std::string s;
-  std::istringstream f(str.c_str());
-  while (getline(f, s, '\n')) {
-    // Abstract the mapping from each line's string:
-    // ""str1" : "str2"" => ret["str1"] = "str2";
-    size_t pos1, pos2, pos3, pos4;
-    pos1 = s.find('"');
-    assert(pos1 != std::string::npos && "invalid string format");
-    pos2 = s.find('"', pos1 + 1);
-    assert(pos2 != std::string::npos && "invalid string format");
-    pos3 = s.find('"', pos2 + 1);
-    assert(pos3 != std::string::npos && "invalid string format");
-    pos4 = s.find('"', pos3 + 1);
-    assert(pos4 != std::string::npos && "invalid string format");
-    ret[s.substr(pos1 + 1, pos2 - pos1 - 1)] =
-        s.substr(pos3 + 1, pos4 - pos3 - 1);
-  }
-  return ret;
-}
-
-/// If the device config file \p loadDeviceDoncfigsFile available, load \p
-/// configs from the file. Otherwise, create \p numDevices number of devices
-/// based on \p backendKind.
-static std::vector<std::unique_ptr<runtime::DeviceConfig>>
-generateDeviceConfigs(std::string &loadDeviceConfigsFile,
-                      unsigned int numDevices, BackendKind backendKind) {
-  std::vector<std::unique_ptr<runtime::DeviceConfig>> configs;
-  if (loadDeviceConfigsFile.empty()) {
-    // If there is no device config file, use numDevices to generate the
-    // configs.
-    for (unsigned int i = 0; i < numDevices; ++i) {
-      auto config = llvm::make_unique<runtime::DeviceConfig>(backendKind);
-      configs.push_back(std::move(config));
-    }
-  } else {
-    // Get the configs from the config file.
-    std::vector<DeviceConfigHelper> lists;
-    lists = deserializeDeviceConfigFromYaml(loadDeviceConfigsFile);
-    for (unsigned int i = 0; i < lists.size(); ++i) {
-      auto backendKind = getBackendKindFromName(lists[i].kindName_);
-      auto name = lists[i].name_;
-      auto parameters = getBackendParams(lists[i].parameters_.str);
-      auto config = llvm::make_unique<runtime::DeviceConfig>(backendKind, name,
-                                                             parameters);
-      configs.push_back(std::move(config));
-    }
-  }
-  return configs;
-}
-
-void Loader::compile(PlaceholderBindings &bindings) {
-  // Dump the DAG before compilation if needed.
-  if (!dumpGraphDAGFileBeforeCompilationOpt.empty()) {
-    F_->dumpDAG(dumpGraphDAGFileBeforeCompilationOpt.c_str());
-  }
-
-  CompilationContext cctx{&bindings, &loweredMap_};
+  // Common configurations.
+  CompilationContext cctx;
+  cctx.loweredInfoMap = &loweredMap_;
   PrecisionConfiguration &precConfig = cctx.precisionConfig;
+  precConfig.convertToFP16 = convertToFP16;
 
-  // Handle the request to profile the graph in preparation for quantization.
-  if (!dumpProfileFileOpt.empty()) {
-    precConfig.quantMode = QuantizationMode::Profile;
+  // Specific configurations.
+  precConfig.quantMode = mode;
+  if (mode == QuantizationMode::None) {
+
+    // By default, when converting models, all nodes that can be converted are
+    // converted. However, some models may need to keep higher precision for
+    // some nodes to prevent high accuracy loss. Those nodes are gathered via
+    // the keepOriginalPrecisionForNodesOpt option and passed to the related
+    // conversion function.
+    for (llvm::StringRef kindName : keepOriginalPrecisionForNodesOpt) {
+      precConfig.precisionModeKindSet.insert(getKindFromNodeName(kindName));
+    }
+
+  } else if (mode == QuantizationMode::Quantize) {
+
+    // By default, when converting models, all nodes that can be converted are
+    // converted. However, some models may need to keep higher precision for
+    // some nodes to prevent high accuracy loss. Those nodes are gathered via
+    // the keepOriginalPrecisionForNodesOpt option and passed to the related
+    // conversion function.
+    for (llvm::StringRef kindName : keepOriginalPrecisionForNodesOpt) {
+      precConfig.precisionModeKindSet.insert(getKindFromNodeName(kindName));
+    }
+    precConfig.quantConfig = getQuantizationConfiguration();
+
+  } else if (mode == QuantizationMode::Profile) {
+
+    // Profiling parameters.
+    precConfig.profConfig.numHistogramBins = numHistogramBinsOpt;
 
     // By default everything will be lowered for profiling. However this may
     // cause performance issues for some models, e.g. if a model has group
@@ -391,41 +576,69 @@ void Loader::compile(PlaceholderBindings &bindings) {
     for (llvm::StringRef kindName : doNotLowerNodesForProfilingOpt) {
       precConfig.precisionModeKindSet.insert(getKindFromNodeName(kindName));
     }
+
   } else {
-    // By default, when converting models, all nodes that can be converted are
-    // converted. However, some models may need to keep higher precision for
-    // some nodes to prevent high accuracy loss. Those nodes are gathered via
-    // the keepOriginalPrecisionForNodesOpt option and passed to the related
-    // conversion function.
-    for (llvm::StringRef kindName : keepOriginalPrecisionForNodesOpt) {
-      precConfig.precisionModeKindSet.insert(getKindFromNodeName(kindName));
-    }
+    LOG(FATAL) << "Quantization mode not supported";
   }
 
-  if (!loadProfileFileOpt.empty()) {
-    precConfig.quantMode = QuantizationMode::Quantize;
-    precConfig.quantConfig.precision = quantizationPrecision;
-    precConfig.quantConfig.infos = deserializeFromYaml(loadProfileFileOpt);
-    precConfig.quantConfig.schema = quantizationSchema;
-    precConfig.quantConfig.enableRowwise = enableRowwiseOpt;
-    precConfig.quantConfig.assertAllNodesQuantized = assertAllNodesQuantizedOpt;
+  // When converting the model placeholders, if the placeholders are already
+  // allocated, we should also convert the backing tensors. Since this procedure
+  // is not yet in place, we only convert when emitting a bundle.
+  if (convertPlaceholdersOpt && !emittingBundle()) {
+    llvm::errs() << "The flag 'convert-placeholders' can only be used when "
+                    "emitting a bundle!\n";
+    std::exit(1);
   }
+  cctx.optimizationOpts.foldElemKindConversionIntoIO = convertPlaceholdersOpt;
 
-  precConfig.convertToFP16 = convertToFP16;
+  return cctx;
+}
+
+CompilationContext Loader::getCompilationContext() {
+  if (!dumpProfileFileOpt.empty()) {
+    return Loader::getCompilationContext(QuantizationMode::Profile);
+  } else if (!loadProfileFileOpt.empty()) {
+    return Loader::getCompilationContext(QuantizationMode::Quantize);
+  } else {
+    return Loader::getCompilationContext(QuantizationMode::None);
+  }
+}
+
+void Loader::compile(PlaceholderBindings &bindings) {
+  CompilationContext cctx = getCompilationContext();
+  cctx.bindings = &bindings;
+  compile(cctx);
+}
+
+void Loader::compile(CompilationContext &cctx) {
+
+  // Dump the DAG before compilation if needed.
+  if (!dumpGraphDAGFileBeforeCompilationOpt.empty()) {
+    F_->dumpDAG(dumpGraphDAGFileBeforeCompilationOpt.c_str());
+  }
 
   // Store a raw pointer to the Module, we pass the unique_ptr to HostManager
   // but the Module is stored by Hostmanager so the pointer will remain valid.
   auto module = M_.get();
 
   if (emittingBundle()) {
+    // Create bundle directory if not exists.
+    if (!llvm::sys::fs::is_directory(emitBundle)) {
+      llvm::sys::fs::create_directory(emitBundle);
+    }
     // Emit IR for the graph, compile it and save as a bundle.
     auto error = ::glow::optimizeFunction(F_, *backend_, cctx);
     EXIT_ON_ERR(std::move(error));
-    backend_->save(F_, emitBundle, networkName);
+    backend_->save(F_, emitBundle, networkName,
+                   mainEntryName.empty() ? networkName : mainEntryName);
   } else {
     // Emit IR for the graph and compile it.
+    cctx.saturateHost = !runAllInputsOnAllDevices;
     auto error = hostManager_->addNetwork(std::move(M_), cctx);
     EXIT_ON_ERR(std::move(error));
+    // After partitioning, the original function may be removed. Need to update
+    // F_.
+    F_ = module->getFunctions().front();
   }
   if (dumpGraphOpt) {
     for (auto function : module->getFunctions()) {
@@ -435,7 +648,10 @@ void Loader::compile(PlaceholderBindings &bindings) {
   if (!dumpGraphDAGFileOpt.empty()) {
     for (auto function : module->getFunctions()) {
       std::string filename =
-          function->getName().str() + "_" + dumpGraphDAGFileOpt;
+          function->getFilename() + "_" + dumpGraphDAGFileOpt;
+      if (module->getFunctions().size() == 1) {
+        filename = dumpGraphDAGFileOpt;
+      }
       function->dumpDAG(filename.c_str());
     }
   }
@@ -450,8 +666,43 @@ void Loader::runInference(PlaceholderBindings &bindings, size_t batchSize) {
     timer.startTimer();
   }
   for (unsigned i = 0; i < iterations; i++) {
-    auto runErr = hostManager_->runNetworkBlocking(modelPathOpt[0], bindings);
+    auto runErr = hostManager_->runNetworkBlocking(functionName_, bindings);
     EXIT_ON_ERR(std::move(runErr));
+  }
+  if (timeOpt) {
+    timer.stopTimer();
+    llvm::outs() << llvm::formatv("Wall time per item (s): {0:f4}\n",
+
+                                  timer.getTotalTime().getWallTime() /
+                                      iterations / batchSize);
+  }
+}
+
+void Loader::runInference(ExecutionContext *context, size_t batchSize) {
+  std::unique_ptr<ExecutionContext> contextP(context);
+
+  unsigned iterations = iterationsOpt == 0 ? 1 : iterationsOpt;
+  llvm::Timer timer("Infer", "Infer");
+  if (timeOpt) {
+    timer.startTimer();
+  }
+
+  for (unsigned i = 0; i < iterations; i++) {
+    std::promise<void> runPromise;
+    auto fut = runPromise.get_future();
+    std::unique_ptr<Error> runErr;
+    hostManager_->runNetwork(
+        functionName_, std::move(contextP),
+        [&runPromise, &runErr](runtime::RunIdentifierTy, Error err,
+                               std::unique_ptr<ExecutionContext> contextPtr) {
+          // Don't really delete context since we don't own it.
+          contextPtr.release();
+
+          runErr = glow::make_unique<Error>(std::move(err));
+          runPromise.set_value();
+        });
+    fut.wait();
+    EXIT_ON_ERR(std::move(*DCHECK_NOTNULL(runErr.get())));
   }
   if (timeOpt) {
     timer.stopTimer();
@@ -461,17 +712,53 @@ void Loader::runInference(PlaceholderBindings &bindings, size_t batchSize) {
   }
 }
 
-void Loader::generateAndSerializeQuantizationInfos(
-    PlaceholderBindings &bindings) {
-  assert(!dumpProfileFileOpt.empty() &&
-         "Filename to dump serialized profile to must not be empty.");
-  std::vector<NodeQuantizationInfo> QI =
-      quantization::generateNodeQuantizationInfos(
-          bindings, F_, loweredMap_, quantizationSchema, quantizationPrecision);
-  serializeToYaml(dumpProfileFileOpt, QI);
+static bool comparePI(const NodeProfilingInfo &a, const NodeProfilingInfo &b) {
+  return (a.nodeOutputName_.compare(b.nodeOutputName_) < 0);
 }
 
-Loader::Loader() {
+void Loader::generateAndSerializeProfilingInfos(PlaceholderBindings &bindings) {
+  assert(!dumpProfileFileOpt.empty() &&
+         "Filename to dump serialized profile to must not be empty.");
+  std::vector<NodeProfilingInfo> PI;
+  for (auto F : getModule()->getFunctions()) {
+    std::vector<NodeProfilingInfo> tmp =
+        quantization::generateNodeProfilingInfos(bindings, F, loweredMap_);
+    PI.insert(PI.end(), tmp.begin(), tmp.end());
+  }
+  std::sort(PI.begin(), PI.end(), comparePI);
+  serializeProfilingInfosToYaml(dumpProfileFileOpt, PI);
+}
+
+Loader &Loader::registerExtension(std::unique_ptr<LoaderExtension> extension) {
+  loaderExtensionList_.push_back(std::move(extension));
+  return *this;
+}
+
+void Loader::postModelLoad(PlaceholderBindings &bindings,
+                           ProtobufLoader &protoLoader,
+                           llvm::StringMap<Placeholder *> &placeholderMap,
+                           size_t compilationBatchSize) {
+  for (auto &&ext : loaderExtensionList_) {
+    ext->postModelLoad(*this, bindings, protoLoader, placeholderMap,
+                       compilationBatchSize);
+  }
+}
+
+void Loader::inferInitMiniBatch(PlaceholderBindings &bindings,
+                                size_t minibatchIndex, size_t minibatchSize) {
+  for (auto &&ext : loaderExtensionList_) {
+    ext->inferInitMiniBatch(*this, bindings, minibatchIndex, minibatchSize);
+  }
+}
+
+void Loader::inferEndMiniBatch(PlaceholderBindings &bindings,
+                               size_t minibatchIndex, size_t minibatchSize) {
+  for (auto &&ext : loaderExtensionList_) {
+    ext->inferEndMiniBatch(*this, bindings, minibatchIndex, minibatchSize);
+  }
+}
+
+Loader::Loader(llvm::ArrayRef<size_t> configDeviceIDs) {
   if (modelPathOpt.size() == 1) {
     if (llvm::sys::fs::is_directory(*modelPathOpt.begin())) {
       caffe2NetDescFilename_ = modelPathOpt[0] + "/predict_net.pb";
@@ -485,12 +772,21 @@ Loader::Loader() {
   }
   M_.reset(new Module);
 
-  std::vector<std::unique_ptr<runtime::DeviceConfig>> configs =
-      generateDeviceConfigs(loadDeviceConfigsFileOpt, numDevices,
-                            ExecutionBackend);
+  std::vector<std::unique_ptr<runtime::DeviceConfig>> configs;
 
-  hostManager_ = llvm::make_unique<runtime::HostManager>(std::move(configs));
-  backend_ = createBackend(ExecutionBackend);
+  if (configDeviceIDs.empty()) {
+    configs = runtime::generateDeviceConfigs(numDevices, ExecutionBackend);
+  } else {
+    for (size_t ID : configDeviceIDs) {
+      CHECK(ID < numDevices) << "IDs must be less than the number of devices";
+      auto config = glow::make_unique<runtime::DeviceConfig>(ExecutionBackend);
+      config->deviceID = ID;
+      configs.push_back(std::move(config));
+    }
+  }
+
+  hostManager_ = glow::make_unique<runtime::HostManager>(std::move(configs));
+  backend_ = std::unique_ptr<Backend>(createBackend(ExecutionBackend));
   F_ = M_->createFunction(modelPathOpt[0]);
   functionName_ = modelPathOpt[0];
 }

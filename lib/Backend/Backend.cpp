@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,22 @@
  */
 
 #include "glow/Backend/Backend.h"
+#include "glow/Backends/DummyDeviceManager.h"
+
 #include "glow/Graph/Graph.h"
 #include "glow/Graph/PlaceholderBindings.h"
+#include "glow/Graph/TensorLayout.h"
 #include "glow/IR/Instrs.h"
+#include "glow/Optimizer/GraphOptimizer/CompilationContext.h"
+#include "glow/Optimizer/GraphOptimizer/FunctionPassPipeline.h"
 
 using namespace glow;
+
+runtime::DeviceManager *
+Backend::createDeviceManager(const runtime::DeviceConfig &deviceConfig) {
+  LOG(ERROR) << "Warning: Creating a DummyDeviceManager.\n";
+  return new runtime::DummyDeviceManager(deviceConfig);
+}
 
 TraceInfo Backend::buildManualTraceInfo(Function *F) const {
   TraceInfo info(false, getTraceEventDataSize());
@@ -29,8 +40,11 @@ TraceInfo Backend::buildManualTraceInfo(Function *F) const {
       Placeholder *backing =
           llvm::dyn_cast<Placeholder>(TEN->getData().getNode());
       assert(backing);
-      info.add(backing, TEN->getIndex(), TEN->getEventName(),
-               TEN->getEventType());
+      char type = TraceEvent::InstantType;
+      if (!TEN->getEventType().empty()) {
+        type = TEN->getEventType()[0];
+      }
+      info.add(backing, TEN->getIndex(), TEN->getEventName(), type);
       info.enabled = true;
     }
   }
@@ -50,7 +64,7 @@ void Backend::autoInstrument(TraceInfo &traceInfo, IRFunction *IR) const {
 
   // First pass, find out how many TraceEvents we should add. Existing
   // TraceEvents have their own backing Tensors, so don't count them.
-  size_t numEvents = 1; // Starts at 1 since there is always a start event.
+  dim_t numEvents = 1; // Starts at 1 since there is always a start event.
   for (auto it = instructions.begin(); it != instructions.end(); it++) {
     auto &I = *it;
     bool isInstrumentation = llvm::isa<TraceEventInst>(&I);
@@ -67,8 +81,8 @@ void Backend::autoInstrument(TraceInfo &traceInfo, IRFunction *IR) const {
   auto &varmap = IR->getVariableMap();
   auto type = F->getParent()->uniqueType(
       ElemKind::Int64ITy,
-      {numEvents,
-       getTraceEventDataSize() / Type::getElementSize(ElemKind::Int64ITy)});
+      {numEvents, (dim_t)getTraceEventDataSize() /
+                      Type::getElementSize(ElemKind::Int64ITy)});
 
   WeightVar *backingWeight = nullptr;
 
@@ -93,16 +107,16 @@ void Backend::autoInstrument(TraceInfo &traceInfo, IRFunction *IR) const {
   if (!backingPH) {
     // Build a Placeholder to a backing tensor with space to fit all
     // timestamps.
-    backingPH =
-        F->getParent()->createPlaceholder(type, name, /* isTrainable */ false);
+    backingPH = F->getParent()->createPlaceholder(type, name,
+                                                  /* isTrainable */ false);
     assert(backingPH);
   }
 
   // Add Placeholder to the graph so we can add it to the runtimeBundle later.
   F->addMetadataPlaceholder(backingPH);
 
-  // If we don't have a weight we need to create one too, whether or not we just
-  // created a Placeholder.
+  // If we don't have a weight we need to create one too, whether or not we
+  // just created a Placeholder.
   if (!backingWeight) {
     // Create an associated weight and add it to the IR.
     backingWeight =
@@ -130,8 +144,9 @@ void Backend::autoInstrument(TraceInfo &traceInfo, IRFunction *IR) const {
 
     auto instName = I.getName();
 
-    // Start a new event.
-    traceInfo.add(backingPH, index, index + 1, instName);
+    // Start a new event
+    traceInfo.add(backingPH, index, index + 1, instName, std::string(),
+                  Kinded::getKindName(I.getKind()));
 
     it = instructions.insert(it, new TraceEventInst(instName.str() + "_trace",
                                                     backingWeight, index++));
@@ -142,4 +157,46 @@ void Backend::autoInstrument(TraceInfo &traceInfo, IRFunction *IR) const {
   }
 
   IR->pushInstr(new TraceEventInst("end_trace", backingWeight, index));
+}
+
+bool Backend::checkAllNodesSupported(const Function &F, bool verbose) const {
+  bool allSupported = true;
+  for (const Node &N : F.getNodes()) {
+    if (!isOpSupported(N)) {
+      allSupported = false;
+      if (verbose) {
+        report("Unsupported node found while compiling Function " +
+               F.getName().str() + " for backend " + getBackendName() + ": " +
+               N.getDebugDesc());
+      }
+    }
+  }
+  return allSupported;
+}
+
+bool Backend::verify(const Function &F, bool verbose) const {
+  return F.verify(this) && checkAllNodesSupported(F, verbose);
+}
+
+bool Backend::verify(const IRFunction &IR) const {
+  (void)IR;
+  return true;
+}
+
+TensorLayoutCommon &Backend::getTensorLayoutRequirements() const {
+  return CanonicalTensorLayout::getInstance();
+}
+
+FunctionPassPipeline Backend::getOptimizationPipeline() const {
+  auto p = createDefaultGraphOptimizationPassPipeline();
+  // Fold Tile followed by Add into BatchedAdd. Currently this is not part of
+  // the default pipeline to avoid issues with some backends. If backends do not
+  // want this opt then they should override getOptimizationPipeline().
+  p.pushFront({FunctionPassID::FoldTileAddIntoBatchedAdd});
+  return p;
+}
+
+IRFunctionPassPipeline Backend::getIROptimizationPipeline() const {
+  auto pipeline = createDefaultIRFunctionOptimizationPipeline();
+  return pipeline;
 }

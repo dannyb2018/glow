@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 #include "glow/Support/Support.h"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -29,6 +30,9 @@ using namespace glow;
 
 using llvm::cast;
 using llvm::isa;
+
+#define DECORATE_NODE_NAME(Node, ...)                                          \
+  llvm::join_items("_", Node->getName(), __VA_ARGS__)
 
 void GraphGradMapper::addGradient(NodeValue activation, NodeValue grad) {
   auto p = map_.insert({activation, grad});
@@ -92,8 +96,8 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
   }
 
     CONVERT_TO_GRAD_NODE(ConvolutionNode)
-    CONVERT_TO_GRAD_NODE(MaxPoolNode)
     CONVERT_TO_GRAD_NODE(AvgPoolNode)
+    CONVERT_TO_GRAD_NODE(AdaptiveAvgPoolNode)
     CONVERT_TO_GRAD_NODE(FullyConnectedNode)
     CONVERT_TO_GRAD_NODE(LocalResponseNormalizationNode)
     CONVERT_TO_GRAD_NODE(SoftMaxNode)
@@ -107,14 +111,48 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
     CONVERT_TO_GRAD_NODE(SigmoidNode)
     CONVERT_TO_GRAD_NODE(TanhNode)
     CONVERT_TO_GRAD_NODE(SparseLengthsWeightedSumNode)
+    CONVERT_TO_GRAD_NODE(SparseLengthsSumNode)
+
+    if (N->getKind() == Kind::BatchedPairwiseDotProductNodeKind) {
+      BatchedPairwiseDotProductNode *BPDPN =
+          cast<BatchedPairwiseDotProductNode>(N);
+      auto outputGrad = map.getGradient(BPDPN->getResult());
+
+      auto *X = new BatchedPairwiseDotProductGradNode(
+          DECORATE_NODE_NAME(N, "grad"), outputGrad, BPDPN->getInputs());
+
+      size_t i = 0;
+      for (auto &in : BPDPN->getInputs()) {
+        X->addExtraResult(in.getType());
+        map.addGradient(in, X->getNthResult(i));
+        ++i;
+      }
+
+      toAppend.push_back(X);
+      continue;
+    }
 
     if (N->getKind() == Kind::SaveNodeKind) {
       // Swap the src and dest. Send the Zero value as gradient for both sides.
-      auto *X = new SplatNode(N->getName(),
+      auto *X = new SplatNode(DECORATE_NODE_NAME(N, "grad"),
                               cast<SaveNode>(N)->getInput().getType(), 0);
       toAppend.push_back(X);
       map.addGradient(cast<SaveNode>(N)->getInput(), X);
       map.addGradient(cast<SaveNode>(N)->getOutput(), X);
+      continue;
+    }
+
+    if (N->getKind() == Kind::MaxPoolNodeKind) {
+      auto *MPN = llvm::cast<MaxPoolNode>(N);
+      // Argmax cannot be differentiated. Assert it has no users, and use a zero
+      // Splat for its grad input so it doesn't have a null input.
+      assert(MPN->getArgmax().getNumUsers() == 0 &&
+             "Argmax cannot be differentiated; must go unused.");
+      auto *ZSN = new SplatNode(DECORATE_NODE_NAME(N, "grad"),
+                                MPN->getArgmax().getType(), 0);
+      toAppend.push_back(ZSN);
+      map.addGradient(MPN->getArgmax(), ZSN);
+      toAppend.push_back(MPN->getGrad(map));
       continue;
     }
 
@@ -124,10 +162,44 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
       NodeValue inputW = RN->getInput();
 
       // Swap the src and dest.
-      auto *X = new ReshapeNode(N->getName(), inputW.getType(), outputG,
-                                inputW.getType()->dims());
+      auto *X = new ReshapeNode(DECORATE_NODE_NAME(RN, "grad", "reshape"),
+                                inputW.getType(), outputG,
+                                inputW.getType()->dims(), RN->getLayout());
       toAppend.push_back(X);
       map.addGradient(RN->getInput(), X);
+      continue;
+    }
+
+    if (N->getKind() == Kind::TileNodeKind) {
+      TileNode *TN = cast<TileNode>(N);
+      NodeValue outputG = map.getGradient(TN->getResult());
+
+      // To compute the gradient with respect to the input of the TileNode, all
+      // of the slices in outputG corresponding to the tiled slices in the
+      // forward pass need to be added together. This is achieved by reshaping
+      // outputG to replace the tiling axis with {numTiles, tileDim}, and then
+      // performing a BatchedReduceAdd on the axis with numTiles elements. For
+      // example, if the tile creates a {n,x,h,w} output with a {n,c,h,w}
+      // input where x = c * numTiles, then the {n,x,h,w} gradient with respect
+      // to the output is reshaped to {n, numTiles, c, h, w} so that
+      // BatchedReduceAddNode eliminates the numTiles axis and produces a
+      // {n,c,h,w} output.
+      auto *TNInputType = TN->getInput().getType();
+      std::vector<dim_t> BRAInputDims{TNInputType->dims()};
+      BRAInputDims.insert(BRAInputDims.begin() + TN->getAxis(), TN->getCount());
+      auto *BRAInputType =
+          F->getParent()->uniqueTypeWithNewShape(TNInputType, BRAInputDims);
+
+      auto *RN =
+          new ReshapeNode(DECORATE_NODE_NAME(TN, "grad", "reshape"),
+                          BRAInputType, outputG, BRAInputType->dims(), "*");
+      auto *BRA =
+          new BatchedReduceAddNode(DECORATE_NODE_NAME(TN, "grad", "bra"),
+                                   TN->getInput().getType(), RN, TN->getAxis());
+
+      toAppend.push_back(RN);
+      toAppend.push_back(BRA);
+      map.addGradient(TN->getInput(), BRA);
       continue;
     }
 
@@ -137,7 +209,8 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
       NodeValue inputW = RN->getInput();
 
       // Swap the src and dest.
-      auto *X = new ConvertToNode(N->getName(), inputW.getType(), outputG);
+      auto *X = new ConvertToNode(DECORATE_NODE_NAME(N, "grad"),
+                                  inputW.getType(), outputG);
       toAppend.push_back(X);
       map.addGradient(RN->getInput(), X);
       continue;
@@ -150,14 +223,19 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
 
       // Generate the reverse shuffle.
       auto shuffle = TN->getShuffle();
+      auto layout = TN->getLayout();
+      std::string reverseLayout;
+      reverseLayout.resize(TN->getLayout().size());
       std::vector<unsigned_t> reverseShuffle(shuffle.begin(), shuffle.end());
       for (unsigned int i = 0; i < shuffle.size(); i++) {
         reverseShuffle[shuffle[i]] = i;
+        reverseLayout[shuffle[i]] = layout[i];
       }
 
       // Swap the src and dest.
-      auto *X = new TransposeNode(N->getName(), inputW.getType(), outputG,
-                                  reverseShuffle);
+      auto *X =
+          new TransposeNode(DECORATE_NODE_NAME(N, "grad"), inputW.getType(),
+                            outputG, reverseShuffle, reverseLayout);
       toAppend.push_back(X);
       map.addGradient(TN->getInput(), X);
       continue;
@@ -165,10 +243,12 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
 
     if (N->getKind() == Kind::SliceNodeKind) {
       SliceNode *SN = cast<SliceNode>(N);
-      auto *zero = new SplatNode("expand", SN->getInput().getType(), 0);
-      auto *insert = new InsertTensorNode(
-          "insert.slice.grad", zero, map.getGradient(SN->getResult()),
-          SN->getStart(), /* count */ 1, /* axis */ 0);
+      auto *zero = new SplatNode(DECORATE_NODE_NAME(SN, "expand"),
+                                 SN->getInput().getType(), 0);
+      auto *insert =
+          new InsertTensorNode(DECORATE_NODE_NAME(SN, "grad"), zero,
+                               map.getGradient(SN->getResult()), SN->getStart(),
+                               /* count */ 1, /* axis */ 0);
 
       toAppend.push_back(zero);
       toAppend.push_back(insert);
@@ -182,10 +262,12 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
       NodeValue outputG = map.getGradient(CC->getResult());
 
       // We start extracting the shape at (0,0, ... ).
-      std::vector<size_t> offsets(CC->getResult().dims().size(), 0);
+      std::vector<dim_t> offsets(CC->getResult().dims().size(), 0);
       unsigned_t dim = CC->getDim();
       for (auto &N : inputs) {
-        auto *X = new SliceNode("extract", N.getType(), outputG, offsets);
+        // SliceNode's name will be auto incremented due to name uniqueness.
+        auto *X = new SliceNode(DECORATE_NODE_NAME(CC, "extract"), N.getType(),
+                                outputG, offsets);
         toAppend.push_back(X);
         // We are stacking the tensors along a specific dimension. This means
         // that we increase the size of the tensor along this dimension.
@@ -209,20 +291,24 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
       auto momentum = BN->getMomentum();
 
       // Update the mean and variance via the MeanVarNormalizationNode.
-      auto *MVN = new MeanVarNormalizationNode("mean_var_normalization", in,
-                                               mean, var, channelIdx, momentum);
+      auto *MVN = new MeanVarNormalizationNode(
+          DECORATE_NODE_NAME(BN, "grad"), in, mean, var, channelIdx, momentum);
       toAppend.push_back(MVN);
 
       // Save the newly calculated mean and variance to the mean and variance
       // variables. These will be used during the next iteration of training.
-      G->createSave("saveMean", MVN->getNewMean(),
+      G->createSave(DECORATE_NODE_NAME(MVN, "mean"), MVN->getNewMean(),
                     llvm::cast<Placeholder>(mean.getNode()));
-      G->createSave("saveVar", MVN->getNewVar(),
+      G->createSave(DECORATE_NODE_NAME(MVN, "var"), MVN->getNewVar(),
                     llvm::cast<Placeholder>(var.getNode()));
 
       // Replace the BN's mean and variance with the new mean and variance
       // calculated from MVN.
+      BN->getParent()->getLogContext()->logNodeInputChange(
+          *BN, BN->getNthInput(BatchNormalizationNode::MeanIdx), mean);
       BN->setNthInput(BatchNormalizationNode::MeanIdx, mean);
+      BN->getParent()->getLogContext()->logNodeInputChange(
+          *BN, BN->getNthInput(BatchNormalizationNode::VarIdx), var);
       BN->setNthInput(BatchNormalizationNode::VarIdx, var);
 
       toAppend.push_back(BN->getGrad(map));
@@ -238,15 +324,51 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
       // Get LHS/RHS inputs and their transpose presentations.
       NodeValue InputLHS = MMN->getLHS();
       NodeValue InputRHS = MMN->getRHS();
-      auto *LT = G->createTranspose("lhs.T", InputLHS, {1, 0});
-      auto *RT = G->createTranspose("rhs.T", InputRHS, {1, 0});
+      auto *LT = G->createTranspose(
+          DECORATE_NODE_NAME(MMN, "grad", "lhs", "transpose"), InputLHS,
+          {1, 0});
+      auto *RT = G->createTranspose(
+          DECORATE_NODE_NAME(MMN, "grad", "rhs", "transpose"), InputRHS,
+          {1, 0});
+
+      // Grad for LHS = outputG x transpose(RHS).
+      auto *GradLHS = new MatMulNode(DECORATE_NODE_NAME(MMN, "grad", "lhs"),
+                                     InputLHS.getType(), OutputG, RT);
+      // Grad for RHS = transpose(LHS) x outputG.
+      auto *GradRHS = new MatMulNode(DECORATE_NODE_NAME(MMN, "grad", "rhs"),
+                                     InputRHS.getType(), LT, OutputG);
+
+      toAppend.push_back(GradLHS);
+      map.addGradient(InputLHS, GradLHS);
+      toAppend.push_back(GradRHS);
+      map.addGradient(InputRHS, GradRHS);
+      continue;
+    }
+
+    if (N->getKind() == Kind::BatchMatMulNodeKind) {
+      BatchMatMulNode *BMMN = cast<BatchMatMulNode>(N);
+      // Get gradient.
+      NodeValue OutputG = map.getGradient(BMMN->getResult());
+
+      // The implementation below is a batched version of the gradient
+      // computation for MatMul.
+      NodeValue InputLHS = BMMN->getLHS();
+      NodeValue InputRHS = BMMN->getRHS();
+      auto *LT = G->createTranspose(
+          DECORATE_NODE_NAME(BMMN, "grad", "lhs", "transpose"), InputLHS,
+          {0, 2, 1});
+      auto *RT = G->createTranspose(
+          DECORATE_NODE_NAME(BMMN, "grad", "lhs", "transpose"), InputRHS,
+          {0, 2, 1});
 
       // Grad for LHS = outputG x transpose(RHS).
       auto *GradLHS =
-          new MatMulNode(MMN->getInputName(0), InputLHS.getType(), OutputG, RT);
+          new BatchMatMulNode(DECORATE_NODE_NAME(BMMN, "grad", "lhs"),
+                              InputLHS.getType(), OutputG, RT);
       // Grad for RHS = transpose(LHS) x outputG.
       auto *GradRHS =
-          new MatMulNode(MMN->getInputName(1), InputRHS.getType(), LT, OutputG);
+          new BatchMatMulNode(DECORATE_NODE_NAME(BMMN, "grad", "lhs"),
+                              InputRHS.getType(), LT, OutputG);
 
       toAppend.push_back(GradLHS);
       map.addGradient(InputLHS, GradLHS);
@@ -266,12 +388,14 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
       // repeating OutputG batch times.
       auto Axis = BRA->getAxis();
       // Copy input dimensions first.
-      std::vector<size_t> Dims{Input.dims()};
+      std::vector<dim_t> Dims{Input.dims()};
       // Then set to 1 dimension size on axis.
       Dims[Axis] = 1;
-      auto *RSN = G->createReshape("reshape.grad", OutputG, Dims);
-      auto *TN = new TileNode("tile.grad", Input.getType(), RSN->getResult(),
-                              Input.dims()[Axis], Axis);
+      auto *RSN = G->createReshape(DECORATE_NODE_NAME(BRA, "grad", "reshape"),
+                                   OutputG, Dims);
+      auto *TN =
+          new TileNode(DECORATE_NODE_NAME(BRA, "grad", "tile"), Input.getType(),
+                       RSN->getResult(), Input.dims()[Axis], Axis);
 
       toAppend.push_back(TN);
       map.addGradient(Input, TN);
@@ -287,9 +411,11 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
       NodeValue Data = GN->getData();
       NodeValue Indices = GN->getIndices();
 
-      // Reshape indices into a one-dimensional Tensor (Vector).
-      std::vector<size_t> IndicesDims{Indices.getType()->size()};
-      auto *RI = G->createReshape("reshape.indices.grad", Indices, IndicesDims);
+      // Reshape indices into a two-dimensional Tensor (Vector).
+      std::vector<dim_t> IndicesDims{Indices.getType()->size(), 1};
+      auto *RI =
+          G->createReshape(DECORATE_NODE_NAME(GN, "grad", "reshape", "indices"),
+                           Indices, IndicesDims);
 
       // Reshape Gradient into N-k dimension, where k is Index dimensions,
       // except the case when Indices is one-dimensional.
@@ -297,19 +423,23 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
       auto K = Indices.dims().size();
       if (K != 1) {
         const auto &OrgDims = OutputG.dims();
-        std::vector<size_t> GDims{OrgDims.begin() + K - 1, OrgDims.end()};
-        for (size_t k = 0; k < K - 1; ++k) {
+        std::vector<dim_t> GDims{OrgDims.begin() + K - 1, OrgDims.end()};
+        for (dim_t k = 0; k < K - 1; ++k) {
           GDims[0] *= OrgDims[k];
         }
-        RG = G->createReshape("reshape.output.grad", OutputG, GDims);
+        RG = G->createReshape(
+            DECORATE_NODE_NAME(GN, "grad", "reshape", "output"), OutputG,
+            GDims);
       }
       // Reshaped Indices Vector maps Reshaped Gradient Tensors
       // to the correspondent Data Tensors, where Vector value
       // points to Data Tensor.
-      auto *SN = G->createSplat("splat.grad", Data.getType(), 0);
-      auto *SA = new ScatterAssignNode("scatter.assign.grad", SN->getResult(),
-                                       RI->getResult(),
-                                       RG ? RG->getResult() : OutputG);
+      auto *SN =
+          G->createSplat(DECORATE_NODE_NAME(GN, "splat"), Data.getType(), 0);
+      auto *SA = new ScatterDataNode(DECORATE_NODE_NAME(GN, "scatter_assign"),
+                                     SN->getResult(), RI->getResult(),
+                                     RG ? RG->getResult() : OutputG,
+                                     /*cumulative*/ false);
       toAppend.push_back(SA);
       map.addGradient(Data, SA);
       continue;
@@ -348,7 +478,8 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
                          conf.batchSize);
     toAppend.push_back(X);
     // Now update the weight with the value computed by SGD.
-    auto *save = new SaveNode(PH->getName().str() + ".saveGrad", {X, 0}, PH);
+    auto *save =
+        new SaveNode(DECORATE_NODE_NAME(PH, "save", "grad"), {X, 0}, PH);
     toAppend.push_back(save);
   }
 
@@ -359,3 +490,5 @@ Function *glow::differentiate(Function *F, const TrainingConfig &conf,
 
   return G;
 }
+
+#undef DECORATE_NODE_NAME

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017-present, Facebook, Inc.
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifndef GLOW_TESTS_BACKENDTESTUTILS_H
+#define GLOW_TESTS_BACKENDTESTUTILS_H
 
 #include "glow/Backend/Backend.h"
 #include "glow/ExecutionEngine/ExecutionEngine.h"
@@ -31,6 +33,14 @@ namespace glow {
 
 extern unsigned parCloneCountOpt;
 
+// INSTANTIATE_TEST_CASE_P is deprecated in gtest v1.10.0. For now use it still
+// internally.
+#if FACEBOOK_INTERNAL
+#define GLOW_INSTANTIATE_TEST_SUITE_P INSTANTIATE_TEST_CASE_P
+#else
+#define GLOW_INSTANTIATE_TEST_SUITE_P INSTANTIATE_TEST_SUITE_P
+#endif /* FACEBOOK_INTERNAL */
+
 // A test harness to enable a test case for specific backends. A test suite
 // should subclass this and instantiate it as follows:
 //
@@ -38,7 +48,7 @@ extern unsigned parCloneCountOpt;
 //   ...
 // };
 //
-// INSTANTIATE_TEST_CASE_P_FOR_BACKEND_TEST(Prefix, OperationTest);
+// GLOW_INSTANTIATE_TEST_SUITE_P_FOR_BACKEND_TEST(Prefix, OperationTest);
 //
 // A test case is defined using TEST_P(), and ENABLED_BACKENDS() can be used
 // to whitelist certain backends for the test. The absence of ENABLED_BACKENDS()
@@ -54,93 +64,174 @@ extern unsigned parCloneCountOpt;
 #define DECLARE_STATELESS_BACKEND_TEST(CLASS_NAME, CONFIG_NAME)                \
   class CLASS_NAME : public ::testing::TestWithParam<CONFIG_NAME> {            \
   protected:                                                                   \
-    bool isEnabledBackend(const std::set<BackendKind> &enabledBackends) {      \
-      return enabledBackends.find(getBackendKind()) != enabledBackends.end();  \
+    bool isEnabledBackend(const std::set<std::string> &enabledBackends) {      \
+      return enabledBackends.find(getBackendName()) != enabledBackends.end();  \
     }                                                                          \
-    const BackendKind Interpreter = BackendKind::Interpreter;                  \
-    const BackendKind CPU = BackendKind::CPU;                                  \
-    const BackendKind OpenCL = BackendKind::OpenCL;                            \
-    const BackendKind Habana = BackendKind::Habana;                            \
                                                                                \
   public:                                                                      \
-    BackendKind getBackendKind() { return std::get<0>(GetParam()); }           \
+    std::string getBackendName() { return std::get<0>(GetParam()); }           \
   }
 
-/// Note that we use std::tuple<BackendKind> here to match other tests which are
+/// Note that we use std::tuple<std::string> here to match other tests which are
 /// parameterized across many other values, e.g. those in ParameterSweepTest.
-DECLARE_STATELESS_BACKEND_TEST(BackendStatelessTest, std::tuple<BackendKind>);
+DECLARE_STATELESS_BACKEND_TEST(BackendStatelessTest, std::tuple<std::string>);
+
+/// Whether to ignore the blacklist and run disabled tests.
+extern bool runDisabledTests;
 
 class BackendTest : public BackendStatelessTest {
 public:
-  BackendTest() : mod_(EE_.getModule()) { F_ = mod_.createFunction("main"); }
-
-  ~BackendTest() override { mod_.clear(); }
+  BackendTest(uint64_t deviceMemory = 0)
+      : EE_(getBackendName(), deviceMemory), mod_(EE_.getModule()) {
+    F_ = mod_.createFunction("main");
+  }
 
 protected:
-  ExecutionEngine EE_{getBackendKind()};
+  ExecutionEngine EE_{getBackendName()};
   Module &mod_;
   Function *F_;
 };
 
-static const auto all_backends = ::testing::Values(
-#ifdef GLOW_WITH_CPU
-    BackendKind::CPU,
-#endif // GLOW_WITH_CPU
-#ifdef GLOW_WITH_OPENCL
-    BackendKind::OpenCL,
-#endif // GLOW_WITH_OPENCL
-#ifdef GLOW_WITH_HABANA
-    BackendKind::Habana,
-#endif // GLOW_WITH_HABANA
-    BackendKind::Interpreter);
+/// Stringify a macro def.
+#define BACKEND_TO_STR(X) #X
+
+#ifdef GLOW_TEST_BACKEND
+#define STRINGIZE(X) BACKEND_TO_STR(X)
+#define ALL_BACKENDS ::testing::Values(STRINGIZE(GLOW_TEST_BACKEND))
+#else
+#define ALL_BACKENDS ::testing::ValuesIn(getAvailableBackends())
+#endif
 
 // Instantiate parameterized test suite with all available backends.
-#define INSTANTIATE_TEST_CASE_P_FOR_BACKEND_TEST(prefix, test_case_name)       \
-  INSTANTIATE_TEST_CASE_P(prefix, test_case_name, all_backends)
+#define GLOW_INSTANTIATE_TEST_SUITE_P_FOR_BACKEND_TEST(prefix, test_case_name) \
+  GLOW_INSTANTIATE_TEST_SUITE_P(prefix, test_case_name, ALL_BACKENDS)
 
 // Instantiate parameterized test suite with all available backends.
-#define INSTANTIATE_TEST_CASE_P_FOR_BACKEND_COMBINED_TEST(                     \
+#define GLOW_INSTANTIATE_TEST_SUITE_P_FOR_BACKEND_COMBINED_TEST(               \
     prefix, test_case_name, combine)                                           \
-  INSTANTIATE_TEST_CASE_P(prefix, test_case_name,                              \
-                          ::testing::Combine(all_backends, combine))
+  GLOW_INSTANTIATE_TEST_SUITE_P(prefix, test_case_name,                        \
+                                ::testing::Combine(ALL_BACKENDS, combine))
 
 // TODO: Replace return for GTEST_SKIP() so that skipped tests are
 // correctly reported once the macro gets available.
 #define ENABLED_BACKENDS(...)                                                  \
-  if (!isEnabledBackend({__VA_ARGS__}))                                        \
-    return;
+  if (!runDisabledTests && !isEnabledBackend({__VA_ARGS__}))                   \
+    GTEST_SKIP();
+
+/// Blacklist of tests for the current backend under test.
+extern std::set<std::string> backendTestBlacklist;
+
+/// Bool for whether to use symmetric quantization for rowwise-quantized FCs.
+extern bool useSymmetricRowwiseQuantFC;
+
+/// Intermediate layer of macros to make expansion of defs work correctly.
+#define INSTANTIATE_TEST_INTERNAL(B, T)                                        \
+  GLOW_INSTANTIATE_TEST_SUITE_P(B, T, ::testing::Values(BACKEND_TO_STR(B)));
+
+/// Instantate a test suite for the backend specified by GLOW_TEST_BACKEND.
+/// Usually this macro will be defined by the build system, to avoid tightly
+/// coupling the existing set of backends to the source.
+#define INSTANTIATE_BACKEND_TEST(T)                                            \
+  INSTANTIATE_TEST_INTERNAL(GLOW_TEST_BACKEND, T);
+
+/// Helper macro to check the current test against the blacklist.
+#define CHECK_IF_ENABLED()                                                     \
+  if (!runDisabledTests &&                                                     \
+      backendTestBlacklist.count(                                              \
+          ::testing::UnitTest::GetInstance()->current_test_info()->name()))    \
+    GTEST_SKIP();
+
+class NumericsTest : public BackendTest {
+protected:
+  PlaceholderBindings bindings_;
+};
+
+class GraphOptz : public ::testing::Test {
+public:
+  GraphOptz(llvm::StringRef backendName = "Interpreter")
+      : EE_(backendName), mod_(EE_.getModule()) {
+    F_ = mod_.createFunction("main");
+  }
+
+protected:
+  void checkNumericalEquivalence(float allowedError = 0.0001) {
+    // Check that the function and its optimized complement exist.
+    EXPECT_TRUE(F_);
+    EXPECT_TRUE(optimizedF_);
+
+    // Check that the bindings are not empty. If they are, the numerical
+    // equivalence check can produce a false positive.
+    EXPECT_GT(bindings_.getDataSize(), 0);
+
+    // Clone bindings to use for original and optimized functions.
+    PlaceholderBindings originalBindings = bindings_.clone();
+    PlaceholderBindings optimizedBindings = bindings_.clone();
+
+    // Compile and run functions. Only lower Functions; we do not want to
+    // optimize the unoptimized Function, and the optimized Function has, well,
+    // already been optimized.
+    if (!alreadyCompiled_) {
+      cctx_.optimizationOpts.onlyLowerFuns.insert(F_);
+      cctx_.optimizationOpts.onlyLowerFuns.insert(optimizedF_);
+      EE_.compile(cctx_);
+    }
+    EE_.run(originalBindings, F_->getName());
+    EE_.run(optimizedBindings, optimizedF_->getName());
+
+    // Compare outputs.
+    EXPECT_TRUE(PlaceholderBindings::compare(&originalBindings,
+                                             &optimizedBindings, allowedError));
+  }
+
+  /// Verify the module is still valid at the end of the test.
+  virtual void TearDown() override { EXPECT_TRUE(mod_.verify()); }
+
+  /// ExecutionEngine instance for running functions to check numerical
+  /// equivalence.
+  ExecutionEngine EE_;
+  /// A reference to the Module inside EE_.
+  Module &mod_;
+  /// The original Function for the test case.
+  Function *F_{nullptr};
+  /// The optimized Function for the test case.
+  Function *optimizedF_{nullptr};
+  /// The bindings used to check numerical equivalence for the test case.
+  PlaceholderBindings bindings_;
+  /// CompilationContext used for all Functions in \ref mod_.
+  CompilationContext cctx_;
+  /// Whether \ref mod_ has already been compiled.
+  bool alreadyCompiled_{false};
+};
 
 /// MockBackend used only for unit testing.
 class MockBackend : public Backend {
+public:
   class MockFunction : public CompiledFunction {
   public:
-    MockFunction(const runtime::RuntimeBundle &bundle)
-        : CompiledFunction(bundle) {}
+    MockFunction(runtime::RuntimeBundle &&bundle)
+        : CompiledFunction(std::move(bundle)) {}
 
-    llvm::Error execute(ExecutionContext *) override {
-      return llvm::Error::success();
-    }
+    Error execute(ExecutionContext *) override { return Error::success(); }
 
-    BackendKind getCompileBackendKind() const override {
-      return BackendKind::Interpreter;
-    }
+    std::string getCompileBackendName() const override { return "MockBackend"; }
   };
-
-  BackendKind getBackendKind() const override {
-    return BackendKind::Interpreter;
-  }
 
   std::string getBackendName() const override { return "MockBackend"; }
 
-  llvm::Expected<std::unique_ptr<CompiledFunction>>
+  Expected<std::unique_ptr<CompiledFunction>>
   compile(Function *F, const BackendOptions &) const override {
-    return llvm::make_unique<MockFunction>(runtime::RuntimeBundle::create(*F));
+    return glow::make_unique<MockFunction>(runtime::RuntimeBundle::create(*F));
   }
 
   bool isOpSupported(const NodeInfo &NI) const override { return false; }
 
   bool generateInst(Node *N, IRGenVisitor &irgen) const override {
     return false;
+  }
+
+  runtime::DeviceManager *
+  createDeviceManager(const runtime::DeviceConfig &deviceConfig) override {
+    return nullptr;
   }
 };
 
@@ -149,30 +240,27 @@ class MockBackend : public Backend {
 class MockBackendCustomIRGen : public Backend {
   class MockFunction : public CompiledFunction {
   public:
-    MockFunction(const runtime::RuntimeBundle &bundle)
-        : CompiledFunction(bundle) {}
+    MockFunction(runtime::RuntimeBundle &&bundle)
+        : CompiledFunction(std::move(bundle)) {}
 
-    llvm::Error execute(ExecutionContext *) override {
-      return llvm::Error::success();
-    }
+    Error execute(ExecutionContext *) override { return Error::success(); }
 
-    BackendKind getCompileBackendKind() const override {
-      return BackendKind::Interpreter;
-    }
+    std::string getCompileBackendName() const override { return "Interpreter"; }
   };
 
-  BackendKind getBackendKind() const override {
-    return BackendKind::Interpreter;
-  }
+  std::string getBackendName() const override { return "Interpreter"; }
 
-  std::string getBackendName() const override { return "MockBackend"; }
-
-  llvm::Expected<std::unique_ptr<CompiledFunction>>
+  Expected<std::unique_ptr<CompiledFunction>>
   compile(Function *F, const BackendOptions &) const override {
-    return llvm::make_unique<MockFunction>(runtime::RuntimeBundle::create(*F));
+    return glow::make_unique<MockFunction>(runtime::RuntimeBundle::create(*F));
   }
 
   bool isOpSupported(const NodeInfo &NI) const override { return false; }
+
+  runtime::DeviceManager *
+  createDeviceManager(const runtime::DeviceConfig &deviceConfig) override {
+    return nullptr;
+  }
 
   bool generateInst(Node *N, IRGenVisitor &irgen) const override {
     bool hasChanged = false;
@@ -189,7 +277,8 @@ class MockBackendCustomIRGen : public Backend {
       auto *V = builder_->createConvolutionInst(
           "CustomConvolutionInstruction", Dest__, Src, Filter, Bias,
           CN__->getKernels(), CN__->getStrides(), CN__->getPads(),
-          CN__->getGroup(), CN__->getDilation());
+          CN__->getGroup(), CN__->getDilation(), CN__->getLayout(),
+          CN__->getFusedActivation());
       if (N->hasPredicate()) {
         V->setPredicate(irgen.valueForNode(N->getPredicate()));
       }
@@ -217,95 +306,139 @@ using CreateAndInitFunction =
 /// Given a method \p createAndInitFunction that creates and initializes a
 /// FloatTy Function with a single output Tensor, \returns a bool representing
 /// if the output Tensor of executing the Function on the Interpreter backend is
-/// equal to executing it on a backend of kind \p backendKind. \p interpElemKind
+/// equal to executing it on a backend \p backendName. \p interpElemKind
 /// and \p backendElemKind represent the desired ElemKinds for their respective
 /// functions to use. If either require quantization then a profile will first
 /// be gathered on the Interpreter, and then that profile will be used to
 /// quantize one or both. Otherwise if either is Float16Ty then the respective
 /// Function it will be converted using the Converter. If
-/// \p enableRowwiseQuantization then rowwise quantization will be used for
-/// nodes that support it. \p schema represents the quantization schema to use,
-/// if applicable. \p parallelCount represents the number of times to clone the
-/// Function inside itself, so that testing can be done on architectures that
-/// have parallel compute engines.
+/// \p convertToRowwiseQuantization then nodes supporting rowwise quantization
+/// will converted to use it. \p schema represents the quantization schema to
+/// use, if applicable. \p parallelCount represents the number of times to clone
+/// the Function inside itself, so that testing can be done on architectures
+/// that have parallel compute engines. The bias is quantized using the
+/// precision \p biasElemKind. \p forceFP16AccumSLS is propagated into the
+/// precision config for compilation.
 void compareAgainstInterpreter(
-    BackendKind backendKind, CreateAndInitFunction createAndInitFunction,
+    llvm::StringRef backendName, CreateAndInitFunction createAndInitFunction,
     ElemKind interpElemKind, ElemKind backendElemKind,
     float allowedError = 0.0001, unsigned parallelCount = 1,
-    bool enableRowwiseQuantization = false,
-    quantization::Schema schema = quantization::Schema::Asymmetric);
+    bool convertToRowwiseQuantization = false,
+    quantization::Schema schema = quantization::Schema::Asymmetric,
+    ElemKind biasElemKind = ElemKind::Int32QTy, bool forceFP16AccumSLS = false);
 
 /// Given some \p FTP representing a Function with a single SaveNode and its
 /// Tensor output, duplicate the Nodes in the Function and their Placeholder
 /// inputs given \p bindings \p parallelCount times. \returns a set of Tensor
-/// pointers for each output of the cloned Function.
+/// pointers for each output of the cloned Function. If the quantization node
+/// info found in \p cctx exists, then all of the node infos will be cloned
+/// accordingly with the names of the newly cloned nodes added to the Function.
 std::unordered_set<Tensor *> cloneFunInsideFun(FunctionTensorPair FTP,
                                                PlaceholderBindings *bindings,
+                                               CompilationContext &cctx,
                                                unsigned parallelCount);
 
+/// \returns the number of nodes in \p F of kind \p kind.
+unsigned countNodeKind(Function *F, Kinded::Kind kind);
+
 void inferConvNet(Tensor *inputs, Tensor *filter, Tensor *bias, Tensor *out,
-                  BackendKind kind);
+                  llvm::StringRef kind);
 
 void trainConvNet(Tensor *inputs, Tensor *kernel1, Tensor *bias1,
                   Tensor *kernel2, Tensor *bias2, Tensor *selected,
-                  llvm::ArrayRef<size_t> shape1, llvm::ArrayRef<size_t> shape2,
-                  Tensor *out, BackendKind kind);
+                  llvm::ArrayRef<dim_t> shape1, llvm::ArrayRef<dim_t> shape2,
+                  Tensor *out, llvm::StringRef kind);
 
 void inferLocalResponseNormalizationNet(Tensor *inputs, Tensor *out,
-                                        BackendKind kind);
+                                        llvm::StringRef kind);
 
 void trainLocalResponseNormalizationNet(Tensor *inputs, Tensor *weights,
                                         Tensor *bias, Tensor *selected,
-                                        llvm::ArrayRef<size_t> shape1,
-                                        llvm::ArrayRef<size_t> shape2,
-                                        Tensor *out, BackendKind kind);
+                                        llvm::ArrayRef<dim_t> shape1,
+                                        llvm::ArrayRef<dim_t> shape2,
+                                        Tensor *out, llvm::StringRef kind);
 void trainAvgPoolNet(Tensor *inputs, Tensor *weights, Tensor *bias,
-                     Tensor *selected, llvm::ArrayRef<size_t> shape1,
-                     llvm::ArrayRef<size_t> shape2, Tensor *out,
-                     BackendKind kind);
+                     Tensor *selected, llvm::ArrayRef<dim_t> shape1,
+                     llvm::ArrayRef<dim_t> shape2, Tensor *out,
+                     llvm::StringRef kind);
 
 void trainMaxPoolNet(Tensor *inputs, Tensor *weights, Tensor *bias,
-                     Tensor *selected, llvm::ArrayRef<size_t> shape1,
-                     llvm::ArrayRef<size_t> shape2, Tensor *out,
-                     BackendKind kind);
+                     Tensor *selected, llvm::ArrayRef<dim_t> shape1,
+                     llvm::ArrayRef<dim_t> shape2, Tensor *out,
+                     llvm::StringRef kind);
 
 void inferIntLookupTableNet(Tensor *input, Tensor *out,
-                            llvm::ArrayRef<int8_t> table, BackendKind kind);
+                            llvm::ArrayRef<int8_t> table, llvm::StringRef kind);
 
-void inferGroupConv(Tensor *out, BackendKind kind);
+void inferGroupConv(Tensor *out, llvm::StringRef kind);
 
-void inferNonSquarePaddingConv(Tensor *out, BackendKind kind);
+void inferNonSquarePaddingConv(Tensor *out, llvm::StringRef kind);
 
-void inferNonSquareKernelConv(Tensor *out, BackendKind kind);
+void inferNonSquareKernelConv(Tensor *out, llvm::StringRef kind);
 
-void inferNonSquareStrideConv(Tensor *out, BackendKind kind);
+void inferNonSquareStrideConv(Tensor *out, llvm::StringRef kind);
 
-void inferConvDKKC8(Tensor *out, BackendKind kind);
+void inferConvDKKC8(Tensor *out, llvm::StringRef kind);
 
-void inferSmallConv(Tensor *inputs, Tensor *out, BackendKind kind);
+void inferSmallConv(Tensor *inputs, Tensor *out, llvm::StringRef kind);
 
 void trainSoftMaxNet(Tensor *inputs, Tensor *weights, Tensor *bias,
-                     Tensor *selected, Tensor *out, BackendKind kind);
+                     Tensor *selected, Tensor *out, llvm::StringRef kind);
 
-void inferBasicConvNet(Tensor *inputs, Tensor *out, BackendKind kind,
+void inferBasicConvNet(Tensor *inputs, Tensor *out, llvm::StringRef kind,
                        size_t convDepth);
 
 void inferTanhConcatNet(Tensor *input1, Tensor *input2, Tensor *input3,
-                        Tensor *out, BackendKind kind);
+                        Tensor *out, llvm::StringRef kind);
 
 FunctionTensorPair createAndInitBasicFCNet(PlaceholderBindings &bindings,
                                            ExecutionEngine &EE);
 
-void inferMixedNet(Tensor *inputs, Tensor *out, BackendKind kind);
+void inferMixedNet(Tensor *inputs, Tensor *out, llvm::StringRef kind);
 
 void inferComplexNet1(Tensor *inputs1, Tensor *inputs2, Tensor *inputs3,
-                      Tensor *inputs4, Tensor *out, BackendKind kind);
+                      Tensor *inputs4, Tensor *out, llvm::StringRef kind);
 
 void inferTinyResnet(Tensor *input, Tensor *out, std::vector<Tensor> &weights,
-                     BackendKind kind);
+                     llvm::StringRef kind);
 
-void inferExtract3D(Tensor *input, Tensor *out, BackendKind kind);
+void inferExtract3D(Tensor *input, Tensor *out, llvm::StringRef kind);
 
-void inferMaxSplat(Tensor *input, Tensor *out, BackendKind kind);
+void inferMaxSplat(Tensor *input, Tensor *out, llvm::StringRef kind);
 
+/// A helper method to insert a compiledFunction \p func into the deviceManager
+/// \p device.
+void insertCompiledFunction(llvm::StringRef name, CompiledFunction *func,
+                            runtime::DeviceManager *device, Module *mod);
+
+/// A helper method to run the specified function \p name with the provided
+/// ExecutionContext \p context on the specified DeviceManager \p device.
+void runOnDevice(ExecutionContext &context, llvm::StringRef name,
+                 runtime::DeviceManager *device);
+
+/// Returns a new Constant of type UInt8FusedQTy with fused rowwise
+/// quantization scales and offsets (i.e. the last 8 bytes of each row
+/// contains the scale and offset).
+Constant *createRandomFusedRowwiseQuantizedConstant(Module &mod,
+                                                    llvm::ArrayRef<dim_t> dims,
+                                                    llvm::StringRef name,
+                                                    bool useFusedFP16 = false);
+
+/// Returns a new Constant, of the provided \p type and \p dims initialized
+/// with random data. If using floating point, then it is initialized via
+/// Xavier with filterSize equal to twice the number of elements in \p dims.
+/// Otherwise integer types are initialzed via their min and max values.
+Constant *createRandomizedConstant(Module &mod, TypeRef type,
+                                   llvm::ArrayRef<dim_t> dims,
+                                   llvm::StringRef name);
+
+/// Helper method to wrap dispatching an inference on function \p fname request
+/// to a \p Hostmanager as a synchronous interface. If \p concurrentRequestsOpt
+/// is set it will duplicate the request to send multiple requests concurrently.
+void dispatchInference(const std::string &fname,
+                       runtime::HostManager *hostManager,
+                       ExecutionContext &context,
+                       unsigned concurrentRequestsOpt);
 } // namespace glow
+
+#endif // GLOW_TESTS_BACKENDTESTUTILS_H
